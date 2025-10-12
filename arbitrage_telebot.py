@@ -262,6 +262,9 @@ TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
 TELEGRAM_POLLING_THREAD: Optional[threading.Thread] = None
 TELEGRAM_ADMIN_IDS: Set[str] = set()
+TELEGRAM_POLL_BACKOFF_UNTIL = 0.0
+
+TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS = 30.0
 
 STATE_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
@@ -772,7 +775,11 @@ def run_loop_forever(interval: int):
 # HTTP helpers
 # =========================
 class HttpError(Exception):
-    pass
+    """Error HTTP con código opcional."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 def current_millis() -> int:
     return int(time.time() * 1000)
@@ -801,7 +808,9 @@ def http_get_json(
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code != 200:
-                raise HttpError(f"HTTP {r.status_code} {url} params={params}")
+                raise HttpError(
+                    f"HTTP {r.status_code} {url} params={params}", status_code=r.status_code
+                )
 
             received_ts = current_millis()
             checksum = hashlib.sha256(r.content).hexdigest()
@@ -971,7 +980,7 @@ def tg_api_request(method: str, params: Optional[Dict] = None, http_method: str 
         raise HttpError(f"Error al invocar {method}: {e}") from e
 
     if r.status_code != 200:
-        raise HttpError(f"HTTP {r.status_code} -> {r.text}")
+        raise HttpError(f"HTTP {r.status_code} -> {r.text}", status_code=r.status_code)
 
     data = r.json()
     if not data.get("ok"):
@@ -1128,10 +1137,16 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
 
 
 def tg_process_updates(enabled: bool = True) -> None:
-    global TELEGRAM_LAST_UPDATE_ID
+    global TELEGRAM_LAST_UPDATE_ID, TELEGRAM_POLL_BACKOFF_UNTIL
 
     if not get_bot_token():
         return
+
+    if TELEGRAM_POLL_BACKOFF_UNTIL:
+        now = time.monotonic()
+        if now < TELEGRAM_POLL_BACKOFF_UNTIL:
+            return
+        TELEGRAM_POLL_BACKOFF_UNTIL = 0.0
 
     params: Dict[str, int] = {}
     if TELEGRAM_LAST_UPDATE_ID:
@@ -1139,6 +1154,17 @@ def tg_process_updates(enabled: bool = True) -> None:
 
     try:
         data = tg_api_request("getUpdates", params=params or None)
+    except HttpError as e:
+        if getattr(e, "status_code", None) == 409:
+            TELEGRAM_POLL_BACKOFF_UNTIL = time.monotonic() + TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS
+            log_event(
+                "telegram.poll.conflict",
+                error=str(e),
+                backoff_seconds=TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS,
+            )
+        else:
+            log_event("telegram.poll.error", error=str(e))
+        return
     except Exception as e:
         log_event("telegram.poll.error", error=str(e))
         return
