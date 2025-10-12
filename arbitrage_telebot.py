@@ -2785,18 +2785,45 @@ def diagnose_exchange_pairs(
 
         latency_ms = (time.perf_counter() - started) * 1000.0
         if quote:
+            try:
+                bid = float(quote.bid)
+                ask = float(quote.ask)
+            except (TypeError, ValueError):
+                bid = math.nan
+                ask = math.nan
+
+            if (
+                not math.isfinite(bid)
+                or not math.isfinite(ask)
+                or bid <= 0
+                or ask <= 0
+                or bid >= ask
+            ):
+                return {
+                    "venue": venue,
+                    "pair": pair,
+                    "status": "error",
+                    "error": "InvalidQuote: bid/ask inválidos",
+                    "latency_ms": latency_ms,
+                }
+
             source = str(quote.source or "")
             offline = source.lower() == "offline"
+            try:
+                ts_value = int(quote.ts)
+            except (TypeError, ValueError):
+                ts_value = int(time.time() * 1000)
+
             return {
                 "venue": venue,
                 "pair": pair,
                 "status": "ok",
-                "bid": float(quote.bid),
-                "ask": float(quote.ask),
+                "bid": bid,
+                "ask": ask,
                 "latency_ms": latency_ms,
                 "source": source,
                 "offline_source": offline,
-                "timestamp": int(quote.ts),
+                "timestamp": ts_value,
             }
 
         return {
