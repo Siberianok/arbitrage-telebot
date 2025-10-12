@@ -46,6 +46,7 @@ CONFIG = {
 
 TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
+TELEGRAM_POLLING_THREAD: Optional[threading.Thread] = None
 
 
 COMMANDS_HELP: List[Tuple[str, str]] = [
@@ -338,6 +339,32 @@ def tg_process_updates(enabled: bool = True) -> None:
         argument = parts[1] if len(parts) > 1 else ""
         tg_handle_command(command, argument, str(chat_id), enabled)
 
+
+def ensure_telegram_polling_thread(enabled: bool, interval: float = 1.0) -> None:
+    """Arranca un hilo dedicado a leer updates de Telegram frecuentemente."""
+    global TELEGRAM_POLLING_THREAD
+
+    if not enabled:
+        return
+
+    if TELEGRAM_POLLING_THREAD and TELEGRAM_POLLING_THREAD.is_alive():
+        return
+
+    def _loop():
+        while True:
+            try:
+                tg_process_updates(enabled=True)
+            except Exception as exc:  # pragma: no cover - logging only
+                print(f"[TELEGRAM] Error en polling: {exc}")
+            time.sleep(max(0.5, interval))
+
+    TELEGRAM_POLLING_THREAD = threading.Thread(
+        target=_loop,
+        name="telegram-polling",
+        daemon=True,
+    )
+    TELEGRAM_POLLING_THREAD.start()
+
 # =========================
 # Modelo y Fees
 # =========================
@@ -532,7 +559,9 @@ def run_once() -> None:
         return
 
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
-    tg_process_updates(enabled=tg_enabled)
+    polling_active = TELEGRAM_POLLING_THREAD and TELEGRAM_POLLING_THREAD.is_alive()
+    if tg_enabled and not polling_active:
+        tg_process_updates(enabled=tg_enabled)
 
     pairs = list(CONFIG["pairs"])
     threshold = float(CONFIG["threshold_percent"])
@@ -579,6 +608,10 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.getenv("PORT", "10000")), help="Puerto HTTP para /health (Render usa $PORT)")
 
     args = ap.parse_args()
+
+    tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
+    if tg_enabled and (args.loop or args.web):
+        ensure_telegram_polling_thread(enabled=True, interval=1.0)
 
     if args.web:
         t = threading.Thread(target=run_loop_forever, args=(args.interval,), daemon=True)
