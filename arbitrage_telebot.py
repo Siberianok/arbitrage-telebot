@@ -700,7 +700,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def serve_http(port: int):
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
     log_event("web.listen_start", port=port)
     server.serve_forever()
 
