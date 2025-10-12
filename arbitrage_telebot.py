@@ -328,7 +328,7 @@ FEE_REGISTRY: Dict[Tuple[str, str], float] = {}
 
 
 COMMANDS_HELP: List[Tuple[str, str]] = [
-    ("/help", "Muestra este listado de comandos"),
+    ("/help", "Cómo acceder al menú de comandos"),
     ("/ping", "Responde con 'pong' para verificar conectividad"),
     ("/status", "Resume configuración actual y chats registrados"),
     ("/threshold <valor>", "Consulta o actualiza el umbral de alerta (%)"),
@@ -341,10 +341,11 @@ COMMANDS_HELP: List[Tuple[str, str]] = [
 
 
 def format_command_help() -> str:
-    lines = ["Comandos disponibles:"]
-    for cmd, desc in COMMANDS_HELP:
-        lines.append(f"{cmd} — {desc}")
-    return "\n".join(lines)
+    return (
+        "📟 Para ver los comandos disponibles, tocá el botón "
+        '"Menú" que aparece junto a la carita de emoticones en Telegram.\n'
+        "Desde allí vas a encontrar accesos directos a todas las acciones del bot."
+    )
 
 
 def get_bot_token() -> str:
@@ -359,6 +360,26 @@ def tg_command_menu_payload() -> List[Dict[str, str]]:
             "description": description[:256],
         })
     return payload
+
+
+def tg_enable_menu_button() -> None:
+    """Fuerza el botón de menú de comandos en el cliente de Telegram."""
+
+    token = get_bot_token()
+    if not token:
+        log_event("telegram.menu_button.skip", reason="missing_token")
+        return
+
+    try:
+        tg_api_request(
+            "setChatMenuButton",
+            params={"menu_button": json.dumps({"type": "commands"})},
+            http_method="post",
+        )
+    except Exception as exc:  # pragma: no cover - logging only
+        log_event("telegram.menu_button.error", error=str(exc))
+    else:
+        log_event("telegram.menu_button.enabled")
 
 
 def build_test_signal_message() -> str:
@@ -411,6 +432,7 @@ def tg_sync_command_menu(enabled: bool = True) -> None:
         log_event("telegram.commands.error", error=str(exc))
     else:
         log_event("telegram.commands.synced", commands=len(commands_payload))
+        tg_enable_menu_button()
 
 
 def _load_telegram_chat_ids_from_env() -> None:
