@@ -55,6 +55,13 @@ class HealthHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404); self.end_headers()
 
+    def do_HEAD(self):
+        if self.path in ("/", "/health", "/live", "/ready"):
+            self.send_response(200)
+        else:
+            self.send_response(404)
+        self.end_headers()
+
 def serve_http(port: int):
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     print(f"[WEB] listening on 0.0.0.0:{port}")
