@@ -4,14 +4,14 @@
 import os
 import csv
 import time
-import math
-import json
 import argparse
 import itertools
 import threading
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from dataclasses import dataclass, field
-from typing import Dict, Optional, List, Tuple, Set
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Tuple, Set, Any
 
 import requests
 
@@ -27,8 +27,30 @@ CONFIG = {
         "ADA/USDT",
         "ALGO/USDT",
         "SHIB/USDT",
+        "SOL/USDT",
+        "MATIC/USDT",
+        "BTC/USDC",
+        "ETH/BTC",
+        "BTC/EUR",
+        "ETH/EUR",
+        "USDC/USDT",
+        "BUSD/USDT",
+        "BUSD/USDC",
     ],
     "simulation_capital_quote": 10_000,  # capital (USDT) para estimar PnL en alerta
+    "capital_weights": {
+        "pairs": {
+            "default": 1.0,
+            "BTC/USDT": 1.5,
+            "ETH/USDT": 1.2,
+            "ETH/BTC": 0.8,
+        },
+        "triangles": {
+            "default": 0.6,
+            "binance::USDT-USDC-BUSD": 1.0,
+            "bybit::USDT-BTC-USDC": 0.8,
+        },
+    },
     "venues": {
         "binance": {
             "enabled": True,
@@ -181,16 +203,35 @@ CONFIG = {
         },
         # add more venues aquí
     },
-    "inventory_management": {
-        "enabled": True,
-        "rebalance_frequency_trades": 3,
-    },
+    "triangular_routes": [
+        {
+            "name": "USDT-USDC-BUSD",
+            "venue": "binance",
+            "start_asset": "USDT",
+            "legs": [
+                {"pair": "USDC/USDT", "action": "BUY_BASE"},
+                {"pair": "BUSD/USDC", "action": "BUY_BASE"},
+                {"pair": "BUSD/USDT", "action": "SELL_BASE"},
+            ],
+        },
+        {
+            "name": "USDT-BTC-USDC",
+            "venue": "bybit",
+            "start_asset": "USDT",
+            "legs": [
+                {"pair": "BTC/USDT", "action": "BUY_BASE"},
+                {"pair": "BTC/USDC", "action": "SELL_BASE"},
+                {"pair": "USDC/USDT", "action": "SELL_BASE"},
+            ],
+        },
+    ],
     "telegram": {
         "enabled": True,                 # poner False para pruebas sin enviar
         "bot_token_env": "TG_BOT_TOKEN",
         "chat_ids_env": "TG_CHAT_IDS",   # coma-separado: "-100123...,123456..."
     },
     "log_csv_path": "logs/opportunities.csv",
+    "triangular_log_csv_path": "logs/triangular_opportunities.csv",
 }
 
 TELEGRAM_CHAT_IDS: Set[str] = set()
@@ -273,18 +314,115 @@ def run_loop_forever(interval: int):
 class HttpError(Exception):
     pass
 
-def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 8, retries: int = 3) -> dict:
-    last_exc = None
+def current_millis() -> int:
+    return int(time.time() * 1000)
+
+
+@dataclass
+class HttpJsonResponse:
+    data: Dict[str, Any]
+    checksum: str
+    received_ts: int
+
+
+LAST_CHECKSUMS: Dict[str, Tuple[str, int]] = {}
+MAX_CHECKSUM_STALENESS_MS = 60_000
+
+
+def http_get_json(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: int = 8,
+    retries: int = 3,
+    integrity_key: Optional[str] = None,
+) -> HttpJsonResponse:
+    last_exc: Optional[Exception] = None
     for _ in range(retries):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code != 200:
                 raise HttpError(f"HTTP {r.status_code} {url} params={params}")
-            return r.json()
+
+            received_ts = current_millis()
+            checksum = hashlib.sha256(r.content).hexdigest()
+            payload = r.json()
+            if not isinstance(payload, dict):
+                raise HttpError(f"Respuesta no es JSON objeto en {url}")
+
+            if integrity_key:
+                last_checksum, last_ts = LAST_CHECKSUMS.get(integrity_key, (None, 0))
+                if last_checksum == checksum and received_ts - last_ts > MAX_CHECKSUM_STALENESS_MS:
+                    raise HttpError(
+                        f"Checksum sin cambios por {received_ts - last_ts} ms para {integrity_key}"
+                    )
+                LAST_CHECKSUMS[integrity_key] = (checksum, received_ts)
+
+            return HttpJsonResponse(payload, checksum, received_ts)
         except Exception as e:
             last_exc = e
             time.sleep(0.5)
     raise last_exc or HttpError("GET failed")
+
+
+MAX_ALLOWED_CLOCK_SKEW_MS = 5_000
+
+
+def ensure_fresh_timestamp(ts_ms: int, received_ts: int, source: str) -> int:
+    if ts_ms <= 0:
+        raise HttpError(f"Timestamp inválido en {source}: {ts_ms}")
+    if abs(received_ts - ts_ms) > MAX_ALLOWED_CLOCK_SKEW_MS:
+        raise HttpError(
+            f"Timestamp desfasado en {source}: diff={received_ts - ts_ms} ms"
+        )
+    return ts_ms
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+@dataclass
+class DepthInfo:
+    best_bid: float
+    best_ask: float
+    bid_volume: float
+    ask_volume: float
+    levels: int
+    ts: int
+    checksum: str
+
+
+@dataclass
+class DepthCacheEntry:
+    info: DepthInfo
+    stored_ts: int
+
+
+class DepthCache:
+    def __init__(self, ttl_ms: int = 5_000):
+        self.ttl_ms = ttl_ms
+        self._lock = threading.Lock()
+        self._data: Dict[Tuple[str, str], DepthCacheEntry] = {}
+
+    def get(self, key: Tuple[str, str], now_ms: Optional[int] = None) -> Optional[DepthInfo]:
+        now = now_ms or current_millis()
+        with self._lock:
+            entry = self._data.get(key)
+            if not entry:
+                return None
+            if now - entry.stored_ts > self.ttl_ms:
+                return None
+            return entry.info
+
+    def set(self, key: Tuple[str, str], info: DepthInfo) -> None:
+        with self._lock:
+            self._data[key] = DepthCacheEntry(info=info, stored_ts=current_millis())
+
+
+DEPTH_CACHE = DepthCache()
 
 # =========================
 # Telegram (HTTP API)
@@ -525,6 +663,9 @@ class Quote:
     bid: float
     ask: float
     ts: int
+    depth: Optional[DepthInfo] = None
+    checksum: Optional[str] = None
+    source: str = ""
 
 @dataclass
 class FeeSchedule:
@@ -799,65 +940,317 @@ def simulate_inventory_rebalance(
 # =========================
 class ExchangeAdapter:
     name: str
+    depth_supported: bool = False
+
     def normalize_symbol(self, pair: str) -> str:
         raise NotImplementedError
+
     def fetch_quote(self, pair: str) -> Optional[Quote]:
         raise NotImplementedError
+
+    def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
+        return None
+
+    def _integrity_key(self, symbol: str, endpoint: str) -> str:
+        return f"{self.name}:{symbol}:{endpoint}"
+
+    def get_depth(self, pair: str) -> Optional[DepthInfo]:
+        if not self.depth_supported:
+            return None
+        symbol = self.normalize_symbol(pair)
+        cache_key = (self.name, symbol)
+        cached = DEPTH_CACHE.get(cache_key)
+        if cached:
+            return cached
+        depth = self.fetch_depth_snapshot(pair)
+        if depth:
+            DEPTH_CACHE.set(cache_key, depth)
+        return depth
+
+    def _attach_depth(self, pair: str, quote: Optional[Quote]) -> Optional[Quote]:
+        depth = self.get_depth(pair)
+        if not depth:
+            return quote
+        symbol = self.normalize_symbol(pair)
+        if quote is None:
+            return Quote(
+                symbol,
+                depth.best_bid,
+                depth.best_ask,
+                depth.ts,
+                depth=depth,
+                checksum=depth.checksum,
+                source="depth",
+            )
+        quote.depth = depth
+        if depth.best_bid > 0:
+            quote.bid = max(quote.bid, depth.best_bid)
+        if depth.best_ask > 0:
+            quote.ask = min(quote.ask, depth.best_ask)
+        quote.ts = max(quote.ts, depth.ts)
+        return quote
+
 
 class Binance(ExchangeAdapter):
     name = "binance"
+    depth_supported = True
+
     def normalize_symbol(self, pair: str) -> str:
         return pair.replace("/", "")
+
     def fetch_quote(self, pair: str) -> Optional[Quote]:
         sym = self.normalize_symbol(pair)
         url = "https://api.binance.com/api/v3/ticker/bookTicker"
-        data = http_get_json(url, params={"symbol": sym})
-        bid = float(data["bidPrice"]); ask = float(data["askPrice"])
-        return Quote(sym, bid, ask, int(time.time()*1000))
+        quote: Optional[Quote] = None
+        try:
+            response = http_get_json(
+                url,
+                params={"symbol": sym},
+                integrity_key=self._integrity_key(sym, "ticker"),
+            )
+            data = response.data
+            bid = safe_float(data.get("bidPrice"))
+            ask = safe_float(data.get("askPrice"))
+            if bid <= 0 or ask <= 0 or bid >= ask:
+                raise HttpError("Precios inválidos en ticker")
+            ts_ms = safe_float(data.get("time"))
+            if ts_ms > 0:
+                ts_val = ensure_fresh_timestamp(int(ts_ms), response.received_ts, "binance:ticker")
+            else:
+                ts_val = response.received_ts
+            quote = Quote(sym, bid, ask, int(ts_val), checksum=response.checksum, source="bookTicker")
+        except Exception as exc:
+            print(f"[binance] ticker fallback {pair}: {exc}")
+        quote = self._attach_depth(pair, quote)
+        if quote and quote.bid >= quote.ask:
+            return None
+        return quote
+
+    def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
+        sym = self.normalize_symbol(pair)
+        url = "https://api.binance.com/api/v3/depth"
+        try:
+            response = http_get_json(
+                url,
+                params={"symbol": sym, "limit": 20},
+                integrity_key=self._integrity_key(sym, "depth"),
+            )
+            bids = response.data.get("bids") or []
+            asks = response.data.get("asks") or []
+            if not bids or not asks:
+                raise HttpError("Depth vacío")
+            best_bid = safe_float(bids[0][0])
+            best_ask = safe_float(asks[0][0])
+            bid_volume = sum(safe_float(b[1]) for b in bids)
+            ask_volume = sum(safe_float(a[1]) for a in asks)
+            levels = min(len(bids), len(asks))
+            ts_val = response.received_ts
+            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, ts_val, response.checksum)
+        except Exception as exc:
+            print(f"[binance] depth error {pair}: {exc}")
+            return None
 
 class Bybit(ExchangeAdapter):
     name = "bybit"
+    depth_supported = True
+
     def normalize_symbol(self, pair: str) -> str:
         return pair.replace("/", "")
+
     def fetch_quote(self, pair: str) -> Optional[Quote]:
         sym = self.normalize_symbol(pair)
         url = "https://api.bybit.com/v5/market/tickers"
-        data = http_get_json(url, params={"category":"spot", "symbol": sym})
+        quote: Optional[Quote] = None
         try:
-            item = data["result"]["list"][0]
-            bid = float(item["bid1Price"]); ask = float(item["ask1Price"])
-            return Quote(sym, bid, ask, int(time.time()*1000))
-        except Exception:
+            response = http_get_json(
+                url,
+                params={"category": "spot", "symbol": sym},
+                integrity_key=self._integrity_key(sym, "ticker"),
+            )
+            result = response.data.get("result") or {}
+            items = result.get("list") or []
+            if not items:
+                raise HttpError("Ticker vacío")
+            item = items[0]
+            bid = safe_float(item.get("bid1Price"))
+            ask = safe_float(item.get("ask1Price"))
+            if bid <= 0 or ask <= 0 or bid >= ask:
+                raise HttpError("Precios inválidos en ticker")
+            ts_field = safe_float(response.data.get("time") or item.get("time") or item.get("t"))
+            if ts_field > 0:
+                ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "bybit:ticker")
+            else:
+                ts_val = response.received_ts
+            quote = Quote(sym, bid, ask, int(ts_val), checksum=response.checksum, source="ticker")
+        except Exception as exc:
+            print(f"[bybit] ticker fallback {pair}: {exc}")
+        quote = self._attach_depth(pair, quote)
+        if quote and quote.bid >= quote.ask:
+            return None
+        return quote
+
+    def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
+        sym = self.normalize_symbol(pair)
+        url = "https://api.bybit.com/v5/market/orderbook"
+        try:
+            response = http_get_json(
+                url,
+                params={"category": "spot", "symbol": sym, "limit": 25},
+                integrity_key=self._integrity_key(sym, "depth"),
+            )
+            result = response.data.get("result") or {}
+            bids = result.get("b") or []
+            asks = result.get("a") or []
+            if not bids or not asks:
+                raise HttpError("Depth vacío")
+            best_bid = safe_float(bids[0][0])
+            best_ask = safe_float(asks[0][0])
+            bid_volume = sum(safe_float(entry[1]) for entry in bids)
+            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            levels = min(len(bids), len(asks))
+            ts_field = safe_float(result.get("ts") or response.data.get("time"))
+            if ts_field > 0:
+                ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "bybit:depth")
+            else:
+                ts_val = response.received_ts
+            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+        except Exception as exc:
+            print(f"[bybit] depth error {pair}: {exc}")
             return None
 
 class KuCoin(ExchangeAdapter):
     name = "kucoin"
+    depth_supported = True
+
     def normalize_symbol(self, pair: str) -> str:
         return pair.replace("/", "-")
+
     def fetch_quote(self, pair: str) -> Optional[Quote]:
         sym = self.normalize_symbol(pair)
         url = "https://api.kucoin.com/api/v1/market/orderbook/level1"
-        data = http_get_json(url, params={"symbol": sym})
+        quote: Optional[Quote] = None
         try:
-            d = data["data"]
-            bid = float(d["bestBid"]); ask = float(d["bestAsk"])
-            return Quote(sym, bid, ask, int(time.time()*1000))
-        except Exception:
+            response = http_get_json(
+                url,
+                params={"symbol": sym},
+                integrity_key=self._integrity_key(sym, "ticker"),
+            )
+            data = response.data.get("data") or {}
+            bid = safe_float(data.get("bestBid"))
+            ask = safe_float(data.get("bestAsk"))
+            if bid <= 0 or ask <= 0 or bid >= ask:
+                raise HttpError("Precios inválidos en ticker")
+            ts_field = safe_float(data.get("time"))
+            if ts_field > 0:
+                ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "kucoin:ticker")
+            else:
+                ts_val = response.received_ts
+            quote = Quote(sym, bid, ask, int(ts_val), checksum=response.checksum, source="level1")
+        except Exception as exc:
+            print(f"[kucoin] ticker fallback {pair}: {exc}")
+        quote = self._attach_depth(pair, quote)
+        if quote and quote.bid >= quote.ask:
             return None
+        return quote
+
+    def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
+        sym = self.normalize_symbol(pair)
+        url = "https://api.kucoin.com/api/v1/market/orderbook/level2_20"
+        try:
+            response = http_get_json(
+                url,
+                params={"symbol": sym},
+                integrity_key=self._integrity_key(sym, "depth"),
+            )
+            data = response.data.get("data") or {}
+            bids = data.get("bids") or []
+            asks = data.get("asks") or []
+            if not bids or not asks:
+                raise HttpError("Depth vacío")
+            best_bid = safe_float(bids[0][0])
+            best_ask = safe_float(asks[0][0])
+            bid_volume = sum(safe_float(entry[1]) for entry in bids)
+            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            levels = min(len(bids), len(asks))
+            ts_field = safe_float(data.get("time"))
+            if ts_field > 0:
+                ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "kucoin:depth")
+            else:
+                ts_val = response.received_ts
+            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+        except Exception as exc:
+            print(f"[kucoin] depth error {pair}: {exc}")
+            return None
+
 
 class OKX(ExchangeAdapter):
     name = "okx"
+    depth_supported = True
+
     def normalize_symbol(self, pair: str) -> str:
         return pair.replace("/", "-")
+
     def fetch_quote(self, pair: str) -> Optional[Quote]:
         sym = self.normalize_symbol(pair)
         url = "https://www.okx.com/api/v5/market/ticker"
-        data = http_get_json(url, params={"instId": sym})
+        quote: Optional[Quote] = None
         try:
-            item = data["data"][0]
-            bid = float(item["bidPx"]); ask = float(item["askPx"])
-            return Quote(sym, bid, ask, int(time.time()*1000))
-        except Exception:
+            response = http_get_json(
+                url,
+                params={"instId": sym},
+                integrity_key=self._integrity_key(sym, "ticker"),
+            )
+            items = response.data.get("data") or []
+            if not items:
+                raise HttpError("Ticker vacío")
+            item = items[0]
+            bid = safe_float(item.get("bidPx"))
+            ask = safe_float(item.get("askPx"))
+            if bid <= 0 or ask <= 0 or bid >= ask:
+                raise HttpError("Precios inválidos en ticker")
+            ts_field = safe_float(item.get("ts") or response.data.get("ts"))
+            if ts_field > 0:
+                ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "okx:ticker")
+            else:
+                ts_val = response.received_ts
+            quote = Quote(sym, bid, ask, int(ts_val), checksum=response.checksum, source="ticker")
+        except Exception as exc:
+            print(f"[okx] ticker fallback {pair}: {exc}")
+        quote = self._attach_depth(pair, quote)
+        if quote and quote.bid >= quote.ask:
+            return None
+        return quote
+
+    def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
+        sym = self.normalize_symbol(pair)
+        url = "https://www.okx.com/api/v5/market/books"
+        try:
+            response = http_get_json(
+                url,
+                params={"instId": sym, "sz": "20"},
+                integrity_key=self._integrity_key(sym, "depth"),
+            )
+            items = response.data.get("data") or []
+            if not items:
+                raise HttpError("Depth vacío")
+            item = items[0]
+            bids = item.get("bids") or []
+            asks = item.get("asks") or []
+            if not bids or not asks:
+                raise HttpError("Depth vacío")
+            best_bid = safe_float(bids[0][0])
+            best_ask = safe_float(asks[0][0])
+            bid_volume = sum(safe_float(entry[1]) for entry in bids)
+            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            levels = min(len(bids), len(asks))
+            ts_field = safe_float(item.get("ts") or response.data.get("ts"))
+            if ts_field > 0:
+                ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "okx:depth")
+            else:
+                ts_val = response.received_ts
+            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+        except Exception as exc:
+            print(f"[okx] depth error {pair}: {exc}")
             return None
 
 def build_adapters() -> Dict[str, ExchangeAdapter]:
@@ -868,6 +1261,39 @@ def build_adapters() -> Dict[str, ExchangeAdapter]:
     if vcfg.get("kucoin",  {}).get("enabled", False): adapters["kucoin"]  = KuCoin()
     if vcfg.get("okx",     {}).get("enabled", False): adapters["okx"]     = OKX()
     return adapters
+
+def build_fee_map() -> Dict[str, VenueFees]:
+    fee_map: Dict[str, VenueFees] = {}
+    for vname, v in CONFIG["venues"].items():
+        if not v.get("enabled", False):
+            continue
+        fee_map[vname] = VenueFees(taker_fee_percent=float(v.get("taker_fee_percent", 0.10)))
+    return fee_map
+
+
+def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) -> Dict[str, Dict[str, Quote]]:
+    pair_quotes: Dict[str, Dict[str, Quote]] = {pair: {} for pair in pairs}
+    if not pairs or not adapters:
+        return pair_quotes
+
+    futures_map: Dict[Any, Tuple[str, str]] = {}
+    max_workers = min(32, max(1, len(pairs) * len(adapters)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for pair in pairs:
+            for vname, adapter in adapters.items():
+                futures_map[executor.submit(adapter.fetch_quote, pair)] = (pair, vname)
+
+        for future in as_completed(futures_map):
+            pair, vname = futures_map[future]
+            try:
+                quote = future.result()
+            except Exception as exc:
+                print(f"[{vname}] error fetch {pair}: {exc}")
+                continue
+            if quote:
+                pair_quotes[pair][vname] = quote
+
+    return pair_quotes
 
 # =========================
 # Engine
@@ -881,24 +1307,45 @@ class Opportunity:
     sell_price: float
     gross_percent: float
     net_percent: float
-    estimated_profit_quote: float
-    estimated_base_qty: float
-    buy_fee_percent: float
-    sell_fee_percent: float
-    buy_slippage_bps: float
-    sell_slippage_bps: float
-    transfer_cost_quote: float
-    transfer_minutes: float
-    rebalance_cost_quote: float
-    rebalance_minutes: float
 
-def compute_opportunities_for_pair(
-    pair: str,
-    quotes: Dict[str, Quote],
-    fees: Dict[str, VenueFees],
-    transfers: Dict[str, VenueTransfers],
-    capital_quote: float,
-) -> List[Opportunity]:
+@dataclass
+class TriangleLeg:
+    pair: str
+    action: str  # BUY_BASE o SELL_BASE
+
+    def normalized_action(self) -> str:
+        return self.action.strip().upper()
+
+
+@dataclass
+class TriangularRoute:
+    name: str
+    venue: str
+    start_asset: str
+    legs: List[TriangleLeg]
+
+    @property
+    def identifier(self) -> str:
+        return f"{self.venue}::{self.name}"
+
+
+@dataclass
+class TriangularOpportunity:
+    route: TriangularRoute
+    start_capital: float
+    final_capital_gross: float
+    final_capital_net: float
+    gross_percent: float
+    net_percent: float
+    leg_prices: List[Tuple[TriangleLeg, float]]
+
+    @property
+    def net_profit(self) -> float:
+        return self.final_capital_net - self.start_capital
+
+def compute_opportunities_for_pair(pair: str,
+                                   quotes: Dict[str, Quote],
+                                   fees: Dict[str, VenueFees]) -> List[Opportunity]:
     venues = list(quotes.keys())
     out: List[Opportunity] = []
     for buy_v, sell_v in itertools.permutations(venues, 2):
@@ -983,6 +1430,90 @@ def compute_opportunities_for_pair(
 
     return sorted(out, key=lambda o: o.net_percent, reverse=True)
 
+
+def get_weighted_capital(base_capital: float, weights_cfg: Dict[str, float], key: str) -> float:
+    if base_capital <= 0:
+        return 0.0
+    default = float(weights_cfg.get("default", 1.0)) if weights_cfg else 1.0
+    weight = float(weights_cfg.get(key, default)) if weights_cfg else default
+    return base_capital * weight
+
+
+def load_triangular_routes() -> List[TriangularRoute]:
+    routes_cfg = CONFIG.get("triangular_routes", []) or []
+    routes: List[TriangularRoute] = []
+    for rcfg in routes_cfg:
+        legs_cfg = rcfg.get("legs", []) or []
+        legs = [
+            TriangleLeg(
+                pair=str(leg_cfg.get("pair", "")).upper(),
+                action=str(leg_cfg.get("action", "BUY_BASE")),
+            )
+            for leg_cfg in legs_cfg
+            if leg_cfg.get("pair")
+        ]
+        if not legs:
+            continue
+        name = str(rcfg.get("name", "triangle")).strip() or "triangle"
+        venue = str(rcfg.get("venue", "")).strip().lower()
+        if not venue:
+            continue
+        start_asset = str(rcfg.get("start_asset", "USDT")).upper() or "USDT"
+        routes.append(TriangularRoute(name=name, venue=venue, start_asset=start_asset, legs=legs))
+    return routes
+
+
+def compute_triangular_opportunity(route: TriangularRoute,
+                                   quotes_by_pair: Dict[str, Dict[str, Quote]],
+                                   fees: Dict[str, VenueFees],
+                                   start_capital: float) -> Optional[TriangularOpportunity]:
+    if start_capital <= 0:
+        return None
+
+    fee_cfg = fees.get(route.venue)
+    fee_rate = (fee_cfg.taker_fee_percent / 100.0) if fee_cfg else 0.0
+
+    gross_amount = start_capital
+    net_amount = start_capital
+    legs_with_prices: List[Tuple[TriangleLeg, float]] = []
+
+    for leg in route.legs:
+        quotes_for_pair = quotes_by_pair.get(leg.pair, {})
+        quote = quotes_for_pair.get(route.venue)
+        if not quote:
+            return None
+
+        action = leg.normalized_action()
+        if action == "BUY_BASE":
+            price = quote.ask
+            if price <= 0:
+                return None
+            gross_amount = gross_amount / price
+            net_amount = (net_amount / price) * (1 - fee_rate)
+        elif action == "SELL_BASE":
+            price = quote.bid
+            if price <= 0:
+                return None
+            gross_amount = gross_amount * price
+            net_amount = (net_amount * price) * (1 - fee_rate)
+        else:
+            return None
+
+        legs_with_prices.append((leg, price))
+
+    gross_percent = (gross_amount - start_capital) / start_capital * 100.0
+    net_percent = (net_amount - start_capital) / start_capital * 100.0
+
+    return TriangularOpportunity(
+        route=route,
+        start_capital=start_capital,
+        final_capital_gross=gross_amount,
+        final_capital_net=net_amount,
+        gross_percent=gross_percent,
+        net_percent=net_percent,
+        leg_prices=legs_with_prices,
+    )
+
 # =========================
 # Simulación PnL (avanzada)
 # =========================
@@ -990,38 +1521,40 @@ def estimate_profit(
     capital_quote: float,
     buy_price: float,
     sell_price: float,
-    buy_fee_percent: float,
-    sell_fee_percent: float,
-    buy_slippage_bps: float = 0.0,
-    sell_slippage_bps: float = 0.0,
-    transfer_cost_quote: float = 0.0,
-    rebalance_cost_quote: float = 0.0,
-) -> Tuple[float, float, float]:
+    total_percent_fee: float,
+    max_base_qty: Optional[float] = None,
+) -> Tuple[float, float, float, float]:
     if buy_price <= 0 or sell_price <= 0 or capital_quote <= 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
-    executed_buy = apply_slippage(buy_price, buy_slippage_bps, "buy")
-    executed_sell = apply_slippage(sell_price, sell_slippage_bps, "sell")
-    if executed_buy <= 0 or executed_sell <= 0:
-        return 0.0, 0.0, 0.0
+    desired_base_qty = capital_quote / buy_price
+    base_qty = desired_base_qty
+    if max_base_qty is not None:
+        base_qty = min(desired_base_qty, max_base_qty)
 
-    base_qty = capital_quote / executed_buy
-    gross_proceeds = base_qty * executed_sell
+    if base_qty <= 0:
+        return 0.0, 0.0, 0.0, 0.0
 
-    buy_fee_amount = capital_quote * (buy_fee_percent / 100.0)
-    sell_fee_amount = gross_proceeds * (sell_fee_percent / 100.0)
-
-    net_proceeds = gross_proceeds - sell_fee_amount
-    total_costs = buy_fee_amount + transfer_cost_quote + rebalance_cost_quote
-    profit = net_proceeds - capital_quote - total_costs
-    net_pct = (profit / capital_quote) * 100.0 if capital_quote > 0 else 0.0
-
-    return profit, net_pct, base_qty
+    effective_capital = base_qty * buy_price
+    gross_proceeds = base_qty * sell_price
+    fee_loss = (total_percent_fee / 100.0) * effective_capital
+    net_proceeds = gross_proceeds - fee_loss
+    profit = net_proceeds - effective_capital
+    net_pct = (profit / effective_capital) * 100.0 if effective_capital > 0 else 0.0
+    return profit, net_pct, base_qty, effective_capital
 
 # =========================
 # Logging CSV
 # =========================
-def append_csv(path: str, opp: Opportunity) -> None:
+def append_csv(
+    path: str,
+    opp: Opportunity,
+    est_profit: float,
+    base_qty: float,
+    capital_used: float,
+    buy_depth: Optional[DepthInfo],
+    sell_depth: Optional[DepthInfo],
+) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     exists = os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -1038,45 +1571,113 @@ def append_csv(path: str, opp: Opportunity) -> None:
                 "net_%",
                 "est_profit_quote",
                 "base_qty",
-                "buy_fee_percent",
-                "sell_fee_percent",
-                "buy_slippage_bps",
-                "sell_slippage_bps",
-                "transfer_cost_quote",
-                "rebalance_cost_quote",
-                "transfer_minutes",
-                "rebalance_minutes",
+                "capital_used_quote",
+                "buy_depth_base",
+                "sell_depth_base",
             ])
         w.writerow([
             int(time.time()), opp.pair, opp.buy_venue, opp.sell_venue,
             f"{opp.buy_price:.8f}", f"{opp.sell_price:.8f}",
             f"{opp.gross_percent:.4f}", f"{opp.net_percent:.4f}",
-            f"{opp.estimated_profit_quote:.4f}", f"{opp.estimated_base_qty:.8f}",
-            f"{opp.buy_fee_percent:.6f}", f"{opp.sell_fee_percent:.6f}",
-            f"{opp.buy_slippage_bps:.4f}", f"{opp.sell_slippage_bps:.4f}",
-            f"{opp.transfer_cost_quote:.6f}", f"{opp.rebalance_cost_quote:.6f}",
-            f"{opp.transfer_minutes:.2f}", f"{opp.rebalance_minutes:.2f}",
+            f"{est_profit:.4f}",
+            f"{base_qty:.8f}",
+            f"{capital_used:.4f}",
+            f"{(buy_depth.ask_volume if buy_depth else 0.0):.8f}" if buy_depth else "",
+            f"{(sell_depth.bid_volume if sell_depth else 0.0):.8f}" if sell_depth else "",
+        ])
+
+
+def append_triangular_csv(path: str, opp: TriangularOpportunity) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow([
+                "ts",
+                "route",
+                "venue",
+                "start_asset",
+                "start_capital",
+                "final_capital_net",
+                "gross_%",
+                "net_%",
+                "legs",
+            ])
+        leg_summary = " | ".join(
+            f"{leg.pair}:{leg.normalized_action()}@{price:.8f}"
+            for leg, price in opp.leg_prices
+        )
+        w.writerow([
+            int(time.time()),
+            opp.route.name,
+            opp.route.venue,
+            opp.route.start_asset,
+            f"{opp.start_capital:.8f}",
+            f"{opp.final_capital_net:.8f}",
+            f"{opp.gross_percent:.4f}",
+            f"{opp.net_percent:.4f}",
+            leg_summary,
         ])
 
 # =========================
 # Formato de alerta
 # =========================
-def fmt_alert(opp: Opportunity, capital_quote: float) -> str:
-    base_asset, quote_asset = opp.pair.split("/")
-    rebalance_cfg = CONFIG.get("inventory_management", {})
-    rebalance_freq = int(rebalance_cfg.get("rebalance_frequency_trades", 1) or 1)
+def fmt_alert(
+    opp: Opportunity,
+    est_profit: float,
+    est_percent: float,
+    base_qty: float,
+    capital_quote: float,
+    capital_used: float,
+    buy_depth: Optional[DepthInfo],
+    sell_depth: Optional[DepthInfo],
+) -> str:
+    lines = [
+        "ARBITRAJE SPOT (inventario)",
+        f"Par: {opp.pair}",
+        f"Comprar en {opp.buy_venue}: {opp.buy_price:.6f}",
+        f"Vender en {opp.sell_venue}: {opp.sell_price:.6f}",
+        f"Spread bruto: {opp.gross_percent:.3f}%  |  Neto: {opp.net_percent:.3f}%",
+        f"PnL estimado: ~{est_profit:.2f} USDT  (~{est_percent:.3f}%)",
+    ]
+
+    if abs(capital_used - capital_quote) > 1e-6:
+        lines.append(
+            f"Capital ajustado por liquidez: {capital_used:.2f} USDT (objetivo {capital_quote:.2f} USDT)"
+        )
+    else:
+        lines.append(f"Capital simulado: {capital_used:.2f} USDT")
+
+    lines.append(f"Cantidad base estimada: {base_qty:.6f}")
+
+    if buy_depth:
+        lines.append(
+            f"Liquidez compra {opp.buy_venue}: {buy_depth.ask_volume:.4f} base en {buy_depth.levels} niveles"
+        )
+    if sell_depth:
+        lines.append(
+            f"Liquidez venta {opp.sell_venue}: {sell_depth.bid_volume:.4f} base en {sell_depth.levels} niveles"
+        )
+
+    lines.append(time.strftime('%Y-%m-%d %H:%M:%S'))
+    return "\n".join(lines)
+
+
+def fmt_triangular_alert(opp: TriangularOpportunity, fee_percent: float) -> str:
+    legs_lines = []
+    for leg, price in opp.leg_prices:
+        action = leg.normalized_action()
+        legs_lines.append(f"- {leg.pair} [{action}] @ {price:.8f}")
+    legs_block = "\n".join(legs_lines)
     return (
-        "ARBITRAJE SPOT (inventario)\n"
-        f"Par: {opp.pair}\n"
-        f"Comprar en {opp.buy_venue}: {opp.buy_price:.6f}\n"
-        f"Vender en {opp.sell_venue}: {opp.sell_price:.6f}\n"
-        f"Spread bruto (con slippage): {opp.gross_percent:.3f}%  |  Neto: {opp.net_percent:.3f}%\n"
-        f"Fees taker buy/sell: {opp.buy_fee_percent:.4f}% / {opp.sell_fee_percent:.4f}%\n"
-        f"Slippage esperado (bps) buy/sell: {opp.buy_slippage_bps:.2f} / {opp.sell_slippage_bps:.2f}\n"
-        f"Costos transferencia round-trip: {opp.transfer_cost_quote:.4f} {quote_asset} (~{opp.transfer_minutes:.1f} min)\n"
-        f"Rebalance promedio ({rebalance_freq} trades): {opp.rebalance_cost_quote:.4f} {quote_asset} (~{opp.rebalance_minutes:.1f} min)\n"
-        f"Simulación sobre {capital_quote:.0f} {quote_asset}: PnL ~{opp.estimated_profit_quote:.2f} {quote_asset}  (~{opp.net_percent:.3f}%)\n"
-        f"Base movida: {opp.estimated_base_qty:.6f} {base_asset}\n"
+        "ARBITRAJE TRIANGULAR\n"
+        f"Ruta: {opp.route.name} ({opp.route.venue})\n"
+        f"Asset inicial: {opp.route.start_asset}\n"
+        f"Capital simulado: {opp.start_capital:.4f} {opp.route.start_asset}\n"
+        f"Resultado neto: {opp.final_capital_net:.4f} {opp.route.start_asset} (PnL {opp.net_profit:.4f}, {opp.net_percent:.3f}%)\n"
+        f"Spread bruto: {opp.gross_percent:.3f}% | Fees considerados: {fee_percent:.3f}% por trade\n"
+        f"Legs:\n{legs_block}\n"
         f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -1094,15 +1695,19 @@ def run_once() -> None:
     if tg_enabled and not polling_active:
         tg_process_updates(enabled=tg_enabled)
 
-    pairs = list(CONFIG["pairs"])
-    fee_map = build_fee_map(pairs)
-    transfer_profiles = build_transfer_profiles()
+    routes = load_triangular_routes()
+    pairs = list(dict.fromkeys(CONFIG["pairs"]))
+    extra_pairs = {leg.pair for route in routes for leg in route.legs}
+    all_pairs = sorted(set(pairs) | extra_pairs)
     threshold = float(CONFIG["threshold_percent"])
     capital = float(CONFIG["simulation_capital_quote"])
     log_csv = CONFIG["log_csv_path"]
+    tri_log_csv = CONFIG.get("triangular_log_csv_path")
+    pair_weight_cfg = CONFIG.get("capital_weights", {}).get("pairs", {})
+    triangle_weight_cfg = CONFIG.get("capital_weights", {}).get("triangles", {})
 
-    pair_quotes: Dict[str, Dict[str, Quote]] = {p: {} for p in pairs}
-    for pair in pairs:
+    pair_quotes: Dict[str, Dict[str, Quote]] = {p: {} for p in all_pairs}
+    for pair in all_pairs:
         for vname, adapter in adapters.items():
             try:
                 q = adapter.fetch_quote(pair)
@@ -1113,18 +1718,42 @@ def run_once() -> None:
                 pair_quotes[pair][vname] = q
 
     alerts = 0
-    for pair, quotes in pair_quotes.items():
+    for pair in pairs:
+        quotes = pair_quotes.get(pair, {})
         if len(quotes) < 2:
             continue
-        opps = compute_opportunities_for_pair(pair, quotes, fee_map, transfer_profiles, capital)
+        capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
+        if capital_for_pair <= 0:
+            continue
+        opps = compute_opportunities_for_pair(pair, quotes, fee_map)
         for opp in opps:
             if opp.net_percent >= threshold:
-                append_csv(log_csv, opp)
-                msg = fmt_alert(opp, capital)
+                total_fee_pct = fee_map[opp.buy_venue].taker_fee_percent + fee_map[opp.sell_venue].taker_fee_percent
+                est_profit, est_percent, base_qty = estimate_profit(capital_for_pair, opp.buy_price, opp.sell_price, total_fee_pct)
+
+                append_csv(log_csv, opp, est_profit, base_qty)
+                msg = fmt_alert(opp, est_profit, est_percent, base_qty, capital_for_pair)
                 tg_send_message(msg, enabled=tg_enabled)
                 alerts += 1
 
-    print(f"Run complete. Oportunidades enviadas: {alerts}")
+    tri_alerts = 0
+    for route in routes:
+        route_capital = get_weighted_capital(capital, triangle_weight_cfg, route.identifier)
+        if route_capital <= 0:
+            continue
+        opp = compute_triangular_opportunity(route, pair_quotes, fee_map, route_capital)
+        if not opp or opp.net_percent < threshold:
+            continue
+
+        if tri_log_csv:
+            append_triangular_csv(tri_log_csv, opp)
+        fee_cfg = fee_map.get(route.venue)
+        fee_pct = fee_cfg.taker_fee_percent if fee_cfg else 0.0
+        msg = fmt_triangular_alert(opp, fee_pct)
+        tg_send_message(msg, enabled=tg_enabled)
+        tri_alerts += 1
+
+    print(f"Run complete. Oportunidades enviadas: {alerts} (cross) / {tri_alerts} (triangulares)")
 
 # =========================
 # CLI
