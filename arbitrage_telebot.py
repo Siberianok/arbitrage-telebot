@@ -147,12 +147,12 @@ PROM_EXCHANGE_ERRORS = Gauge(
 # CONFIG
 # =========================
 CONFIG = {
-    "threshold_percent": 0.5,      # alerta si neto >= 0.50%
+    "threshold_percent": 0.30,      # alerta si neto >= 0.30%
     "pairs": [
         # En modo de prueba solo consideramos los activos solicitados
         "BTC/USDT",
-        "USDT/ARS",
-        "BTC/ARS",
+        "ETH/USDT",
+        "XRP/USDT",
     ],
     "simulation_capital_quote": 10_000,  # capital (USDT) para estimar PnL en alerta
     "max_quote_age_seconds": 15,  # descarta cotizaciones más viejas que este límite
@@ -160,19 +160,18 @@ CONFIG = {
         "pairs": {
             "default": 1.0,
             "BTC/USDT": 1.5,
-            "USDT/ARS": 1.1,
+            "ETH/USDT": 1.2,
+            "XRP/USDT": 1.1,
         },
         "triangles": {
             "default": 0.6,
-            "binance::ARS-USDT-BTC": 1.0,
-            "bybit::ARS-USDT-BTC": 0.8,
         },
     },
     "offline_quotes": {
         # Valores de respaldo en caso de faltar la configuración de pruebas
         "BTC/USDT": {"bid": 30050.0, "ask": 30060.0},
-        "USDT/ARS": {"bid": 350.0, "ask": 352.0},
-        "BTC/ARS": {"bid": 10500000.0, "ask": 10580000.0},
+        "ETH/USDT": {"bid": 1800.0, "ask": 1801.5},
+        "XRP/USDT": {"bid": 0.52, "ask": 0.521},
     },
     "test_mode": {
         "enabled": True,
@@ -185,15 +184,15 @@ CONFIG = {
                         "ask": 30055.0,
                         "source": "spot-test",
                     },
-                    "USDT/ARS": {
-                        "bid": 349.0,
-                        "ask": 350.5,
-                        "source": "p2p-test",
+                    "ETH/USDT": {
+                        "bid": 1798.5,
+                        "ask": 1800.0,
+                        "source": "spot-test",
                     },
-                    "BTC/ARS": {
-                        "bid": 10495000.0,
-                        "ask": 10560000.0,
-                        "source": "triang-test",
+                    "XRP/USDT": {
+                        "bid": 0.519,
+                        "ask": 0.520,
+                        "source": "spot-test",
                     },
                 }
             },
@@ -204,15 +203,15 @@ CONFIG = {
                         "ask": 30066.5,
                         "source": "spot-test",
                     },
-                    "USDT/ARS": {
-                        "bid": 351.5,
-                        "ask": 353.0,
-                        "source": "p2p-test",
+                    "ETH/USDT": {
+                        "bid": 1799.0,
+                        "ask": 1800.6,
+                        "source": "spot-test",
                     },
-                    "BTC/ARS": {
-                        "bid": 10610000.0,
-                        "ask": 10675000.0,
-                        "source": "triang-test",
+                    "XRP/USDT": {
+                        "bid": 0.521,
+                        "ask": 0.522,
+                        "source": "spot-test",
                     },
                 }
             },
@@ -221,6 +220,7 @@ CONFIG = {
     "venues": {
         "binance": {
             "enabled": True,
+            "taker_fee_percent": 0.10,
             "fees": {
                 "default": {
                     "taker": 0.10,
@@ -229,10 +229,9 @@ CONFIG = {
                     "native_token_discount_percent": 0.025,
                 },
                 "per_pair": {
-                    "BTC/USDT": {"taker": 0.08, "slippage_bps": 0.8},
-                    "USDT/ARS": {"taker": 0.08, "slippage_bps": 4.0},
-                    "BTC/ARS": {"taker": 0.08, "slippage_bps": 6.0},
-                    "ETH/USDT": {"taker": 0.085},
+                    "BTC/USDT": {"taker": 0.10, "slippage_bps": 0.8},
+                    "ETH/USDT": {"taker": 0.10, "slippage_bps": 1.2},
+                    "XRP/USDT": {"taker": 0.10, "slippage_bps": 2.0},
                 },
                 "vip_level": "VIP0",
                 "vip_multipliers": {
@@ -302,6 +301,7 @@ CONFIG = {
         },
         "bybit": {
             "enabled": True,
+            "taker_fee_percent": 0.10,
             "fees": {
                 "default": {
                     "taker": 0.10,
@@ -309,8 +309,8 @@ CONFIG = {
                     "slippage_bps": 1.5,
                 },
                 "per_pair": {
-                    "USDT/ARS": {"taker": 0.10, "slippage_bps": 5.0},
-                    "BTC/ARS": {"taker": 0.10, "slippage_bps": 7.0},
+                    "ETH/USDT": {"taker": 0.10, "slippage_bps": 1.5},
+                    "XRP/USDT": {"taker": 0.10, "slippage_bps": 2.5},
                 },
                 "vip_level": "VIP0",
                 "vip_multipliers": {
@@ -383,28 +383,7 @@ CONFIG = {
         },
         # add more venues aquí
     },
-    "triangular_routes": [
-        {
-            "name": "ARS-USDT-BTC",
-            "venue": "binance",
-            "start_asset": "ARS",
-            "legs": [
-                {"pair": "USDT/ARS", "action": "BUY_BASE"},
-                {"pair": "BTC/USDT", "action": "BUY_BASE"},
-                {"pair": "BTC/ARS", "action": "SELL_BASE"},
-            ],
-        },
-        {
-            "name": "ARS-USDT-BTC",
-            "venue": "bybit",
-            "start_asset": "ARS",
-            "legs": [
-                {"pair": "USDT/ARS", "action": "BUY_BASE"},
-                {"pair": "BTC/USDT", "action": "BUY_BASE"},
-                {"pair": "BTC/ARS", "action": "SELL_BASE"},
-            ],
-        },
-    ],
+    "triangular_routes": [],
     "telegram": {
         "enabled": True,                 # poner False para pruebas sin enviar
         "bot_token_env": "TG_BOT_TOKEN",
@@ -474,7 +453,7 @@ def snapshot_public_config() -> Dict[str, Any]:
     }
     return {
         "threshold_percent": float(CONFIG.get("threshold_percent", 0.0)),
-        "pairs": list(CONFIG.get("pairs", [])),
+        "pairs": normalize_pair_list(CONFIG.get("pairs", [])),
         "simulation_capital_quote": float(CONFIG.get("simulation_capital_quote", 0.0)),
         "venues": venues,
         "telegram_enabled": bool(CONFIG.get("telegram", {}).get("enabled", False)),
@@ -565,6 +544,21 @@ def normalize_pair_input(raw_value: str) -> Optional[str]:
             return None
         return f"{base}/{quote}"
     return f"{cleaned}/{DEFAULT_QUOTE_ASSET}"
+
+
+def normalize_pair_list(pairs: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    normalized: List[str] = []
+    for raw_value in pairs:
+        if raw_value is None:
+            continue
+        normalized_pair = normalize_pair_input(str(raw_value))
+        if not normalized_pair:
+            continue
+        if normalized_pair not in seen:
+            normalized.append(normalized_pair)
+            seen.add(normalized_pair)
+    return normalized
 
 
 def build_pairs_reply_keyboard(pairs: Iterable[str]) -> Dict[str, Any]:
@@ -2710,6 +2704,10 @@ def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) 
                 if is_circuit_open(venue):
                     record_exchange_skip(venue, "circuit_open", pair)
                     continue
+                if venue == "bybit" and pair.upper().endswith("/ARS"):
+                    print("[bybit] ARS no está en spot; usar Convert/P2P (no implementado).")
+                    record_exchange_skip(venue, "ars_not_spot", pair)
+                    continue
                 futures_map[executor.submit(_task, adapter, pair, venue)] = (pair, venue)
 
         for future in as_completed(futures_map):
@@ -3592,7 +3590,7 @@ def run_once() -> None:
         tg_process_updates(enabled=tg_enabled)
 
     routes = load_triangular_routes()
-    pairs = list(dict.fromkeys(CONFIG["pairs"]))
+    pairs = normalize_pair_list(CONFIG["pairs"])
     extra_pairs = {leg.pair for route in routes for leg in route.legs}
     all_pairs = sorted(set(pairs) | extra_pairs)
     threshold = float(CONFIG["threshold_percent"])
@@ -3621,10 +3619,20 @@ def run_once() -> None:
         DASHBOARD_STATE["last_quote_count"] = sum(len(v) for v in pair_quotes.values())
         DASHBOARD_STATE["latest_quotes"] = build_quote_snapshot(pair_quotes)
 
+    for pair in all_pairs:
+        venues_available = sorted(pair_quotes.get(pair, {}).keys())
+        print(f"[COVERAGE] {pair}: {venues_available}")
+
     alerts = 0
     for pair in pairs:
         quotes = pair_quotes.get(pair, {})
         if len(quotes) < 2:
+            available = sorted(quotes.keys())
+            print(
+                "[SKIP] "
+                f"{pair}: solo {available} tiene spot; se necesitan 2 venues. "
+                "Sugerencia: BTC/USDT, ETH/USDT, XRP/USDT."
+            )
             continue
         capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
         if capital_for_pair <= 0:
@@ -3812,8 +3820,7 @@ def main():
     args = ap.parse_args()
 
     if args.diagnose_exchanges:
-        selected_pairs = args.diagnose_pairs or CONFIG["pairs"]
-        selected_pairs = [pair.strip().upper() for pair in selected_pairs if pair]
+        selected_pairs = normalize_pair_list(args.diagnose_pairs or CONFIG["pairs"])
         adapters = build_adapters()
         if args.diagnose_venues:
             venues_filter = {venue.strip().lower() for venue in args.diagnose_venues if venue}
