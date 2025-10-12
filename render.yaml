@@ -3,9 +3,13 @@ services:
     name: arbitrage-telebot-web
     plan: free
     env: python
-    buildCommand: pip install requests
+    buildCommand: pip install -r requirements.txt
     startCommand: python arbitrage_telebot.py --web --interval 30
     healthCheckPath: /health
+    disk:
+      name: arbitrage-telebot-data
+      mountPath: /var/lib/arbitrage-telebot
+      sizeGB: 1
     envVars:
       - key: TG_BOT_TOKEN
         sync: false
@@ -13,3 +17,7 @@ services:
         sync: false
       - key: INTERVAL_SECONDS
         value: "30"
+      - key: LOG_BASE_DIR
+        value: /var/lib/arbitrage-telebot/logs
+      - key: LOG_BACKUP_DIR
+        value: /var/lib/arbitrage-telebot/backups

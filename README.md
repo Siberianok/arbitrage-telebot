@@ -15,11 +15,15 @@ Umbral de alerta: configurable (recomendado 0.8–1.0%).
 
 Simulación de PnL: incluida en cada alerta (ej.: capital = 10,000 USDT). 🧮
 
+Priorización avanzada: cada señal pondera liquidez (depth L2), volatilidad histórica y clasifica confianza (alta/media/baja).
+
+Recolección resiliente: consultas paralelas con fallback multi-endpoint, verificación de checksum y métricas Prometheus listas para consumir.
+
 Inteligencia histórica: ajuste dinámico del threshold, backtesting con costes realistas y clasificación de confianza por señal. 📈
 
-Alertas Telegram: múltiples destinos (DM y/o canal). 🔔
+Alertas Telegram: múltiples destinos (DM y/o canal) con formato enriquecido y enlaces directos a los libros de órdenes. 🔔
 
-Logs CSV: logs/opportunities.csv (timestamp, par, venues, spreads, PnL simulado). 🧾
+Logs CSV: logs/opportunities.csv (timestamp, par, venues, spreads, PnL simulado) + respaldos automáticos en `log_backups/`. 🧾
 
 Dashboard web: panel autenticado con estado en tiempo real, historial de alertas y edición segura de configuración. 📊
 
@@ -47,10 +51,11 @@ Para restringir quién puede modificar parámetros, definir `TG_ADMIN_IDS` (list
 
 Ejecutar el bot con `--web` expone:
 
-- `/health` — endpoint simple para liveness/readiness.
+- `/health` — JSON con latencia de la última corrida, métricas por exchange y timestamp del último envío a Telegram.
 - `/` — dashboard autenticado con estado y controles.
 - `/api/state` — snapshot JSON para integraciones.
 - `/api/config` — actualización de configuración vía POST autenticado.
+- `/metrics` — métricas Prometheus listas para scrapear (latencias, alertas, intentos por exchange, etc.).
 
 Configurar credenciales básicas vía variables de entorno:
 
@@ -60,6 +65,11 @@ export WEB_AUTH_PASS="clave-super-segura"
 ```
 
 Luego iniciar con `python arbitrage_telebot.py --web --interval 30 --port 10000`.
+
+📦 Variables clave para despliegues resilientes
+
+- `LOG_BASE_DIR` / `LOG_BACKUP_DIR`: directorios para logs y respaldos persistentes (por defecto `logs/` y `log_backups/`).
+- `QUOTE_WORKERS`: máximo de workers concurrentes para la recolección de precios (default 16).
 
 🔎 Playbooks operativos
 
