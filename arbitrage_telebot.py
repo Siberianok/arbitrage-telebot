@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import csv
-import time
 import argparse
 import base64
-import itertools
-import threading
+import binascii
+import csv
 import hashlib
+import itertools
 import json
-import math
-from statistics import StatisticsError, mean, pstdev
+import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple, Set, Any, Iterable
@@ -568,9 +568,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not auth_header.startswith("Basic "):
             self._send_unauthorized()
             return False
+        parts = auth_header.split(" ", 1)
+        if len(parts) < 2:
+            self._send_unauthorized()
+            return False
         try:
-            decoded = base64.b64decode(auth_header.split(" ", 1)[1]).decode("utf-8")
-        except Exception:
+            decoded = base64.b64decode(parts[1]).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
             self._send_unauthorized()
             return False
         if ":" not in decoded:
@@ -646,7 +650,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length else b"{}"
             try:
-                data = json.loads(raw.decode("utf-8") or "{}")
+                decoded_body = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                self._send_json({"error": "JSON inválido"}, status=400)
+                return
+            if not decoded_body:
+                decoded_body = "{}"
+            try:
+                data = json.loads(decoded_body)
             except json.JSONDecodeError:
                 self._send_json({"error": "JSON inválido"}, status=400)
                 return
