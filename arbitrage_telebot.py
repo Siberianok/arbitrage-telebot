@@ -326,17 +326,11 @@ FEE_REGISTRY: Dict[Tuple[str, str], float] = {}
 
 
 COMMANDS_HELP: List[Tuple[str, str]] = [
-    ("/menu", "Mostrar un teclado con los comandos disponibles"),
-    ("/help", "Cómo acceder al menú de comandos"),
     ("/ping", "Responde con 'pong' para verificar conectividad"),
     ("/status", "Resume configuración actual y chats registrados"),
     (
         "/threshold",
         "Consulta o actualiza el umbral de alerta (%) — usar /threshold <valor>",
-    ),
-    (
-        "/capital",
-        "Consulta o ajusta el capital simulado en USDT — usar /capital <USDT>",
     ),
     ("/pairs", "Lista los pares configurados"),
     ("/addpair", "Agrega un par nuevo al monitoreo — usar /addpair <PAR>",),
@@ -1107,24 +1101,6 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         )
         return
 
-    if command == "/help":
-        tg_send_message(
-            format_command_help(),
-            enabled=enabled,
-            chat_id=chat_id,
-            reply_markup=tg_commands_reply_markup(),
-        )
-        return
-
-    if command == "/menu":
-        tg_send_message(
-            "Elegí una opción del menú 👇",
-            enabled=enabled,
-            chat_id=chat_id,
-            reply_markup=tg_commands_reply_markup(),
-        )
-        return
-
     if command == "/ping":
         tg_send_message("pong", enabled=enabled, chat_id=chat_id)
         return
@@ -1175,38 +1151,6 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         )
         return
 
-    if command == "/capital":
-        if not argument:
-            tg_send_message(
-                f"Capital simulado: {CONFIG['simulation_capital_quote']:.2f} USDT",
-                enabled=enabled,
-                chat_id=chat_id,
-            )
-            return
-        if not ensure_admin(chat_id, enabled):
-            return
-        try:
-            value = float(argument.replace(",", "").strip())
-        except ValueError:
-            tg_send_message(
-                "Valor inválido. Ej: /capital 15000",
-                enabled=enabled,
-                chat_id=chat_id,
-            )
-            return
-        if value <= 0:
-            tg_send_message("El capital debe ser mayor que cero.", enabled=enabled, chat_id=chat_id)
-            return
-        with CONFIG_LOCK:
-            CONFIG["simulation_capital_quote"] = value
-        refresh_config_snapshot()
-        tg_send_message(
-            f"Nuevo capital simulado guardado: {CONFIG['simulation_capital_quote']:.2f} USDT",
-            enabled=enabled,
-            chat_id=chat_id,
-        )
-        return
-
     if command == "/pairs":
         pairs = CONFIG["pairs"]
         if not pairs:
@@ -1252,7 +1196,11 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         tg_send_message(build_test_signal_message(), enabled=enabled, chat_id=chat_id)
         return
 
-    tg_send_message("Comando no reconocido. Probá /help para ver el listado.", enabled=enabled, chat_id=chat_id)
+    tg_send_message(
+        "Comando no reconocido. Usá el botón de menú para ver las opciones disponibles.",
+        enabled=enabled,
+        chat_id=chat_id,
+    )
 
 
 def tg_process_updates(enabled: bool = True) -> None:

@@ -16,7 +16,7 @@
 4. Registrar resultados en hoja de control compartida.
 
 ## 3. Automatización con bots de trading
-1. Ajustar threshold y capital mediante comandos `/threshold` y `/capital` (solo administradores) para adecuarlos al algoritmo.
+1. Ajustar el threshold mediante `/threshold` (solo administradores) y actualizar el capital simulado desde el dashboard para adecuarlos al algoritmo.
 2. Habilitar el bot de trading con API keys en modo "paper" y validar ejecución contra las alertas recibidas.
 3. Pasar a modo real cuando se verifiquen métricas de latencia y slippage.
 4. Mantener monitorización continua del dashboard y Telegram para detectar divergencias.
@@ -29,5 +29,5 @@
 ## 5. Checklist post-operación
 - Confirmar ejecución en ambos exchanges.
 - Reconciliar balances y fees cobrados.
-- Actualizar threshold/capital si el mercado cambió.
+- Actualizar threshold y capital si el mercado cambió.
 - Archivar logs CSV y capturas relevantes en el repositorio de operaciones.

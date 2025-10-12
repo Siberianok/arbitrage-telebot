@@ -31,11 +31,9 @@ Ejecución v1 (inventario): ejecutás el spread con saldo en ambos exchanges (si
 
 | Comando | Descripción |
 | --- | --- |
-| `/help` | Muestra el listado de comandos disponibles. |
 | `/ping` | Devuelve `pong` para verificar la conectividad del bot. |
 | `/status` | Resume el threshold configurado, pares monitoreados y chats registrados. |
 | `/threshold <valor>` | Consulta o actualiza el umbral de alerta (en %) _(solo admins pueden modificar)_. |
-| `/capital <USDT>` | Consulta o ajusta el capital simulado en USDT _(solo admins pueden modificar)_. |
 | `/pairs` | Lista los pares configurados actualmente. |
 | `/addpair <PAR>` | Agrega un nuevo par (por ejemplo `BTC/USDT`) _(solo admins)_. |
 | `/delpair <PAR>` | Elimina un par del monitoreo _(solo admins)_. |
