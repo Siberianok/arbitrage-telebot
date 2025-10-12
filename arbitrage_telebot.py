@@ -348,6 +348,38 @@ def get_bot_token() -> str:
     return os.getenv(CONFIG["telegram"]["bot_token_env"], "").strip()
 
 
+def tg_command_menu_payload() -> List[Dict[str, str]]:
+    payload: List[Dict[str, str]] = []
+    for command, description in COMMANDS_HELP:
+        payload.append({
+            "command": command.lstrip("/"),
+            "description": description[:256],
+        })
+    return payload
+
+
+def tg_sync_command_menu(enabled: bool = True) -> None:
+    if not enabled:
+        return
+
+    token = get_bot_token()
+    if not token:
+        log_event("telegram.commands.skip", reason="missing_token")
+        return
+
+    commands_payload = tg_command_menu_payload()
+    try:
+        tg_api_request(
+            "setMyCommands",
+            params={"commands": json.dumps(commands_payload)},
+            http_method="post",
+        )
+    except Exception as exc:  # pragma: no cover - logging only
+        log_event("telegram.commands.error", error=str(exc))
+    else:
+        log_event("telegram.commands.synced", commands=len(commands_payload))
+
+
 def _load_telegram_chat_ids_from_env() -> None:
     chat_ids_env = os.getenv(CONFIG["telegram"]["chat_ids_env"], "").strip()
     if not chat_ids_env:
@@ -2620,6 +2652,8 @@ def main():
     args = ap.parse_args()
 
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
+    if tg_enabled:
+        tg_sync_command_menu(enabled=True)
     if tg_enabled and (args.loop or args.web):
         ensure_telegram_polling_thread(enabled=True, interval=1.0)
 
