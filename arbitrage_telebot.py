@@ -149,21 +149,10 @@ PROM_EXCHANGE_ERRORS = Gauge(
 CONFIG = {
     "threshold_percent": 0.6,      # alerta si neto >= 0.60%
     "pairs": [
+        # En modo de prueba solo consideramos los activos solicitados
         "BTC/USDT",
-        "ETH/USDT",
-        "XRP/USDT",
-        "ADA/USDT",
-        "ALGO/USDT",
-        "SHIB/USDT",
-        "SOL/USDT",
-        "MATIC/USDT",
-        "BTC/USDC",
-        "ETH/BTC",
-        "BTC/EUR",
-        "ETH/EUR",
-        "USDC/USDT",
-        "BUSD/USDT",
-        "BUSD/USDC",
+        "USDT/ARS",
+        "BTC/ARS",
     ],
     "simulation_capital_quote": 10_000,  # capital (USDT) para estimar PnL en alerta
     "max_quote_age_seconds": 15,  # descarta cotizaciones más viejas que este límite
@@ -171,20 +160,63 @@ CONFIG = {
         "pairs": {
             "default": 1.0,
             "BTC/USDT": 1.5,
-            "ETH/USDT": 1.2,
-            "ETH/BTC": 0.8,
+            "USDT/ARS": 1.1,
         },
         "triangles": {
             "default": 0.6,
-            "binance::USDT-USDC-BUSD": 1.0,
-            "bybit::USDT-BTC-USDC": 0.8,
+            "binance::ARS-USDT-BTC": 1.0,
+            "bybit::ARS-USDT-BTC": 0.8,
         },
     },
     "offline_quotes": {
+        # Valores de respaldo en caso de faltar la configuración de pruebas
         "BTC/USDT": {"bid": 30050.0, "ask": 30060.0},
-        "ETH/USDT": {"bid": 2050.0, "ask": 2052.5},
-        "SOL/USDT": {"bid": 32.5, "ask": 32.6},
-        "ADA/USDT": {"bid": 0.58, "ask": 0.581},
+        "USDT/ARS": {"bid": 350.0, "ask": 352.0},
+        "BTC/ARS": {"bid": 10500000.0, "ask": 10580000.0},
+    },
+    "test_mode": {
+        "enabled": True,
+        "pause_live_requests": True,
+        "venues": {
+            "binance": {
+                "pairs": {
+                    "BTC/USDT": {
+                        "bid": 30050.5,
+                        "ask": 30055.0,
+                        "source": "spot-test",
+                    },
+                    "USDT/ARS": {
+                        "bid": 349.0,
+                        "ask": 350.5,
+                        "source": "p2p-test",
+                    },
+                    "BTC/ARS": {
+                        "bid": 10495000.0,
+                        "ask": 10560000.0,
+                        "source": "triang-test",
+                    },
+                }
+            },
+            "bybit": {
+                "pairs": {
+                    "BTC/USDT": {
+                        "bid": 30062.0,
+                        "ask": 30066.5,
+                        "source": "spot-test",
+                    },
+                    "USDT/ARS": {
+                        "bid": 351.5,
+                        "ask": 353.0,
+                        "source": "p2p-test",
+                    },
+                    "BTC/ARS": {
+                        "bid": 10610000.0,
+                        "ask": 10675000.0,
+                        "source": "triang-test",
+                    },
+                }
+            },
+        },
     },
     "venues": {
         "binance": {
@@ -298,129 +330,32 @@ CONFIG = {
             },
         },
         "kucoin": {
-            "enabled": True,
-            "fees": {
-                "default": {
-                    "taker": 0.10,
-                    "maker": 0.08,
-                    "slippage_bps": 1.2,
-                },
-                "vip_level": "VIP0",
-                "vip_multipliers": {
-                    "default": 1.0,
-                    "VIP1": 0.92,
-                },
-                "native_token_discount_percent": 0.02,
-            },
-            "transfers": {
-                "BTC": {
-                    "withdraw_fee": 0.0006,
-                    "withdraw_minutes": 40,
-                    "deposit_fee": 0.0,
-                    "deposit_minutes": 20,
-                },
-                "ETH": {
-                    "withdraw_fee": 0.003,
-                    "withdraw_minutes": 15,
-                    "deposit_fee": 0.0,
-                    "deposit_minutes": 8,
-                },
-                "USDT": {
-                    "withdraw_fee": 1.0,
-                    "withdraw_minutes": 25,
-                    "deposit_fee": 0.0,
-                    "deposit_minutes": 10,
-                },
-            },
-            "endpoints": {
-                "ticker": {
-                    "primary": "https://api.kucoin.com/api/v1/market/orderbook/level1",
-                    "fallbacks": [
-                        "https://api1.kucoin.com/api/v1/market/orderbook/level1",
-                        "https://api2.kucoin.com/api/v1/market/orderbook/level1",
-                    ],
-                },
-                "depth": {
-                    "primary": "https://api.kucoin.com/api/v1/market/orderbook/level2_20",
-                    "fallbacks": [
-                        "https://api1.kucoin.com/api/v1/market/orderbook/level2_20",
-                        "https://api2.kucoin.com/api/v1/market/orderbook/level2_20",
-                    ],
-                },
-            },
+            "enabled": False,
         },
         "okx": {
-            "enabled": True,
-            "fees": {
-                "default": {
-                    "taker": 0.10,
-                    "maker": 0.09,
-                    "slippage_bps": 1.1,
-                },
-                "vip_level": "VIP0",
-                "vip_multipliers": {
-                    "default": 1.0,
-                    "VIP1": 0.96,
-                },
-            },
-            "transfers": {
-                "BTC": {
-                    "withdraw_fee": 0.0004,
-                    "withdraw_minutes": 28,
-                    "deposit_fee": 0.0,
-                    "deposit_minutes": 12,
-                },
-                "ETH": {
-                    "withdraw_fee": 0.002,
-                    "withdraw_minutes": 9,
-                    "deposit_fee": 0.0,
-                    "deposit_minutes": 4,
-                },
-                "USDT": {
-                    "withdraw_fee": 0.8,
-                    "withdraw_minutes": 18,
-                    "deposit_fee": 0.0,
-                    "deposit_minutes": 6,
-                },
-            },
-            "endpoints": {
-                "ticker": {
-                    "primary": "https://www.okx.com/api/v5/market/ticker",
-                    "fallbacks": [
-                        "https://aws.okx.com/api/v5/market/ticker",
-                        "https://www.okx.cab/api/v5/market/ticker",
-                    ],
-                },
-                "depth": {
-                    "primary": "https://www.okx.com/api/v5/market/books",
-                    "fallbacks": [
-                        "https://aws.okx.com/api/v5/market/books",
-                        "https://www.okx.cab/api/v5/market/books",
-                    ],
-                },
-            },
+            "enabled": False,
         },
         # add more venues aquí
     },
     "triangular_routes": [
         {
-            "name": "USDT-USDC-BUSD",
+            "name": "ARS-USDT-BTC",
             "venue": "binance",
-            "start_asset": "USDT",
+            "start_asset": "ARS",
             "legs": [
-                {"pair": "USDC/USDT", "action": "BUY_BASE"},
-                {"pair": "BUSD/USDC", "action": "BUY_BASE"},
-                {"pair": "BUSD/USDT", "action": "SELL_BASE"},
+                {"pair": "USDT/ARS", "action": "BUY_BASE"},
+                {"pair": "BTC/USDT", "action": "BUY_BASE"},
+                {"pair": "BTC/ARS", "action": "SELL_BASE"},
             ],
         },
         {
-            "name": "USDT-BTC-USDC",
+            "name": "ARS-USDT-BTC",
             "venue": "bybit",
-            "start_asset": "USDT",
+            "start_asset": "ARS",
             "legs": [
+                {"pair": "USDT/ARS", "action": "BUY_BASE"},
                 {"pair": "BTC/USDT", "action": "BUY_BASE"},
-                {"pair": "BTC/USDC", "action": "SELL_BASE"},
-                {"pair": "USDC/USDT", "action": "SELL_BASE"},
+                {"pair": "BTC/ARS", "action": "SELL_BASE"},
             ],
         },
     ],
@@ -2022,6 +1957,48 @@ class ExchangeAdapter:
     def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
         return None
 
+    def _test_mode_config(self) -> Dict[str, Any]:
+        cfg = CONFIG.get("test_mode") or {}
+        if not isinstance(cfg, dict):
+            return {}
+        return cfg
+
+    def _is_test_mode_enabled(self) -> bool:
+        return bool(self._test_mode_config().get("enabled", False))
+
+    def _test_mode_paused(self) -> bool:
+        cfg = self._test_mode_config()
+        return bool(cfg.get("pause_live_requests", False))
+
+    def _test_mode_quote(self, pair: str) -> Optional[Quote]:
+        if not self._is_test_mode_enabled():
+            return None
+        cfg = self._test_mode_config()
+        venues_cfg = cfg.get("venues") or {}
+        if not isinstance(venues_cfg, dict):
+            return None
+        venue_cfg = venues_cfg.get(self.name, {})
+        pairs_cfg = venue_cfg.get("pairs") or {}
+        if not isinstance(pairs_cfg, dict):
+            return None
+        data = pairs_cfg.get(pair)
+        if not isinstance(data, dict):
+            return None
+        bid = safe_float(data.get("bid"))
+        ask = safe_float(data.get("ask"))
+        if bid <= 0 or ask <= 0 or bid >= ask:
+            return None
+        ts_raw = data.get("ts")
+        ts = int(ts_raw) if ts_raw is not None else current_millis()
+        source = str(data.get("source") or "test")
+        return Quote(
+            self.normalize_symbol(pair),
+            bid,
+            ask,
+            ts,
+            source=source,
+        )
+
     def _endpoint_config(self, endpoint: str, default: str) -> Tuple[str, List[str]]:
         venue_cfg = CONFIG.get("venues", {}).get(self.name, {})
         endpoints_cfg = venue_cfg.get("endpoints", {})
@@ -2058,6 +2035,8 @@ class ExchangeAdapter:
 
     def get_depth(self, pair: str) -> Optional[DepthInfo]:
         if not self.depth_supported:
+            return None
+        if self._is_test_mode_enabled() and self._test_mode_paused():
             return None
         symbol = self.normalize_symbol(pair)
         cache_key = (self.name, symbol)
@@ -2101,6 +2080,11 @@ class Binance(ExchangeAdapter):
         return pair.replace("/", "")
 
     def fetch_quote(self, pair: str) -> Optional[Quote]:
+        test_quote = self._test_mode_quote(pair)
+        if test_quote is not None:
+            return self._attach_depth(pair, test_quote)
+        if self._is_test_mode_enabled() and self._test_mode_paused():
+            return self._attach_depth(pair, self._offline_quote(pair, reason="test_mode_paused"))
         sym = self.normalize_symbol(pair)
         url, fallbacks = self._endpoint_config(
             "ticker", "https://api.binance.com/api/v3/ticker/bookTicker"
@@ -2167,6 +2151,11 @@ class Bybit(ExchangeAdapter):
         return pair.replace("/", "")
 
     def fetch_quote(self, pair: str) -> Optional[Quote]:
+        test_quote = self._test_mode_quote(pair)
+        if test_quote is not None:
+            return self._attach_depth(pair, test_quote)
+        if self._is_test_mode_enabled() and self._test_mode_paused():
+            return self._attach_depth(pair, self._offline_quote(pair, reason="test_mode_paused"))
         sym = self.normalize_symbol(pair)
         url, fallbacks = self._endpoint_config(
             "ticker", "https://api.bybit.com/v5/market/tickers"
@@ -2250,6 +2239,11 @@ class KuCoin(ExchangeAdapter):
         return pair.replace("/", "-")
 
     def fetch_quote(self, pair: str) -> Optional[Quote]:
+        test_quote = self._test_mode_quote(pair)
+        if test_quote is not None:
+            return self._attach_depth(pair, test_quote)
+        if self._is_test_mode_enabled() and self._test_mode_paused():
+            return self._attach_depth(pair, self._offline_quote(pair, reason="test_mode_paused"))
         sym = self.normalize_symbol(pair)
         url, fallbacks = self._endpoint_config(
             "ticker", "https://api.kucoin.com/api/v1/market/orderbook/level1"
@@ -2322,6 +2316,11 @@ class OKX(ExchangeAdapter):
         return pair.replace("/", "-")
 
     def fetch_quote(self, pair: str) -> Optional[Quote]:
+        test_quote = self._test_mode_quote(pair)
+        if test_quote is not None:
+            return self._attach_depth(pair, test_quote)
+        if self._is_test_mode_enabled() and self._test_mode_paused():
+            return self._attach_depth(pair, self._offline_quote(pair, reason="test_mode_paused"))
         sym = self.normalize_symbol(pair)
         url, fallbacks = self._endpoint_config(
             "ticker", "https://www.okx.com/api/v5/market/ticker"
