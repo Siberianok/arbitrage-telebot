@@ -7,6 +7,7 @@ import binascii
 import csv
 import hashlib
 import itertools
+import math
 import json
 import os
 import threading
