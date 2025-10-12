@@ -1,14 +1,15 @@
 services:
-  - type: worker
-    name: arbitrage-telebot
+  - type: web
+    name: arbitrage-telebot-web
+    plan: free
     env: python
-    buildCommand: |
-      pip install -r requirements.txt
-    startCommand: |
-      python arbitrage_telebot.py --loop --interval 30
-    autoDeploy: true
+    buildCommand: pip install requests
+    startCommand: python arbitrage_telebot.py --web --interval 30
+    healthCheckPath: /health
     envVars:
       - key: TG_BOT_TOKEN
         sync: false
       - key: TG_CHAT_IDS
         sync: false
+      - key: INTERVAL_SECONDS
+        value: "30"
