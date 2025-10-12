@@ -41,17 +41,25 @@ class _ErrorAdapter(_BaseAdapter):
         raise RuntimeError("boom")
 
 
+class _InvalidQuoteAdapter(_BaseAdapter):
+    name = "invalid"
+
+    def fetch_quote(self, pair: str) -> Optional[Quote]:
+        return Quote(pair, 1.0, 0.5, int(time.time() * 1000), source="live")
+
+
 def test_diagnose_exchange_pairs_returns_statuses():
     adapters = {
         "good": _GoodAdapter(),
         "offline": _OfflineAdapter(),
         "nodata": _NoDataAdapter(),
         "error": _ErrorAdapter(),
+        "invalid": _InvalidQuoteAdapter(),
     }
 
     results = diagnose_exchange_pairs(["BTC/USDT"], adapters, max_workers=1)
 
-    assert len(results) == 4
+    assert len(results) == 5
     results_by_venue = {item["venue"]: item for item in results}
 
     assert results_by_venue["good"]["status"] == "ok"
@@ -65,6 +73,9 @@ def test_diagnose_exchange_pairs_returns_statuses():
 
     assert results_by_venue["error"]["status"] == "error"
     assert "RuntimeError" in results_by_venue["error"].get("error", "")
+
+    assert results_by_venue["invalid"]["status"] == "error"
+    assert "InvalidQuote" in results_by_venue["invalid"].get("error", "")
 
     for item in results:
         assert item["latency_ms"] >= 0.0
