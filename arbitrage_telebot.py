@@ -35,7 +35,7 @@ from observability import (
 # CONFIG
 # =========================
 CONFIG = {
-    "threshold_percent": 0.8,      # alerta si neto >= 0.80%
+    "threshold_percent": 0.6,      # alerta si neto >= 0.60%
     "pairs": [
         "BTC/USDT",
         "ETH/USDT",
