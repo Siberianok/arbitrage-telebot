@@ -11,7 +11,8 @@ import itertools
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass
-from typing import Dict, Optional, List, Tuple, Set
+from statistics import mean, pstdev, StatisticsError
+from typing import Dict, Optional, List, Tuple, Set, Iterable
 
 import requests
 
@@ -42,11 +43,29 @@ CONFIG = {
         "chat_ids_env": "TG_CHAT_IDS",   # coma-separado: "-100123...,123456..."
     },
     "log_csv_path": "logs/opportunities.csv",
+    "analysis": {
+        "lookback_hours": 72,
+        "target_success_rate": 0.65,
+        "min_threshold_percent": 0.3,
+        "max_threshold_percent": 2.5,
+        "adjust_multiplier": 0.6,
+    },
+    "execution_costs": {
+        "slippage_bps": 8.0,        # coste extra (ida+vuelta)
+        "rebalance_bps": 5.0,       # coste de rebalanceo eventual
+        "latency_seconds": 6.0,
+        "latency_penalty_multiplier": 0.45,
+    },
 }
 
 TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
 TELEGRAM_POLLING_THREAD: Optional[threading.Thread] = None
+
+DYNAMIC_THRESHOLD_PERCENT = float(CONFIG["threshold_percent"])
+LATEST_ANALYSIS: Optional["HistoricalAnalysis"] = None
+LOG_HEADER_INITIALIZED = False
+
 
 
 COMMANDS_HELP: List[Tuple[str, str]] = [
@@ -208,13 +227,14 @@ def tg_api_request(method: str, params: Optional[Dict] = None, http_method: str 
 
 
 def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) -> None:
+    global DYNAMIC_THRESHOLD_PERCENT
     command = command.lower()
     register_telegram_chat(chat_id)
 
     if command == "/start":
         response = (
             "Hola! Ya estás registrado para recibir señales.\n"
-            f"Threshold actual: {CONFIG['threshold_percent']:.3f}%\n"
+            f"Threshold base: {CONFIG['threshold_percent']:.3f}% | dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
             f"{format_command_help()}"
         )
         tg_send_message(response, enabled=enabled, chat_id=chat_id)
@@ -231,9 +251,16 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
     if command == "/status":
         pairs = CONFIG["pairs"]
         chats = get_registered_chat_ids()
+        analysis_summary = "Sin historial"
+        if LATEST_ANALYSIS and LATEST_ANALYSIS.rows_considered:
+            analysis_summary = (
+                f"SR: {LATEST_ANALYSIS.success_rate*100:.1f}%"
+                f" ({LATEST_ANALYSIS.rows_considered} señales)"
+            )
         response = (
             "Estado actual:\n"
-            f"Threshold: {CONFIG['threshold_percent']:.3f}%\n"
+            f"Threshold base: {CONFIG['threshold_percent']:.3f}% | dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
+            f"Histórico: {analysis_summary}\n"
             f"Pares ({len(pairs)}): {', '.join(pairs) if pairs else 'sin pares'}\n"
             f"Chats registrados: {', '.join(chats) if chats else 'ninguno'}"
         )
@@ -243,7 +270,10 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
     if command == "/threshold":
         if not argument:
             tg_send_message(
-                f"Threshold actual: {CONFIG['threshold_percent']:.3f}%",
+                (
+                    f"Threshold base: {CONFIG['threshold_percent']:.3f}% | "
+                    f"dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%"
+                ),
                 enabled=enabled,
                 chat_id=chat_id,
             )
@@ -254,6 +284,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             tg_send_message("Valor inválido. Ej: /threshold 0.8", enabled=enabled, chat_id=chat_id)
             return
         CONFIG["threshold_percent"] = value
+        DYNAMIC_THRESHOLD_PERCENT = value
         tg_send_message(
             f"Nuevo threshold guardado: {CONFIG['threshold_percent']:.3f}%",
             enabled=enabled,
@@ -374,6 +405,7 @@ class Quote:
     bid: float
     ask: float
     ts: int
+    volume_quote_24h: float = 0.0
 
 @dataclass
 class VenueFees:
@@ -401,7 +433,13 @@ class Binance(ExchangeAdapter):
         url = "https://api.binance.com/api/v3/ticker/bookTicker"
         data = http_get_json(url, params={"symbol": sym})
         bid = float(data["bidPrice"]); ask = float(data["askPrice"])
-        return Quote(sym, bid, ask, int(time.time()*1000))
+        volume_quote = 0.0
+        try:
+            stats = http_get_json("https://api.binance.com/api/v3/ticker/24hr", params={"symbol": sym})
+            volume_quote = float(stats.get("quoteVolume", 0.0))
+        except Exception:
+            volume_quote = 0.0
+        return Quote(sym, bid, ask, int(time.time()*1000), volume_quote)
 
 class Bybit(ExchangeAdapter):
     name = "bybit"
@@ -414,7 +452,8 @@ class Bybit(ExchangeAdapter):
         try:
             item = data["result"]["list"][0]
             bid = float(item["bid1Price"]); ask = float(item["ask1Price"])
-            return Quote(sym, bid, ask, int(time.time()*1000))
+            volume_quote = float(item.get("turnover24h", 0.0))
+            return Quote(sym, bid, ask, int(time.time()*1000), volume_quote)
         except Exception:
             return None
 
@@ -429,7 +468,13 @@ class KuCoin(ExchangeAdapter):
         try:
             d = data["data"]
             bid = float(d["bestBid"]); ask = float(d["bestAsk"])
-            return Quote(sym, bid, ask, int(time.time()*1000))
+            volume_quote = 0.0
+            try:
+                stats = http_get_json("https://api.kucoin.com/api/v1/market/stats", params={"symbol": sym})
+                volume_quote = float(stats.get("data", {}).get("volValue", 0.0))
+            except Exception:
+                volume_quote = 0.0
+            return Quote(sym, bid, ask, int(time.time()*1000), volume_quote)
         except Exception:
             return None
 
@@ -444,7 +489,8 @@ class OKX(ExchangeAdapter):
         try:
             item = data["data"][0]
             bid = float(item["bidPx"]); ask = float(item["askPx"])
-            return Quote(sym, bid, ask, int(time.time()*1000))
+            volume_quote = float(item.get("volCcy24h", 0.0))
+            return Quote(sym, bid, ask, int(time.time()*1000), volume_quote)
         except Exception:
             return None
 
@@ -477,6 +523,228 @@ class Opportunity:
     sell_price: float
     gross_percent: float
     net_percent: float
+    liquidity_score: float = 0.0
+    volatility_score: float = 0.0
+    priority_score: float = 0.0
+    confidence_label: str = "media"
+
+
+@dataclass
+class BacktestParams:
+    capital_quote: float
+    slippage_bps: float
+    rebalance_bps: float
+    latency_seconds: float
+    latency_penalty_multiplier: float
+
+
+@dataclass
+class BacktestReport:
+    total_trades: int = 0
+    profitable_trades: int = 0
+    cumulative_pnl: float = 0.0
+    average_pnl: float = 0.0
+    success_rate: float = 0.0
+    average_effective_percent: float = 0.0
+
+
+@dataclass
+class HistoricalAnalysis:
+    rows_considered: int
+    success_rate: float
+    average_net_percent: float
+    average_effective_percent: float
+    recommended_threshold: float
+    pair_volatility: Dict[str, float]
+    max_volatility: float
+    backtest: BacktestReport
+
+
+def safe_float(value: Optional[str], default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def load_historical_rows(path: str, lookback_hours: int) -> List[Dict[str, str]]:
+    if not os.path.exists(path):
+        return []
+
+    ensure_log_header(path)
+
+    cutoff_ts: Optional[int] = None
+    if lookback_hours > 0:
+        cutoff_ts = int(time.time() - lookback_hours * 3600)
+
+    rows: List[Dict[str, str]] = []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                ts = int(float(row.get("ts", 0)))
+            except (TypeError, ValueError):
+                continue
+            if cutoff_ts is not None and ts < cutoff_ts:
+                continue
+            rows.append(row)
+    return rows
+
+
+def compute_pair_volatility(rows: Iterable[Dict[str, str]]) -> Tuple[Dict[str, float], float]:
+    per_pair: Dict[str, List[float]] = {}
+    for row in rows:
+        pair = row.get("pair")
+        if not pair:
+            continue
+        per_pair.setdefault(pair, []).append(safe_float(row.get("net_%"), 0.0))
+
+    volatility: Dict[str, float] = {}
+    max_volatility = 0.0
+    for pair, values in per_pair.items():
+        if len(values) > 1:
+            try:
+                vol = pstdev(values)
+            except StatisticsError:
+                vol = 0.0
+        else:
+            vol = 0.0
+        volatility[pair] = vol
+        max_volatility = max(max_volatility, vol)
+    return volatility, max_volatility
+
+
+def build_backtest_params(capital: float, cfg: Dict[str, float]) -> BacktestParams:
+    return BacktestParams(
+        capital_quote=capital,
+        slippage_bps=float(cfg.get("slippage_bps", 0.0)),
+        rebalance_bps=float(cfg.get("rebalance_bps", 0.0)),
+        latency_seconds=float(cfg.get("latency_seconds", 0.0)),
+        latency_penalty_multiplier=float(cfg.get("latency_penalty_multiplier", 0.0)),
+    )
+
+
+def compute_effective_net_percent(net_percent: float, pair_volatility: float, params: BacktestParams) -> float:
+    penalty = (params.slippage_bps + params.rebalance_bps) / 100.0
+    if pair_volatility > 0 and params.latency_seconds > 0 and params.latency_penalty_multiplier > 0:
+        penalty += pair_volatility * (params.latency_seconds / 60.0) * params.latency_penalty_multiplier
+    return net_percent - penalty
+
+
+def run_backtest(rows: Iterable[Dict[str, str]], params: BacktestParams, pair_volatility: Dict[str, float]) -> Tuple[BacktestReport, List[float], List[float]]:
+    net_values: List[float] = []
+    effective_values: List[float] = []
+    cumulative_pnl = 0.0
+    profitable = 0
+
+    for row in rows:
+        pair = row.get("pair")
+        if not pair:
+            continue
+        net_percent = safe_float(row.get("net_%"), 0.0)
+        effective_net = compute_effective_net_percent(net_percent, pair_volatility.get(pair, 0.0), params)
+        net_values.append(net_percent)
+        effective_values.append(effective_net)
+        pnl = params.capital_quote * (effective_net / 100.0)
+        cumulative_pnl += pnl
+        if pnl > 0:
+            profitable += 1
+
+    total = len(effective_values)
+    average_pnl = cumulative_pnl / total if total else 0.0
+    average_effective = mean(effective_values) if effective_values else 0.0
+    success_rate = (profitable / total) if total else 0.0
+
+    report = BacktestReport(
+        total_trades=total,
+        profitable_trades=profitable,
+        cumulative_pnl=cumulative_pnl,
+        average_pnl=average_pnl,
+        success_rate=success_rate,
+        average_effective_percent=average_effective,
+    )
+
+    return report, net_values, effective_values
+
+
+def compute_dynamic_threshold(
+    net_values: List[float],
+    effective_values: List[float],
+    success_rate: float,
+    current_threshold: float,
+    cfg: Dict[str, float],
+) -> float:
+    if not net_values:
+        return current_threshold
+
+    target = float(cfg.get("target_success_rate", 0.6))
+    min_thr = float(cfg.get("min_threshold_percent", 0.1))
+    max_thr = float(cfg.get("max_threshold_percent", 5.0))
+    adjust_multiplier = float(cfg.get("adjust_multiplier", 0.4))
+
+    sorted_net = sorted(net_values)
+    # índice asociado al percentil que deja target% de señales por encima
+    idx = max(0, min(len(sorted_net) - 1, int(math.floor((1 - target) * len(sorted_net)))))
+    quantile_net = sorted_net[idx]
+
+    penalties: List[float] = []
+    for net, eff in zip(net_values, effective_values):
+        penalties.append(net - eff)
+    avg_penalty = mean(penalties) if penalties else 0.0
+
+    candidate = quantile_net + max(0.0, avg_penalty)
+
+    diff = success_rate - target
+    adjusted = current_threshold - diff * adjust_multiplier
+
+    blended = 0.5 * adjusted + 0.5 * candidate
+    return max(min_thr, min(max_thr, blended))
+
+
+def analyze_historical_performance(path: str, capital: float) -> HistoricalAnalysis:
+    analysis_cfg = CONFIG.get("analysis", {})
+    lookback_hours = int(analysis_cfg.get("lookback_hours", 0))
+    rows = load_historical_rows(path, lookback_hours)
+
+    params = build_backtest_params(capital, CONFIG.get("execution_costs", {}))
+
+    if not rows:
+        backtest = BacktestReport()
+        return HistoricalAnalysis(
+            rows_considered=0,
+            success_rate=backtest.success_rate,
+            average_net_percent=0.0,
+            average_effective_percent=backtest.average_effective_percent,
+            recommended_threshold=float(CONFIG["threshold_percent"]),
+            pair_volatility={},
+            max_volatility=0.0,
+            backtest=backtest,
+        )
+
+    volatility, max_volatility = compute_pair_volatility(rows)
+    backtest, net_values, effective_values = run_backtest(rows, params, volatility)
+
+    average_net = mean(net_values) if net_values else 0.0
+    recommended_threshold = compute_dynamic_threshold(
+        net_values,
+        effective_values,
+        backtest.success_rate,
+        float(CONFIG["threshold_percent"]),
+        analysis_cfg,
+    )
+
+    return HistoricalAnalysis(
+        rows_considered=len(net_values),
+        success_rate=backtest.success_rate,
+        average_net_percent=average_net,
+        average_effective_percent=backtest.average_effective_percent,
+        recommended_threshold=recommended_threshold,
+        pair_volatility=volatility,
+        max_volatility=max_volatility,
+        backtest=backtest,
+    )
 
 def compute_opportunities_for_pair(pair: str,
                                    quotes: Dict[str, Quote],
@@ -503,6 +771,66 @@ def compute_opportunities_for_pair(pair: str,
 
     return sorted(out, key=lambda o: o.net_percent, reverse=True)
 
+
+def compute_liquidity_score(pair_quotes: Dict[str, Quote], buy_venue: str, sell_venue: str) -> float:
+    buy_quote = pair_quotes.get(buy_venue)
+    sell_quote = pair_quotes.get(sell_venue)
+    if not buy_quote or not sell_quote:
+        return 0.0
+
+    volumes = [q.volume_quote_24h for q in pair_quotes.values() if q and q.volume_quote_24h > 0]
+    if not volumes:
+        return 0.0
+    max_volume = max(volumes)
+    if max_volume <= 0:
+        return 0.0
+
+    base_volume = min(buy_quote.volume_quote_24h, sell_quote.volume_quote_24h)
+    return max(0.0, min(1.0, base_volume / max_volume))
+
+
+def compute_volatility_score(pair: str, analysis: Optional[HistoricalAnalysis]) -> float:
+    if not analysis or analysis.max_volatility <= 0:
+        return 0.0
+    vol = analysis.pair_volatility.get(pair, 0.0)
+    if analysis.max_volatility <= 0:
+        return 0.0
+    return max(0.0, min(1.0, vol / analysis.max_volatility))
+
+
+def compute_priority_score(net_percent: float, liquidity: float, volatility_score: float, threshold: float) -> Tuple[float, float]:
+    normalized_net = 0.0
+    if threshold > 0:
+        normalized_net = max(0.0, min(1.5, net_percent / threshold))
+    stability = 1.0 - volatility_score
+    priority = (0.45 * min(1.0, normalized_net) + 0.4 * liquidity + 0.15 * max(0.0, stability))
+    return max(0.0, min(1.0, priority)), normalized_net
+
+
+def classify_confidence(priority: float, normalized_net: float, liquidity: float, volatility_score: float) -> str:
+    if priority >= 0.75 and normalized_net >= 1.1 and liquidity >= 0.6 and volatility_score <= 0.35:
+        return "alta"
+    if priority >= 0.45 and liquidity >= 0.3:
+        return "media"
+    return "baja"
+
+
+def enrich_opportunity(
+    opp: Opportunity,
+    pair_quotes: Dict[str, Quote],
+    analysis: Optional[HistoricalAnalysis],
+    threshold: float,
+) -> Opportunity:
+    liquidity = compute_liquidity_score(pair_quotes, opp.buy_venue, opp.sell_venue)
+    volatility_score = compute_volatility_score(opp.pair, analysis)
+    priority, normalized_net = compute_priority_score(opp.net_percent, liquidity, volatility_score, threshold)
+    confidence = classify_confidence(priority, normalized_net, liquidity, volatility_score)
+    opp.liquidity_score = liquidity
+    opp.volatility_score = volatility_score
+    opp.priority_score = priority
+    opp.confidence_label = confidence
+    return opp
+
 # =========================
 # Simulación PnL (simple)
 # =========================
@@ -520,18 +848,94 @@ def estimate_profit(capital_quote: float, buy_price: float, sell_price: float, t
 # =========================
 # Logging CSV
 # =========================
-def append_csv(path: str, opp: Opportunity, est_profit: float, base_qty: float) -> None:
+LOG_HEADER = [
+    "ts",
+    "pair",
+    "buy_venue",
+    "sell_venue",
+    "buy_price",
+    "sell_price",
+    "gross_%",
+    "net_%",
+    "est_profit_quote",
+    "base_qty",
+    "liquidity_score",
+    "volatility_score",
+    "priority_score",
+    "confidence",
+]
+
+
+def ensure_log_header(path: str) -> None:
+    global LOG_HEADER_INITIALIZED
+    if LOG_HEADER_INITIALIZED:
+        return
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    exists = os.path.exists(path)
+
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(LOG_HEADER)
+        LOG_HEADER_INITIALIZED = True
+        return
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            header = []
+        rows = list(reader)
+
+    if header == LOG_HEADER:
+        LOG_HEADER_INITIALIZED = True
+        return
+
+    # Upgrade antiguo header -> nuevo formato con columnas extra
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(LOG_HEADER)
+        for row in rows:
+            record = {header[i]: row[i] for i in range(len(header))}
+            writer.writerow([
+                record.get("ts", ""),
+                record.get("pair", ""),
+                record.get("buy_venue", ""),
+                record.get("sell_venue", ""),
+                record.get("buy_price", ""),
+                record.get("sell_price", ""),
+                record.get("gross_%", ""),
+                record.get("net_%", ""),
+                record.get("est_profit_quote", ""),
+                record.get("base_qty", ""),
+                record.get("liquidity_score", ""),
+                record.get("volatility_score", ""),
+                record.get("priority_score", ""),
+                record.get("confidence", ""),
+            ])
+
+    LOG_HEADER_INITIALIZED = True
+
+
+def append_csv(path: str, opp: Opportunity, est_profit: float, base_qty: float) -> None:
+    ensure_log_header(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        if not exists:
-            w.writerow(["ts","pair","buy_venue","sell_venue","buy_price","sell_price","gross_%","net_%","est_profit_quote","base_qty"])
         w.writerow([
-            int(time.time()), opp.pair, opp.buy_venue, opp.sell_venue,
-            f"{opp.buy_price:.8f}", f"{opp.sell_price:.8f}",
-            f"{opp.gross_percent:.4f}", f"{opp.net_percent:.4f}",
-            f"{est_profit:.4f}", f"{base_qty:.8f}"
+            int(time.time()),
+            opp.pair,
+            opp.buy_venue,
+            opp.sell_venue,
+            f"{opp.buy_price:.8f}",
+            f"{opp.sell_price:.8f}",
+            f"{opp.gross_percent:.4f}",
+            f"{opp.net_percent:.4f}",
+            f"{est_profit:.4f}",
+            f"{base_qty:.8f}",
+            f"{opp.liquidity_score:.4f}",
+            f"{opp.volatility_score:.4f}",
+            f"{opp.priority_score:.4f}",
+            opp.confidence_label,
         ])
 
 # =========================
@@ -544,6 +948,7 @@ def fmt_alert(opp: Opportunity, est_profit: float, est_percent: float, base_qty:
         f"Comprar en {opp.buy_venue}: {opp.buy_price:.6f}\n"
         f"Vender en {opp.sell_venue}: {opp.sell_price:.6f}\n"
         f"Spread bruto: {opp.gross_percent:.3f}%  |  Neto: {opp.net_percent:.3f}%\n"
+        f"Confianza: {opp.confidence_label.upper()}  |  Prioridad: {opp.priority_score:.2f}  |  Liquidez ~{opp.liquidity_score*100:.0f}%  |  Volatilidad rel. ~{opp.volatility_score*100:.0f}%\n"
         f"Simulacion sobre {capital_quote:.0f} USDT: PnL ~{est_profit:.2f} USDT  (~{est_percent:.3f}%)\n"
         f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
@@ -564,9 +969,29 @@ def run_once() -> None:
         tg_process_updates(enabled=tg_enabled)
 
     pairs = list(CONFIG["pairs"])
-    threshold = float(CONFIG["threshold_percent"])
     capital = float(CONFIG["simulation_capital_quote"])
     log_csv = CONFIG["log_csv_path"]
+
+    global DYNAMIC_THRESHOLD_PERCENT, LATEST_ANALYSIS
+    analysis = analyze_historical_performance(log_csv, capital)
+    LATEST_ANALYSIS = analysis
+    if analysis.rows_considered > 0:
+        DYNAMIC_THRESHOLD_PERCENT = analysis.recommended_threshold
+        print(
+            "[ANALYSIS] Señales consideradas=%d | SR=%.1f%% | Neto medio=%.3f%% | Neto efectivo=%.3f%% -> Threshold dinámico=%.3f%%"
+            % (
+                analysis.rows_considered,
+                analysis.success_rate * 100.0,
+                analysis.average_net_percent,
+                analysis.average_effective_percent,
+                DYNAMIC_THRESHOLD_PERCENT,
+            )
+        )
+    else:
+        DYNAMIC_THRESHOLD_PERCENT = float(CONFIG["threshold_percent"])
+        print("[ANALYSIS] Sin historial suficiente. Threshold base=%.3f%%" % DYNAMIC_THRESHOLD_PERCENT)
+
+    threshold = DYNAMIC_THRESHOLD_PERCENT
 
     pair_quotes: Dict[str, Dict[str, Quote]] = {p: {} for p in pairs}
     for pair in pairs:
@@ -583,7 +1008,11 @@ def run_once() -> None:
     for pair, quotes in pair_quotes.items():
         if len(quotes) < 2:
             continue
-        opps = compute_opportunities_for_pair(pair, quotes, fee_map)
+        opps = [
+            enrich_opportunity(opp, quotes, analysis, threshold)
+            for opp in compute_opportunities_for_pair(pair, quotes, fee_map)
+        ]
+        opps.sort(key=lambda o: o.priority_score, reverse=True)
         for opp in opps:
             if opp.net_percent >= threshold:
                 total_fee_pct = fee_map[opp.buy_venue].taker_fee_percent + fee_map[opp.sell_venue].taker_fee_percent
