@@ -1,27 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Arbitrage TeleBot (v1, single-file)
------------------------------------
-- Spot cross-exchange arbitrage (inventario) con alertas por Telegram
-- CEX incluidos (por ahora): Binance, Bybit, KuCoin, OKX
-- Pairs configurables (BTC/USDT, ETH/USDT, etc.)
-- Spread neto = spread bruto - (fee taker buy + fee taker sell)
-- Umbral configurable (0.8% por defecto) + simulación de PnL sobre capital
-- Logs CSV de oportunidades
-
-Requisitos: Python 3.9+ y 'requests'
-    pip install requests
-
-Variables de entorno (Telegram):
-    export TG_BOT_TOKEN="123456:ABCDEF..."
-    export TG_CHAT_IDS="-1001234567890,123456789"   # canal,usuario (coma-separado)
-
-Uso:
-    python arbitrage_telebot.py --once         # una corrida
-    python arbitrage_telebot.py --loop         # loop continuo
-    python arbitrage_telebot.py --interval 30  # segundos entre corridas (loop)
-"""
 
 import os
 import csv
@@ -30,13 +8,15 @@ import math
 import json
 import argparse
 import itertools
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Tuple
 
 import requests
 
 # =========================
-# CONFIG BÁSICA (editá acá)
+# CONFIG
 # =========================
 CONFIG = {
     "threshold_percent": 0.8,      # alerta si neto >= 0.80%
@@ -54,14 +34,10 @@ CONFIG = {
         "bybit":   {"enabled": True,  "taker_fee_percent": 0.10},
         "kucoin":  {"enabled": True,  "taker_fee_percent": 0.10},
         "okx":     {"enabled": True,  "taker_fee_percent": 0.10},
-
-        # TODO: activar e implementar más venues (Bitget, BingX, HTX, AscendEX, etc.)
-        # "bitget": {"enabled": False, "taker_fee_percent": 0.10},
-        # "bingx":  {"enabled": False, "taker_fee_percent": 0.10},
-        # "htx":    {"enabled": False, "taker_fee_percent": 0.10},
+        # add more venues aquí
     },
     "telegram": {
-        "enabled": True,                 # poner False para modo silencioso
+        "enabled": True,                 # poner False para pruebas sin enviar
         "bot_token_env": "TG_BOT_TOKEN",
         "chat_ids_env": "TG_CHAT_IDS",   # coma-separado: "-100123...,123456..."
     },
@@ -69,7 +45,31 @@ CONFIG = {
 }
 
 # =========================
-# Helpers HTTP
+# HTTP / Health
+# =========================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health", "/live", "/ready"):
+            self.send_response(200); self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404); self.end_headers()
+
+def serve_http(port: int):
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"[WEB] listening on 0.0.0.0:{port}")
+    server.serve_forever()
+
+def run_loop_forever(interval: int):
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            print("[ERROR loop]", e)
+        time.sleep(max(5, interval))
+
+# =========================
+# HTTP helpers
 # =========================
 class HttpError(Exception):
     pass
@@ -99,7 +99,7 @@ def tg_send_message(text: str, enabled: bool = True) -> None:
     chat_ids_env = os.getenv(CONFIG["telegram"]["chat_ids_env"], "").strip()
 
     if not token or not chat_ids_env:
-        print("[TELEGRAM] Faltan variables de entorno (TG_BOT_TOKEN / TG_CHAT_IDS). Mensaje no enviado.")
+        print("[TELEGRAM] Falta TG_BOT_TOKEN o TG_CHAT_IDS. No se envía.")
         print("Mensaje:\n" + text)
         return
 
@@ -110,7 +110,7 @@ def tg_send_message(text: str, enabled: bool = True) -> None:
             payload = {"chat_id": cid, "text": text, "parse_mode": "Markdown"}
             r = requests.post(base, data=payload, timeout=8)
             if r.status_code != 200:
-                print(f"[TELEGRAM] Error HTTP {r.status_code} chat_id={cid} -> {r.text}")
+                print(f"[TELEGRAM] HTTP {r.status_code} chat_id={cid} -> {r.text}")
         except Exception as e:
             print(f"[TELEGRAM] Error enviando a {cid}: {e}")
 
@@ -119,7 +119,7 @@ def tg_send_message(text: str, enabled: bool = True) -> None:
 # =========================
 @dataclass
 class Quote:
-    symbol: str  # símbolo normalizado por exchange (ej: BTCUSDT, BTC-USDT)
+    symbol: str
     bid: float
     ask: float
     ts: int
@@ -204,7 +204,6 @@ def build_adapters() -> Dict[str, ExchangeAdapter]:
     if vcfg.get("bybit",   {}).get("enabled", False): adapters["bybit"]   = Bybit()
     if vcfg.get("kucoin",  {}).get("enabled", False): adapters["kucoin"]  = KuCoin()
     if vcfg.get("okx",     {}).get("enabled", False): adapters["okx"]     = OKX()
-    # TODO: agregar más adapters aquí (Bitget, BingX, HTX, AscendEX, etc.)
     return adapters
 
 def build_fee_map() -> Dict[str, VenueFees]:
@@ -216,7 +215,7 @@ def build_fee_map() -> Dict[str, VenueFees]:
     return fee_map
 
 # =========================
-# Engine de oportunidades
+# Engine
 # =========================
 @dataclass
 class Opportunity:
@@ -257,11 +256,6 @@ def compute_opportunities_for_pair(pair: str,
 # Simulación PnL (simple)
 # =========================
 def estimate_profit(capital_quote: float, buy_price: float, sell_price: float, total_percent_fee: float) -> Tuple[float, float, float]:
-    """
-    Estimación simple: compra base = capital/buy_price; vende al sell_price
-    Aplica fee total porcentual sobre el capital efectivo.
-    Retorna (profit_quote, net_percent, base_qty)
-    """
     if buy_price <= 0 or sell_price <= 0 or capital_quote <= 0:
         return 0.0, 0.0, 0.0
     base_qty = capital_quote / buy_price
@@ -319,7 +313,6 @@ def run_once() -> None:
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
     log_csv = CONFIG["log_csv_path"]
 
-    # Fetch quotes por par/venue
     pair_quotes: Dict[str, Dict[str, Quote]] = {p: {} for p in pairs}
     for pair in pairs:
         for vname, adapter in adapters.items():
@@ -331,7 +324,6 @@ def run_once() -> None:
             if q:
                 pair_quotes[pair][vname] = q
 
-    # Oportunidades y alertas
     alerts = 0
     for pair, quotes in pair_quotes.items():
         if len(quotes) < 2:
@@ -353,21 +345,28 @@ def run_once() -> None:
 # CLI
 # =========================
 def main():
-    ap = argparse.ArgumentParser(description="Arbitrage TeleBot (spot, inventario)")
+    ap = argparse.ArgumentParser(description="Arbitrage TeleBot (spot, inventario) - web-ready")
     ap.add_argument("--once", action="store_true", help="Ejecuta una vez y termina")
     ap.add_argument("--loop", action="store_true", help="Ejecuta en loop continuo")
-    ap.add_argument("--interval", type=int, default=30, help="Segundos entre corridas en modo loop")
+    ap.add_argument("--interval", type=int, default=int(os.getenv("INTERVAL_SECONDS", "30")), help="Segundos entre corridas en modo loop")
+    ap.add_argument("--web", action="store_true", help="Expone /health y corre el loop en background")
+    ap.add_argument("--port", type=int, default=int(os.getenv("PORT", "10000")), help="Puerto HTTP para /health (Render usa $PORT)")
+
     args = ap.parse_args()
+
+    if args.web:
+        t = threading.Thread(target=run_loop_forever, args=(args.interval,), daemon=True)
+        t.start()
+        serve_http(args.port)
+        return
 
     if args.once and args.loop:
         print("Elegí --once o --loop, no ambos.")
         return
 
     if args.once or not args.loop:
-        run_once()
-        return
+        run_once(); return
 
-    # loop
     while True:
         try:
             run_once()
