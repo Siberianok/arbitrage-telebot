@@ -13,3 +13,5 @@ services:
         sync: false
       - key: INTERVAL_SECONDS
         value: "30"
+      - key: LOG_CSV_PATH
+        value: "/var/data/logs/opportunities.csv"

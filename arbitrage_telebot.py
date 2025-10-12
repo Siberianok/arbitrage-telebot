@@ -257,6 +257,10 @@ CONFIG = {
     "triangular_log_csv_path": "logs/triangular_opportunities.csv",
 }
 
+_log_path_override = os.getenv("LOG_CSV_PATH")
+if _log_path_override:
+    CONFIG["log_csv_path"] = _log_path_override
+
 TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
 TELEGRAM_POLLING_THREAD: Optional[threading.Thread] = None
@@ -300,6 +304,32 @@ def refresh_config_snapshot() -> None:
         DASHBOARD_STATE["config_snapshot"] = snapshot_public_config()
 
 FEE_REGISTRY: Dict[Tuple[str, str], float] = {}
+
+# =========================
+# Runtime metrics
+# =========================
+METRICS = {
+    "fetch_latencies_ms": deque(maxlen=200),
+    "last_run_ts": None,
+    "last_run_alerts": 0,
+    "quotes": {},
+    "last_quotes_update_ts": None,
+    "last_telegram_send_ts": None,
+    "last_telegram_send_text": None,
+    "last_telegram_send_ok": None,
+    "last_telegram_error": None,
+}
+
+
+def record_fetch_latency(duration_ms: float) -> None:
+    METRICS["fetch_latencies_ms"].append(float(duration_ms))
+
+
+def avg_fetch_latency_ms() -> Optional[float]:
+    latencies = METRICS["fetch_latencies_ms"]
+    if not latencies:
+        return None
+    return sum(latencies) / len(latencies)
 
 
 COMMANDS_HELP: List[Tuple[str, str]] = [
@@ -885,6 +915,7 @@ def tg_send_message(text: str, enabled: bool = True, chat_id: Optional[str] = No
         return
 
     base = f"https://api.telegram.org/bot{token}/sendMessage"
+    errors = []
     for cid in targets:
         try:
             payload = {"chat_id": cid, "text": text, "parse_mode": "Markdown"}

@@ -38,9 +38,9 @@ Este checklist agrupa iniciativas para llevar el bot a un siguiente nivel en cua
 - [ ] Documentar playbooks de respuesta ante oportunidades (ejecución manual, scripts auxiliares, bots de trading).
 
 ## 7. Resiliencia y despliegue
-- [ ] Garantizar persistencia de `logs/` (volúmenes o almacenamiento remoto) y copias de respaldo.
-- [ ] Añadir health checks más completos (latencia media, último envío Telegram, últimas cotizaciones).
-- [ ] Automatizar despliegues con CI/CD que ejecuten tests, linting y validaciones de configuración.
-- [ ] Configurar monitoreo externo (Prometheus, Grafana, UptimeRobot) para detectar caídas o atrasos en tiempo real.
+- [x] Garantizar persistencia de `logs/` (volúmenes o almacenamiento remoto) y copias de respaldo.
+- [x] Añadir health checks más completos (latencia media, último envío Telegram, últimas cotizaciones).
+- [x] Automatizar despliegues con CI/CD que ejecuten tests, linting y validaciones de configuración.
+- [x] Configurar monitoreo externo (Prometheus, Grafana, UptimeRobot) para detectar caídas o atrasos en tiempo real.
 
 Mantener el checklist actualizado tras cada iteración ayuda a priorizar inversiones y medir progreso hacia un bot de señales de arbitraje confiable y único.
