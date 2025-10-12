@@ -143,6 +143,19 @@ PROM_EXCHANGE_ERRORS = Gauge(
     registry=PROM_REGISTRY,
 )
 
+
+def emit_pair_coverage(pair: str, venues: Iterable[str]) -> None:
+    """Report venue coverage for a trading pair via structured logs."""
+
+    venues_list = sorted(venues)
+    log_event(
+        "run.coverage",
+        pair=pair,
+        venues=venues_list,
+        venues_count=len(venues_list),
+    )
+    print(f"[COVERAGE] {pair}: {venues_list}")
+
 # =========================
 # CONFIG
 # =========================
@@ -3621,7 +3634,7 @@ def run_once() -> None:
 
     for pair in all_pairs:
         venues_available = sorted(pair_quotes.get(pair, {}).keys())
-        print(f"[COVERAGE] {pair}: {venues_available}")
+        emit_pair_coverage(pair, venues_available)
 
     alerts = 0
     for pair in pairs:
