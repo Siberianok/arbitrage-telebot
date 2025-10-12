@@ -14,10 +14,10 @@ Este checklist agrupa iniciativas para llevar el bot a un siguiente nivel en cua
 - [ ] Añadir verificación de integridad (checksum) de respuestas y fallback a endpoints secundarios.
 
 ## 3. Gestión avanzada de fees y costes
-- [ ] Registrar y actualizar automáticamente las comisiones por exchange/pareja (niveles VIP, descuentos de token nativo, etc.).
-- [ ] Modelar costes de retiro/deposito y tiempos de confirmación para evaluar arbitrajes de “vuelta completa”.
-- [ ] Ajustar `estimate_profit` para aplicar comisiones sobre ambas piernas y considerar deslizamiento esperado.
-- [ ] Simular impacto de rebalanceo de inventarios (transferencias entre exchanges) y costos asociados.
+- [x] Registrar y actualizar automáticamente las comisiones por exchange/pareja (niveles VIP, descuentos de token nativo, etc.).
+- [x] Modelar costes de retiro/deposito y tiempos de confirmación para evaluar arbitrajes de “vuelta completa”.
+- [x] Ajustar `estimate_profit` para aplicar comisiones sobre ambas piernas y considerar deslizamiento esperado.
+- [x] Simular impacto de rebalanceo de inventarios (transferencias entre exchanges) y costos asociados.
 
 ## 4. Monitoreo, alertas y confiabilidad
 - [ ] Centralizar logging estructurado (JSON) y métricas (exitos/fallos por exchange) para observabilidad.
