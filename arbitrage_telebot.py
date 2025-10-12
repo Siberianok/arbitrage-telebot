@@ -11,7 +11,7 @@ import itertools
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Set
 
 import requests
 
@@ -43,6 +43,27 @@ CONFIG = {
     },
     "log_csv_path": "logs/opportunities.csv",
 }
+
+TELEGRAM_CHAT_IDS: Set[str] = set()
+TELEGRAM_LAST_UPDATE_ID = 0
+
+
+def get_bot_token() -> str:
+    return os.getenv(CONFIG["telegram"]["bot_token_env"], "").strip()
+
+
+def _load_telegram_chat_ids_from_env() -> None:
+    chat_ids_env = os.getenv(CONFIG["telegram"]["chat_ids_env"], "").strip()
+    if not chat_ids_env:
+        return
+    for cid in chat_ids_env.split(","):
+        cid = cid.strip()
+        if cid:
+            TELEGRAM_CHAT_IDS.add(cid)
+    os.environ[CONFIG["telegram"]["chat_ids_env"]] = ",".join(sorted(TELEGRAM_CHAT_IDS))
+
+
+_load_telegram_chat_ids_from_env()
 
 # =========================
 # HTTP / Health
@@ -97,22 +118,43 @@ def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 8, ret
 # =========================
 # Telegram (HTTP API)
 # =========================
-def tg_send_message(text: str, enabled: bool = True) -> None:
+def register_telegram_chat(chat_id) -> str:
+    cid = str(chat_id)
+    if cid not in TELEGRAM_CHAT_IDS:
+        TELEGRAM_CHAT_IDS.add(cid)
+        os.environ[CONFIG["telegram"]["chat_ids_env"]] = ",".join(sorted(TELEGRAM_CHAT_IDS))
+        print(f"[TELEGRAM] Nuevo chat registrado: {cid}")
+    return cid
+
+
+def get_registered_chat_ids() -> List[str]:
+    return sorted(TELEGRAM_CHAT_IDS)
+
+
+def tg_send_message(text: str, enabled: bool = True, chat_id: Optional[str] = None) -> None:
     if not enabled:
         print("[TELEGRAM DISABLED] Would send:\n" + text)
         return
 
-    token = os.getenv(CONFIG["telegram"]["bot_token_env"], "").strip()
-    chat_ids_env = os.getenv(CONFIG["telegram"]["chat_ids_env"], "").strip()
-
-    if not token or not chat_ids_env:
-        print("[TELEGRAM] Falta TG_BOT_TOKEN o TG_CHAT_IDS. No se envía.")
+    token = get_bot_token()
+    if not token:
+        print("[TELEGRAM] Falta TG_BOT_TOKEN. No se envía.")
         print("Mensaje:\n" + text)
         return
 
-    chat_ids = [cid.strip() for cid in chat_ids_env.split(",") if cid.strip()]
+    targets: List[str]
+    if chat_id is not None:
+        targets = [str(chat_id)]
+    else:
+        targets = get_registered_chat_ids()
+
+    if not targets:
+        print("[TELEGRAM] No hay chats registrados. No se envía.")
+        print("Mensaje:\n" + text)
+        return
+
     base = f"https://api.telegram.org/bot{token}/sendMessage"
-    for cid in chat_ids:
+    for cid in targets:
         try:
             payload = {"chat_id": cid, "text": text, "parse_mode": "Markdown"}
             r = requests.post(base, data=payload, timeout=8)
@@ -120,6 +162,159 @@ def tg_send_message(text: str, enabled: bool = True) -> None:
                 print(f"[TELEGRAM] HTTP {r.status_code} chat_id={cid} -> {r.text}")
         except Exception as e:
             print(f"[TELEGRAM] Error enviando a {cid}: {e}")
+
+
+def tg_api_request(method: str, params: Optional[Dict] = None, http_method: str = "get") -> Dict:
+    token = get_bot_token()
+    if not token:
+        raise HttpError("Falta TG_BOT_TOKEN")
+
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        if http_method.lower() == "post":
+            r = requests.post(url, data=params or {}, timeout=8)
+        else:
+            r = requests.get(url, params=params or {}, timeout=8)
+    except Exception as e:
+        raise HttpError(f"Error al invocar {method}: {e}") from e
+
+    if r.status_code != 200:
+        raise HttpError(f"HTTP {r.status_code} -> {r.text}")
+
+    data = r.json()
+    if not data.get("ok"):
+        raise HttpError(f"Respuesta no OK en {method}: {data}")
+    return data
+
+
+def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) -> None:
+    command = command.lower()
+    register_telegram_chat(chat_id)
+
+    if command == "/start":
+        response = (
+            "Hola! Ya estás registrado para recibir señales.\n"
+            f"Threshold actual: {CONFIG['threshold_percent']:.3f}%\n"
+            "Comandos disponibles:\n"
+            "/ping, /status, /threshold <valor>, /pairs, /addpair <par>, /delpair <par>, /test"
+        )
+        tg_send_message(response, enabled=enabled, chat_id=chat_id)
+        return
+
+    if command == "/ping":
+        tg_send_message("pong", enabled=enabled, chat_id=chat_id)
+        return
+
+    if command == "/status":
+        pairs = CONFIG["pairs"]
+        chats = get_registered_chat_ids()
+        response = (
+            "Estado actual:\n"
+            f"Threshold: {CONFIG['threshold_percent']:.3f}%\n"
+            f"Pares ({len(pairs)}): {', '.join(pairs) if pairs else 'sin pares'}\n"
+            f"Chats registrados: {', '.join(chats) if chats else 'ninguno'}"
+        )
+        tg_send_message(response, enabled=enabled, chat_id=chat_id)
+        return
+
+    if command == "/threshold":
+        if not argument:
+            tg_send_message(
+                f"Threshold actual: {CONFIG['threshold_percent']:.3f}%",
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return
+        try:
+            value = float(argument.replace("%", "").strip())
+        except ValueError:
+            tg_send_message("Valor inválido. Ej: /threshold 0.8", enabled=enabled, chat_id=chat_id)
+            return
+        CONFIG["threshold_percent"] = value
+        tg_send_message(
+            f"Nuevo threshold guardado: {CONFIG['threshold_percent']:.3f}%",
+            enabled=enabled,
+            chat_id=chat_id,
+        )
+        return
+
+    if command == "/pairs":
+        pairs = CONFIG["pairs"]
+        if not pairs:
+            tg_send_message("No hay pares configurados.", enabled=enabled, chat_id=chat_id)
+        else:
+            formatted = "\n".join(f"- {p}" for p in pairs)
+            tg_send_message(f"Pares actuales:\n{formatted}", enabled=enabled, chat_id=chat_id)
+        return
+
+    if command == "/addpair":
+        if not argument:
+            tg_send_message("Uso: /addpair BTC/USDT", enabled=enabled, chat_id=chat_id)
+            return
+        pair = argument.upper().strip()
+        if pair in CONFIG["pairs"]:
+            tg_send_message(f"{pair} ya estaba en la lista.", enabled=enabled, chat_id=chat_id)
+        else:
+            CONFIG["pairs"].append(pair)
+            tg_send_message(f"Par agregado: {pair}", enabled=enabled, chat_id=chat_id)
+        return
+
+    if command == "/delpair":
+        if not argument:
+            tg_send_message("Uso: /delpair BTC/USDT", enabled=enabled, chat_id=chat_id)
+            return
+        pair = argument.upper().strip()
+        if pair not in CONFIG["pairs"]:
+            tg_send_message(f"{pair} no está en la lista.", enabled=enabled, chat_id=chat_id)
+        else:
+            CONFIG["pairs"] = [p for p in CONFIG["pairs"] if p != pair]
+            tg_send_message(f"Par eliminado: {pair}", enabled=enabled, chat_id=chat_id)
+        return
+
+    if command == "/test":
+        tg_send_message("Señal de prueba ✅", enabled=enabled, chat_id=chat_id)
+        return
+
+    tg_send_message("Comando no reconocido.", enabled=enabled, chat_id=chat_id)
+
+
+def tg_process_updates(enabled: bool = True) -> None:
+    global TELEGRAM_LAST_UPDATE_ID
+
+    if not get_bot_token():
+        return
+
+    params: Dict[str, int] = {}
+    if TELEGRAM_LAST_UPDATE_ID:
+        params["offset"] = TELEGRAM_LAST_UPDATE_ID + 1
+
+    try:
+        data = tg_api_request("getUpdates", params=params or None)
+    except Exception as e:
+        print(f"[TELEGRAM] Error leyendo updates: {e}")
+        return
+
+    for update in data.get("result", []):
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            TELEGRAM_LAST_UPDATE_ID = max(TELEGRAM_LAST_UPDATE_ID, update_id)
+        message = update.get("message") or update.get("channel_post")
+        if not message:
+            continue
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        text = (message.get("text") or "").strip()
+        if not chat_id or not text:
+            continue
+
+        register_telegram_chat(chat_id)
+        if not text.startswith("/"):
+            continue
+
+        parts = text.split(maxsplit=1)
+        command = parts[0]
+        argument = parts[1] if len(parts) > 1 else ""
+        tg_handle_command(command, argument, str(chat_id), enabled)
 
 # =========================
 # Modelo y Fees
@@ -314,10 +509,12 @@ def run_once() -> None:
         print("No hay venues habilitados en CONFIG['venues'].")
         return
 
-    pairs = CONFIG["pairs"]
+    tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
+    tg_process_updates(enabled=tg_enabled)
+
+    pairs = list(CONFIG["pairs"])
     threshold = float(CONFIG["threshold_percent"])
     capital = float(CONFIG["simulation_capital_quote"])
-    tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
     log_csv = CONFIG["log_csv_path"]
 
     pair_quotes: Dict[str, Dict[str, Quote]] = {p: {} for p in pairs}
