@@ -329,11 +329,17 @@ COMMANDS_HELP: List[Tuple[str, str]] = [
     ("/help", "Cómo acceder al menú de comandos"),
     ("/ping", "Responde con 'pong' para verificar conectividad"),
     ("/status", "Resume configuración actual y chats registrados"),
-    ("/threshold <valor>", "Consulta o actualiza el umbral de alerta (%)"),
-    ("/capital <USDT>", "Consulta o ajusta el capital simulado en USDT"),
+    (
+        "/threshold",
+        "Consulta o actualiza el umbral de alerta (%) — usar /threshold <valor>",
+    ),
+    (
+        "/capital",
+        "Consulta o ajusta el capital simulado en USDT — usar /capital <USDT>",
+    ),
     ("/pairs", "Lista los pares configurados"),
-    ("/addpair <PAR>", "Agrega un par nuevo al monitoreo"),
-    ("/delpair <PAR>", "Elimina un par del monitoreo"),
+    ("/addpair", "Agrega un par nuevo al monitoreo — usar /addpair <PAR>",),
+    ("/delpair", "Elimina un par del monitoreo — usar /delpair <PAR>"),
     ("/test", "Envía una señal de prueba"),
 ]
 
