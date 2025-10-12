@@ -3,7 +3,6 @@
 
 import argparse
 import base64
-import binascii
 import csv
 import hashlib
 import itertools
@@ -15,7 +14,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple, Set, Any, Iterable
 
 import requests
@@ -670,6 +668,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _is_healthcheck(self) -> bool:
         return self.path in ("/health", "/live", "/ready")
 
+    def _decode_auth_header(self, auth_header: str) -> Optional[str]:
+        if not auth_header or " " not in auth_header:
+            self._send_unauthorized()
+            return None
+        try:
+            encoded_part = auth_header.split(" ", 1)[1]
+            decoded = base64.b64decode(encoded_part).decode("utf-8")
+            return decoded
+        except (IndexError, base64.binascii.Error, UnicodeDecodeError):
+            self._send_unauthorized()
+            return None
+
+    def _parse_json(self, raw: bytes) -> Optional[Dict[str, Any]]:
+        try:
+            decoded = raw.decode("utf-8")
+            data = json.loads(decoded or "{}")
+            return data
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json({"error": "JSON inválido"}, status=400)
+            return None
+
     def _require_authentication(self) -> bool:
         if not WEB_AUTH_USER and not WEB_AUTH_PASS:
             return True
@@ -677,14 +696,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not auth_header.startswith("Basic "):
             self._send_unauthorized()
             return False
-        parts = auth_header.split(" ", 1)
-        if len(parts) < 2:
-            self._send_unauthorized()
-            return False
-        try:
-            decoded = base64.b64decode(parts[1]).decode("utf-8")
-        except (binascii.Error, UnicodeDecodeError):
-            self._send_unauthorized()
+        decoded = self._decode_auth_header(auth_header)
+        if not decoded:
             return False
         if ":" not in decoded:
             self._send_unauthorized()
@@ -758,17 +771,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length else b"{}"
-            try:
-                decoded_body = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                self._send_json({"error": "JSON inválido"}, status=400)
-                return
-            if not decoded_body:
-                decoded_body = "{}"
-            try:
-                data = json.loads(decoded_body)
-            except json.JSONDecodeError:
-                self._send_json({"error": "JSON inválido"}, status=400)
+            data = self._parse_json(raw)
+            if data is None:
                 return
             updated = {}
             errors: List[str] = []
@@ -2407,8 +2411,6 @@ def ensure_log_header(path: str) -> None:
 
 def append_csv(path: str, opp: Opportunity, est_profit: float, base_qty: float) -> None:
     ensure_log_header(path)
-    buy_volume = buy_depth.ask_volume if buy_depth else 0.0
-    sell_volume = sell_depth.bid_volume if sell_depth else 0.0
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
