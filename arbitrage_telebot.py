@@ -48,6 +48,25 @@ TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
 
 
+COMMANDS_HELP: List[Tuple[str, str]] = [
+    ("/help", "Muestra este listado de comandos"),
+    ("/ping", "Responde con 'pong' para verificar conectividad"),
+    ("/status", "Resume configuración actual y chats registrados"),
+    ("/threshold <valor>", "Consulta o actualiza el umbral de alerta (%)"),
+    ("/pairs", "Lista los pares configurados"),
+    ("/addpair <PAR>", "Agrega un par nuevo al monitoreo"),
+    ("/delpair <PAR>", "Elimina un par del monitoreo"),
+    ("/test", "Envía una señal de prueba"),
+]
+
+
+def format_command_help() -> str:
+    lines = ["Comandos disponibles:"]
+    for cmd, desc in COMMANDS_HELP:
+        lines.append(f"{cmd} — {desc}")
+    return "\n".join(lines)
+
+
 def get_bot_token() -> str:
     return os.getenv(CONFIG["telegram"]["bot_token_env"], "").strip()
 
@@ -195,10 +214,13 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         response = (
             "Hola! Ya estás registrado para recibir señales.\n"
             f"Threshold actual: {CONFIG['threshold_percent']:.3f}%\n"
-            "Comandos disponibles:\n"
-            "/ping, /status, /threshold <valor>, /pairs, /addpair <par>, /delpair <par>, /test"
+            f"{format_command_help()}"
         )
         tg_send_message(response, enabled=enabled, chat_id=chat_id)
+        return
+
+    if command == "/help":
+        tg_send_message(format_command_help(), enabled=enabled, chat_id=chat_id)
         return
 
     if command == "/ping":
@@ -275,7 +297,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         tg_send_message("Señal de prueba ✅", enabled=enabled, chat_id=chat_id)
         return
 
-    tg_send_message("Comando no reconocido.", enabled=enabled, chat_id=chat_id)
+    tg_send_message("Comando no reconocido. Probá /help para ver el listado.", enabled=enabled, chat_id=chat_id)
 
 
 def tg_process_updates(enabled: bool = True) -> None:
