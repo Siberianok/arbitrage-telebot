@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  telebot:
+    build: ..
+    container_name: arbitrage-telebot
+    command: python arbitrage_telebot.py --web --interval ${INTERVAL_SECONDS:-30}
+    environment:
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
+      TG_CHAT_IDS: ${TG_CHAT_IDS:-}
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-30}
+    ports:
+      - "10000:10000"
+    restart: unless-stopped
+    volumes:
+      - telebot-logs:/app/logs
+      - telebot-backups:/app/backups
+
+volumes:
+  telebot-logs:
+  telebot-backups:

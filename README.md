@@ -17,7 +17,9 @@ Simulación de PnL: incluida en cada alerta (ej.: capital = 10,000 USDT). 🧮
 
 Alertas Telegram: múltiples destinos (DM y/o canal). 🔔
 
-Logs CSV: logs/opportunities.csv (timestamp, par, venues, spreads, PnL simulado). 🧾
+Logs CSV: logs/opportunities.csv (timestamp, par, venues, spreads, PnL simulado) con backups automáticos vía `scripts/backup_logs.py`. 🧾
+
+Observabilidad reforzada: endpoint `/health` JSON con latencias promedio, último envío Telegram y últimas cotizaciones, `/metrics/prom` listo para Prometheus y CI/CD con linting, compilación y validación de configuración.
 
 Diseño extensible: fácil de sumar exchanges, P2P, puentes fiat, límites y manejo de latencias. 🧰
 
@@ -47,3 +49,51 @@ Calcula spread bruto y luego neto (resta fees taker).
 Si el neto ≥ umbral, simula PnL para tu capital y envía alerta a Telegram.
 
 Registra la oportunidad en logs/opportunities.csv.
+
+## Despliegue y persistencia de logs
+
+### Docker Compose con volúmenes persistentes
+
+```bash
+cd deploy
+docker compose up -d
+```
+
+El archivo `deploy/docker-compose.yaml` monta volúmenes `telebot-logs` y `telebot-backups` para que `logs/` y `backups/` sobrevivan
+a reinicios o recreaciones del contenedor. Podés redefinir la ruta del CSV con `LOG_CSV_PATH=/data/logs/opportunities.csv` si montás
+un volumen externo.
+
+### Backups automatizados
+
+Ejecutá `scripts/backup_logs.py` desde un cron o pipeline para comprimir `logs/` y guardar un respaldo en `backups/`. Opcionalmente
+acepta `--s3-bucket`/`--s3-prefix` (o variables `S3_BUCKET`/`S3_PREFIX`) para subir el archivo a Amazon S3.
+
+```bash
+python scripts/backup_logs.py --logs-dir logs --backups-dir backups --s3-bucket mi-bucket --s3-prefix arbitrage/telebot
+```
+
+### Render.com
+
+- Configurá un disco persistente en Render montado en `/var/data` y ajustá `LOG_CSV_PATH=/var/data/logs/opportunities.csv` (ya
+  definido en `render.yaml`).
+- Programá una tarea cron en Render (o un job separado) que ejecute `python scripts/backup_logs.py --logs-dir /var/data/logs --backups-dir /var/data/backups`.
+
+## Health checks y monitoreo externo
+
+- `GET /health` `/live` `/ready`: JSON con latencia promedio de fetch, último envío a Telegram, timestamp de últimas cotizaciones y
+  pares con datos frescos.
+- `GET /metrics`: mismo JSON para integraciones ligeras.
+- `GET /metrics/prom`: métrica en formato Prometheus (status, último run, latencia, alertas, estado de Telegram).
+
+### Integraciones sugeridas
+
+- **Prometheus/Grafana**: añadí un job de scrape apuntando a `/metrics/prom` y grafica las métricas en Grafana.
+- **UptimeRobot / health-checkers**: monitorizá `https://tu-dominio/health` (espera HTTP 200) y añadí alertas si el JSON indica
+  `status="stale"`.
+- **Alertas adicionales**: Grafana Alerting o Prometheus Alertmanager pueden dispararse si `arbitrage_bot_status` ≠ 0 o si
+  `arbitrage_bot_average_fetch_latency_ms` supera tu umbral.
+
+## CI/CD
+
+El workflow `.github/workflows/ci.yml` ejecuta linting (`ruff`), compilación (`python -m compileall`) y validaciones de configuración
+en cada push/pull request para detectar errores antes de desplegar.

@@ -9,6 +9,7 @@ import json
 import argparse
 import itertools
 import threading
+from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Tuple, Set
@@ -44,9 +45,39 @@ CONFIG = {
     "log_csv_path": "logs/opportunities.csv",
 }
 
+_log_path_override = os.getenv("LOG_CSV_PATH")
+if _log_path_override:
+    CONFIG["log_csv_path"] = _log_path_override
+
 TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
 TELEGRAM_POLLING_THREAD: Optional[threading.Thread] = None
+
+# =========================
+# Runtime metrics
+# =========================
+METRICS = {
+    "fetch_latencies_ms": deque(maxlen=200),
+    "last_run_ts": None,
+    "last_run_alerts": 0,
+    "quotes": {},
+    "last_quotes_update_ts": None,
+    "last_telegram_send_ts": None,
+    "last_telegram_send_text": None,
+    "last_telegram_send_ok": None,
+    "last_telegram_error": None,
+}
+
+
+def record_fetch_latency(duration_ms: float) -> None:
+    METRICS["fetch_latencies_ms"].append(float(duration_ms))
+
+
+def avg_fetch_latency_ms() -> Optional[float]:
+    latencies = METRICS["fetch_latencies_ms"]
+    if not latencies:
+        return None
+    return sum(latencies) / len(latencies)
 
 
 COMMANDS_HELP: List[Tuple[str, str]] = [
@@ -89,19 +120,114 @@ _load_telegram_chat_ids_from_env()
 # HTTP / Health
 # =========================
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/", "/health", "/live", "/ready"):
-            self.send_response(200); self.end_headers()
-            self.wfile.write(b"ok")
-        else:
-            self.send_response(404); self.end_headers()
+    """Expose JSON health information with latency and freshness metrics."""
 
-    def do_HEAD(self):
-        if self.path in ("/", "/health", "/live", "/ready"):
+    def _build_payload(self) -> dict:
+        now = int(time.time())
+        average_latency = avg_fetch_latency_ms()
+        quotes_summary = {}
+        for pair, venues in METRICS.get("quotes", {}).items():
+            quotes_summary[pair] = {}
+            for venue, data in venues.items():
+                quotes_summary[pair][venue] = {
+                    "bid": data.get("bid"),
+                    "ask": data.get("ask"),
+                    "ts": data.get("ts"),
+                    "age_seconds": max(0, now - int(data.get("ts", now))),
+                }
+
+        status = "ok"
+        last_run_ts = METRICS.get("last_run_ts")
+        if last_run_ts and now - int(last_run_ts) > max(120, int(os.getenv("INTERVAL_SECONDS", "30")) * 4):
+            status = "stale"
+
+        payload = {
+            "status": status,
+            "timestamp": now,
+            "last_run_ts": last_run_ts,
+            "last_run_alerts": METRICS.get("last_run_alerts"),
+            "average_fetch_latency_ms": average_latency,
+            "last_quotes_update_ts": METRICS.get("last_quotes_update_ts"),
+            "last_telegram_send_ts": METRICS.get("last_telegram_send_ts"),
+            "last_telegram_send_ok": METRICS.get("last_telegram_send_ok"),
+            "last_telegram_error": METRICS.get("last_telegram_error"),
+            "last_pairs_with_data": METRICS.get("last_pairs_with_data", {}),
+            "quotes": quotes_summary,
+        }
+        if METRICS.get("last_telegram_send_text"):
+            payload["last_telegram_preview"] = METRICS["last_telegram_send_text"]
+        if average_latency is not None:
+            payload["average_fetch_latency_ms"] = round(average_latency, 3)
+        return payload
+
+    def _build_prometheus_metrics(self) -> bytes:
+        payload = self._build_payload()
+        lines = [
+            "# HELP arbitrage_bot_status Overall health status (0=ok,1=stale)",
+            "# TYPE arbitrage_bot_status gauge",
+        ]
+        status_value = 0 if payload.get("status") == "ok" else 1
+        lines.append(f"arbitrage_bot_status {status_value}")
+
+        for key in ("last_run_ts", "last_quotes_update_ts", "last_telegram_send_ts"):
+            value = payload.get(key)
+            if value is not None:
+                lines.append(f"# TYPE arbitrage_bot_{key} gauge")
+                lines.append(f"arbitrage_bot_{key} {int(value)}")
+
+        latency = payload.get("average_fetch_latency_ms")
+        if latency is not None:
+            lines.append("# TYPE arbitrage_bot_average_fetch_latency_ms gauge")
+            lines.append(f"arbitrage_bot_average_fetch_latency_ms {float(latency)}")
+
+        alerts = payload.get("last_run_alerts")
+        if alerts is not None:
+            lines.append("# TYPE arbitrage_bot_last_run_alerts gauge")
+            lines.append(f"arbitrage_bot_last_run_alerts {int(alerts)}")
+
+        telegram_ok = payload.get("last_telegram_send_ok")
+        if telegram_ok is not None:
+            lines.append("# TYPE arbitrage_bot_last_telegram_send_ok gauge")
+            lines.append(f"arbitrage_bot_last_telegram_send_ok {1 if telegram_ok else 0}")
+
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    def _send_json(self, status_code: int) -> None:
+        payload = self._build_payload()
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/health", "/live", "/ready", "/metrics"):
+            self._send_json(200)
+        elif self.path in ("/metrics/prom", "/metrics/prometheus"):
+            body = self._build_prometheus_metrics()
             self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
-        self.end_headers()
+            self.end_headers()
+
+    def do_HEAD(self):
+        if self.path in ("/", "/health", "/live", "/ready", "/metrics"):
+            self._send_json(200)
+        elif self.path in ("/metrics/prom", "/metrics/prometheus"):
+            body = self._build_prometheus_metrics()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
 
 def serve_http(port: int):
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
@@ -152,14 +278,24 @@ def get_registered_chat_ids() -> List[str]:
 
 
 def tg_send_message(text: str, enabled: bool = True, chat_id: Optional[str] = None) -> None:
+    preview = text if len(text) <= 200 else text[:197] + "..."
+    now = int(time.time())
+    METRICS["last_telegram_send_ts"] = now
+    METRICS["last_telegram_send_text"] = preview
+    METRICS["last_telegram_error"] = None
+
     if not enabled:
         print("[TELEGRAM DISABLED] Would send:\n" + text)
+        METRICS["last_telegram_send_ok"] = False
+        METRICS["last_telegram_error"] = "telegram_disabled"
         return
 
     token = get_bot_token()
     if not token:
         print("[TELEGRAM] Falta TG_BOT_TOKEN. No se envía.")
         print("Mensaje:\n" + text)
+        METRICS["last_telegram_send_ok"] = False
+        METRICS["last_telegram_error"] = "missing_token"
         return
 
     targets: List[str]
@@ -171,17 +307,28 @@ def tg_send_message(text: str, enabled: bool = True, chat_id: Optional[str] = No
     if not targets:
         print("[TELEGRAM] No hay chats registrados. No se envía.")
         print("Mensaje:\n" + text)
+        METRICS["last_telegram_send_ok"] = False
+        METRICS["last_telegram_error"] = "no_targets"
         return
 
     base = f"https://api.telegram.org/bot{token}/sendMessage"
+    errors = []
     for cid in targets:
         try:
             payload = {"chat_id": cid, "text": text, "parse_mode": "Markdown"}
             r = requests.post(base, data=payload, timeout=8)
             if r.status_code != 200:
                 print(f"[TELEGRAM] HTTP {r.status_code} chat_id={cid} -> {r.text}")
+                errors.append(f"{cid}:{r.status_code}")
         except Exception as e:
             print(f"[TELEGRAM] Error enviando a {cid}: {e}")
+            errors.append(f"{cid}:{e}")
+
+    if errors:
+        METRICS["last_telegram_send_ok"] = False
+        METRICS["last_telegram_error"] = "; ".join(str(err) for err in errors[:3])
+    else:
+        METRICS["last_telegram_send_ok"] = True
 
 
 def tg_api_request(method: str, params: Optional[Dict] = None, http_method: str = "get") -> Dict:
@@ -571,13 +718,23 @@ def run_once() -> None:
     pair_quotes: Dict[str, Dict[str, Quote]] = {p: {} for p in pairs}
     for pair in pairs:
         for vname, adapter in adapters.items():
+            started_at = time.perf_counter()
             try:
                 q = adapter.fetch_quote(pair)
             except Exception as e:
                 q = None
                 print(f"[{vname}] error fetch {pair}: {e}")
+            finally:
+                duration_ms = (time.perf_counter() - started_at) * 1000.0
+                record_fetch_latency(duration_ms)
             if q:
                 pair_quotes[pair][vname] = q
+                METRICS.setdefault("quotes", {}).setdefault(pair, {})[vname] = {
+                    "bid": q.bid,
+                    "ask": q.ask,
+                    "ts": int(q.ts),
+                }
+                METRICS["last_quotes_update_ts"] = int(time.time())
 
     alerts = 0
     for pair, quotes in pair_quotes.items():
@@ -593,6 +750,12 @@ def run_once() -> None:
                 msg = fmt_alert(opp, est_profit, est_percent, base_qty, capital)
                 tg_send_message(msg, enabled=tg_enabled)
                 alerts += 1
+
+    METRICS["last_run_ts"] = int(time.time())
+    METRICS["last_run_alerts"] = alerts
+    METRICS["last_pairs_with_data"] = {
+        pair: sorted(quotes.keys()) for pair, quotes in pair_quotes.items() if quotes
+    }
 
     print(f"Run complete. Oportunidades enviadas: {alerts}")
 
