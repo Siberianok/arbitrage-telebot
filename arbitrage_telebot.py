@@ -278,6 +278,27 @@ WEB_AUTH_PASS = os.getenv("WEB_AUTH_PASS", "").strip()
 LATEST_ANALYSIS: Optional[Any] = None
 
 
+LOG_HEADER = [
+    "ts",
+    "pair",
+    "buy_venue",
+    "sell_venue",
+    "buy_price",
+    "sell_price",
+    "gross_%",
+    "net_%",
+    "est_profit_quote",
+    "base_qty",
+    "capital_used_quote",
+    "buy_depth_base",
+    "sell_depth_base",
+    "liquidity_score",
+    "volatility_score",
+    "priority_score",
+    "confidence",
+]
+
+
 def snapshot_public_config() -> Dict[str, Any]:
     venues = {
         name: {
@@ -1845,6 +1866,8 @@ class Opportunity:
     sell_price: float
     gross_percent: float
     net_percent: float
+    buy_depth: Optional[DepthInfo] = None
+    sell_depth: Optional[DepthInfo] = None
     liquidity_score: float = 0.0
     volatility_score: float = 0.0
     priority_score: float = 0.0
@@ -2105,9 +2128,9 @@ def compute_opportunities_for_pair(
         if not buy_quote or not sell_quote:
             continue
 
-        buy_fee_cfg = fees.get(buy_v)
-        sell_fee_cfg = fees.get(sell_v)
-        if not buy_fee_cfg or not sell_fee_cfg:
+        buy_price = float(buy_quote.ask)
+        sell_price = float(sell_quote.bid)
+        if buy_price <= 0 or sell_price <= 0:
             continue
 
         buy_schedule = buy_fee_cfg.schedule_for_pair(pair)
@@ -2273,6 +2296,8 @@ def ensure_log_header(path: str) -> None:
 
 def append_csv(path: str, opp: Opportunity, est_profit: float, base_qty: float) -> None:
     ensure_log_header(path)
+    buy_volume = buy_depth.ask_volume if buy_depth else 0.0
+    sell_volume = sell_depth.bid_volume if sell_depth else 0.0
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -2420,6 +2445,7 @@ def run_once() -> None:
     tri_log_csv = CONFIG.get("triangular_log_csv_path")
     pair_weight_cfg = CONFIG.get("capital_weights", {}).get("pairs", {})
     triangle_weight_cfg = CONFIG.get("capital_weights", {}).get("triangles", {})
+    fee_map = build_fee_map(all_pairs)
 
     fee_map = build_fee_map(all_pairs)
     summary_opps: List[Dict[str, Any]] = []
@@ -2463,12 +2489,19 @@ def run_once() -> None:
             continue
         opps = compute_opportunities_for_pair(pair, quotes, fee_map)
         for opp in opps[:5]:
-            f_buy = fee_map.get(opp.buy_venue)
-            f_sell = fee_map.get(opp.sell_venue)
-            if not f_buy or not f_sell:
+            fee_buy = fee_map.get(opp.buy_venue)
+            fee_sell = fee_map.get(opp.sell_venue)
+            if not fee_buy or not fee_sell:
                 continue
-            total_fee_pct = f_buy.taker_fee_percent + f_sell.taker_fee_percent
-            est_profit, est_percent, base_qty = estimate_profit(capital, opp.buy_price, opp.sell_price, total_fee_pct)
+            buy_schedule = fee_buy.schedule_for_pair(pair)
+            sell_schedule = fee_sell.schedule_for_pair(pair)
+            total_fee_pct = buy_schedule.taker_fee_percent + sell_schedule.taker_fee_percent
+            est_profit, est_percent, base_qty, capital_used = estimate_profit(
+                capital_for_pair,
+                opp.buy_price,
+                opp.sell_price,
+                total_fee_pct,
+            )
             link_items = build_trade_link_items(opp.buy_venue, opp.sell_venue, opp.pair)
             entry = {
                 "pair": opp.pair,
@@ -2481,16 +2514,38 @@ def run_once() -> None:
                 "est_profit_quote": est_profit,
                 "est_percent": est_percent,
                 "base_qty": base_qty,
+                "capital_used_quote": capital_used,
                 "links": link_items,
                 "threshold_hit": opp.net_percent >= threshold,
             }
             summary_opps.append(entry)
             if opp.net_percent >= threshold:
-                total_fee_pct = fee_map[opp.buy_venue].taker_fee_percent + fee_map[opp.sell_venue].taker_fee_percent
-                est_profit, est_percent, base_qty = estimate_profit(capital_for_pair, opp.buy_price, opp.sell_price, total_fee_pct)
+                est_profit, est_percent, base_qty, capital_used = estimate_profit(
+                    capital_for_pair,
+                    opp.buy_price,
+                    opp.sell_price,
+                    total_fee_pct,
+                )
 
-                append_csv(log_csv, opp, est_profit, base_qty)
-                msg = fmt_alert(opp, est_profit, est_percent, base_qty, capital_for_pair)
+                append_csv(
+                    log_csv,
+                    opp,
+                    est_profit,
+                    base_qty,
+                    capital_used,
+                    opp.buy_depth,
+                    opp.sell_depth,
+                )
+                msg = fmt_alert(
+                    opp,
+                    est_profit,
+                    est_percent,
+                    base_qty,
+                    capital_for_pair,
+                    capital_used,
+                    opp.buy_depth,
+                    opp.sell_depth,
+                )
                 tg_send_message(msg, enabled=tg_enabled)
                 log_event(
                     "opportunity.alert",
@@ -2543,7 +2598,7 @@ def run_once() -> None:
         if tri_log_csv:
             append_triangular_csv(tri_log_csv, opp)
         fee_cfg = fee_map.get(route.venue)
-        fee_pct = fee_cfg.taker_fee_percent if fee_cfg else 0.0
+        fee_pct = fee_cfg.default.taker_fee_percent if fee_cfg else 0.0
         msg = fmt_triangular_alert(opp, fee_pct)
         tg_send_message(msg, enabled=tg_enabled)
         tri_alerts += 1
