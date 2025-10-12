@@ -147,7 +147,7 @@ PROM_EXCHANGE_ERRORS = Gauge(
 # CONFIG
 # =========================
 CONFIG = {
-    "threshold_percent": 0.6,      # alerta si neto >= 0.60%
+    "threshold_percent": 0.5,      # alerta si neto >= 0.50%
     "pairs": [
         # En modo de prueba solo consideramos los activos solicitados
         "BTC/USDT",
@@ -230,6 +230,8 @@ CONFIG = {
                 },
                 "per_pair": {
                     "BTC/USDT": {"taker": 0.08, "slippage_bps": 0.8},
+                    "USDT/ARS": {"taker": 0.08, "slippage_bps": 4.0},
+                    "BTC/ARS": {"taker": 0.08, "slippage_bps": 6.0},
                     "ETH/USDT": {"taker": 0.085},
                 },
                 "vip_level": "VIP0",
@@ -238,6 +240,27 @@ CONFIG = {
                     "VIP0": 1.0,
                     "VIP1": 0.95,
                     "VIP2": 0.90,
+                },
+            },
+            "p2p": {
+                "enabled": True,
+                "endpoint": "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+                "fallbacks": [
+                    "https://p2p.binance.com/bapi/c2c/v2/public/c2c/adv/search",
+                ],
+                "rows": 10,
+                "merchant_types": [],
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "pay_types": [],
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "pay_types": [],
+                    },
                 },
             },
             "transfers": {
@@ -285,11 +308,34 @@ CONFIG = {
                     "maker": 0.10,
                     "slippage_bps": 1.5,
                 },
+                "per_pair": {
+                    "USDT/ARS": {"taker": 0.10, "slippage_bps": 5.0},
+                    "BTC/ARS": {"taker": 0.10, "slippage_bps": 7.0},
+                },
                 "vip_level": "VIP0",
                 "vip_multipliers": {
                     "default": 1.0,
                     "VIP1": 0.97,
                     "VIP2": 0.93,
+                },
+            },
+            "p2p": {
+                "enabled": True,
+                "endpoint": "https://api2.bybit.com/fiat/otc/item/online",
+                "rows": 10,
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
                 },
             },
             "transfers": {
@@ -1159,6 +1205,54 @@ def http_get_json(
 
 
 MAX_ALLOWED_CLOCK_SKEW_MS = 5_000
+
+
+def http_post_json(
+    url: str,
+    payload: Optional[dict] = None,
+    timeout: int = 8,
+    retries: int = 3,
+    headers: Optional[Dict[str, str]] = None,
+    fallback_endpoints: Optional[List[Tuple[str, Optional[dict]]]] = None,
+) -> HttpJsonResponse:
+    last_exc: Optional[Exception] = None
+    effective_headers = {"Content-Type": "application/json"}
+    if headers:
+        effective_headers.update(headers)
+    endpoints: List[Tuple[str, Optional[dict]]] = [(url, payload)]
+    if fallback_endpoints:
+        endpoints.extend(fallback_endpoints)
+
+    for endpoint_url, endpoint_payload in endpoints:
+        for attempt in range(retries):
+            try:
+                r = requests.post(
+                    endpoint_url,
+                    json=endpoint_payload,
+                    headers=effective_headers,
+                    timeout=timeout,
+                )
+                if r.status_code != 200:
+                    raise HttpError(
+                        f"HTTP {r.status_code} {endpoint_url} payload={endpoint_payload}",
+                        status_code=r.status_code,
+                    )
+
+                received_ts = current_millis()
+                checksum = hashlib.sha256(r.content).hexdigest()
+                payload_json = r.json()
+                if not isinstance(payload_json, dict):
+                    raise HttpError(f"Respuesta no es JSON objeto en {endpoint_url}")
+
+                return HttpJsonResponse(payload_json, checksum, received_ts)
+            except Exception as exc:
+                last_exc = exc
+                backoff = min(0.5 * (2 ** attempt), 5.0)
+                time.sleep(backoff + random.uniform(0, 0.25))
+        if fallback_endpoints:
+            print(f"[http] cambiando a endpoint alternativo {endpoint_url}: {last_exc}")
+
+    raise last_exc or HttpError("POST failed")
 
 
 def ensure_fresh_timestamp(ts_ms: int, received_ts: int, source: str) -> int:
@@ -2042,6 +2136,20 @@ class ExchangeAdapter:
         ]
         return primary, fallbacks
 
+    def _p2p_config(self) -> Dict[str, Any]:
+        venue_cfg = CONFIG.get("venues", {}).get(self.name, {})
+        p2p_cfg = venue_cfg.get("p2p") or {}
+        return p2p_cfg if isinstance(p2p_cfg, dict) else {}
+
+    def _p2p_pair_config(self, pair: str) -> Optional[Dict[str, Any]]:
+        p2p_cfg = self._p2p_config()
+        if not p2p_cfg.get("enabled", False):
+            return None
+        pairs_cfg = p2p_cfg.get("pairs") or {}
+        if not isinstance(pairs_cfg, dict):
+            return None
+        return pairs_cfg.get(pair)
+
     def _integrity_key(self, symbol: str, endpoint: str) -> str:
         return f"{self.name}:{symbol}:{endpoint}"
 
@@ -2116,6 +2224,11 @@ class Binance(ExchangeAdapter):
             return self._attach_depth(pair, test_quote)
         if self._is_test_mode_enabled() and self._test_mode_paused():
             return self._attach_depth(pair, self._offline_quote(pair, reason="test_mode_paused"))
+        p2p_cfg = self._p2p_pair_config(pair)
+        if p2p_cfg:
+            p2p_quote = self._fetch_p2p_quote(pair, p2p_cfg)
+            if p2p_quote:
+                return p2p_quote
         sym = self.normalize_symbol(pair)
         url, fallbacks = self._endpoint_config(
             "ticker", "https://api.binance.com/api/v3/ticker/bookTicker"
@@ -2174,6 +2287,71 @@ class Binance(ExchangeAdapter):
             print(f"[binance] depth error {pair}: {exc}")
             return None
 
+    def _fetch_p2p_quote(self, pair: str, cfg: Dict[str, Any]) -> Optional[Quote]:
+        p2p_cfg = self._p2p_config()
+        endpoint = str(p2p_cfg.get("endpoint") or "").strip()
+        if not endpoint:
+            return None
+        asset = str(cfg.get("asset") or pair.split("/")[0]).upper()
+        fiat = str(cfg.get("fiat") or pair.split("/")[1]).upper()
+        pay_types_raw = cfg.get("pay_types") or []
+        pay_types = [pt for pt in pay_types_raw if isinstance(pt, str) and pt]
+        rows = max(1, int(p2p_cfg.get("rows", 10)))
+        merchant_types = p2p_cfg.get("merchant_types") or []
+
+        def _fetch_side(trade_type: str) -> Optional[float]:
+            payload: Dict[str, Any] = {
+                "page": 1,
+                "rows": rows,
+                "payTypes": pay_types,
+                "asset": asset,
+                "tradeType": trade_type,
+                "fiat": fiat,
+                "publisherType": None,
+            }
+            if merchant_types:
+                payload["merchantCheck"] = True
+                payload["publisherType"] = "MERCHANT"
+
+            fallbacks: List[Tuple[str, Optional[dict]]] = []
+            for fb in p2p_cfg.get("fallbacks", []) or []:
+                fb_url = str(fb).strip()
+                if fb_url:
+                    fallbacks.append((fb_url, payload))
+
+            try:
+                response = http_post_json(endpoint, payload, fallback_endpoints=fallbacks)
+            except Exception as exc:
+                print(f"[binance] p2p {pair} {trade_type} error: {exc}")
+                return None
+
+            data = response.data.get("data") or []
+            if not isinstance(data, list) or not data:
+                return None
+
+            prices: List[float] = []
+            for item in data:
+                adv = item.get("adv") if isinstance(item, dict) else None
+                price_str = adv.get("price") if isinstance(adv, dict) else None
+                price = safe_float(price_str)
+                if price > 0:
+                    prices.append(price)
+            if not prices:
+                return None
+            if trade_type.upper() == "BUY":
+                return min(prices)
+            return max(prices)
+
+        ask_price = _fetch_side("BUY")
+        bid_price = _fetch_side("SELL")
+        if ask_price is None or bid_price is None:
+            return None
+        if bid_price <= 0 or ask_price <= 0 or bid_price >= ask_price:
+            return None
+
+        symbol = self.normalize_symbol(pair)
+        return Quote(symbol, bid_price, ask_price, current_millis(), source="p2p")
+
 class Bybit(ExchangeAdapter):
     name = "bybit"
     depth_supported = True
@@ -2187,6 +2365,11 @@ class Bybit(ExchangeAdapter):
             return self._attach_depth(pair, test_quote)
         if self._is_test_mode_enabled() and self._test_mode_paused():
             return self._attach_depth(pair, self._offline_quote(pair, reason="test_mode_paused"))
+        p2p_cfg = self._p2p_pair_config(pair)
+        if p2p_cfg:
+            p2p_quote = self._fetch_p2p_quote(pair, p2p_cfg)
+            if p2p_quote:
+                return p2p_quote
         sym = self.normalize_symbol(pair)
         url, fallbacks = self._endpoint_config(
             "ticker", "https://api.bybit.com/v5/market/tickers"
@@ -2261,6 +2444,58 @@ class Bybit(ExchangeAdapter):
         except Exception as exc:
             print(f"[bybit] depth error {pair}: {exc}")
             return None
+
+    def _fetch_p2p_quote(self, pair: str, cfg: Dict[str, Any]) -> Optional[Quote]:
+        p2p_cfg = self._p2p_config()
+        endpoint = str(p2p_cfg.get("endpoint") or "").strip()
+        if not endpoint:
+            return None
+        asset = str(cfg.get("asset") or pair.split("/")[0]).upper()
+        fiat = str(cfg.get("fiat") or pair.split("/")[1]).upper()
+        rows = max(1, int(p2p_cfg.get("rows", 10)))
+        ask_side = str(cfg.get("ask_side", "1"))
+        bid_side = str(cfg.get("bid_side", "0"))
+
+        def _fetch_side(side: str, prefer_min: bool) -> Optional[float]:
+            payload: Dict[str, Any] = {
+                "userId": "",
+                "tokenId": asset,
+                "currencyId": fiat,
+                "payment": [],
+                "side": side,
+                "size": str(rows),
+                "page": "1",
+                "amount": "",
+            }
+            try:
+                response = http_post_json(endpoint, payload)
+            except Exception as exc:
+                print(f"[bybit] p2p {pair} side={side} error: {exc}")
+                return None
+
+            data = response.data.get("result") or {}
+            items = data.get("items") if isinstance(data, dict) else None
+            if not isinstance(items, list) or not items:
+                return None
+
+            prices: List[float] = []
+            for item in items:
+                price = safe_float(item.get("price") if isinstance(item, dict) else None)
+                if price > 0:
+                    prices.append(price)
+            if not prices:
+                return None
+            return min(prices) if prefer_min else max(prices)
+
+        ask_price = _fetch_side(ask_side, True)
+        bid_price = _fetch_side(bid_side, False)
+        if ask_price is None or bid_price is None:
+            return None
+        if bid_price <= 0 or ask_price <= 0 or bid_price >= ask_price:
+            return None
+
+        symbol = self.normalize_symbol(pair)
+        return Quote(symbol, bid_price, ask_price, current_millis(), source="p2p")
 
 class KuCoin(ExchangeAdapter):
     name = "kucoin"
