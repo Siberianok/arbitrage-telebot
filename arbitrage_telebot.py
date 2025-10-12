@@ -360,7 +360,7 @@ def tg_command_menu_payload() -> List[Dict[str, str]]:
     return payload
 
 
-def tg_enable_menu_button() -> None:
+def tg_enable_menu_button(chat_id: Optional[str] = None) -> None:
     """Fuerza el botón de menú de comandos en el cliente de Telegram."""
 
     token = get_bot_token()
@@ -368,16 +368,20 @@ def tg_enable_menu_button() -> None:
         log_event("telegram.menu_button.skip", reason="missing_token")
         return
 
+    params = {"menu_button": json.dumps({"type": "commands"})}
+    if chat_id:
+        params["chat_id"] = str(chat_id)
+
     try:
         tg_api_request(
             "setChatMenuButton",
-            params={"menu_button": json.dumps({"type": "commands"})},
+            params=params,
             http_method="post",
         )
     except Exception as exc:  # pragma: no cover - logging only
-        log_event("telegram.menu_button.error", error=str(exc))
+        log_event("telegram.menu_button.error", error=str(exc), chat_id=chat_id)
     else:
-        log_event("telegram.menu_button.enabled")
+        log_event("telegram.menu_button.enabled", chat_id=chat_id)
 
 
 def build_test_signal_message() -> str:
@@ -431,6 +435,8 @@ def tg_sync_command_menu(enabled: bool = True) -> None:
     else:
         log_event("telegram.commands.synced", commands=len(commands_payload))
         tg_enable_menu_button()
+        for chat_id in get_registered_chat_ids():
+            tg_enable_menu_button(chat_id=chat_id)
 
 
 def _load_telegram_chat_ids_from_env() -> None:
@@ -958,6 +964,7 @@ def register_telegram_chat(chat_id) -> str:
         TELEGRAM_CHAT_IDS.add(cid)
         os.environ[CONFIG["telegram"]["chat_ids_env"]] = ",".join(sorted(TELEGRAM_CHAT_IDS))
         log_event("telegram.chat_registered", chat_id=cid)
+        tg_enable_menu_button(chat_id=cid)
     return cid
 
 
