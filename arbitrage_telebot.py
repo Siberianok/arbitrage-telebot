@@ -2403,6 +2403,83 @@ def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) 
     return pair_quotes
 
 
+def diagnose_exchange_pairs(
+    pairs: Iterable[str],
+    adapters: Dict[str, ExchangeAdapter],
+    max_workers: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Ejecuta fetch_quote para cada par y exchange, devolviendo diagnósticos detallados."""
+
+    pairs_list = [pair.strip().upper() for pair in pairs if pair]
+    if not pairs_list or not adapters:
+        return []
+
+    futures: Dict[Any, Tuple[str, str]] = {}
+    results: List[Dict[str, Any]] = []
+    workers = max_workers or DEFAULT_QUOTE_WORKERS
+    workers = max(1, workers)
+
+    def _task(venue: str, adapter: ExchangeAdapter, pair: str) -> Dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            quote = adapter.fetch_quote(pair)
+        except Exception as exc:  # pragma: no cover - logging handled by caller
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            return {
+                "venue": venue,
+                "pair": pair,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "latency_ms": latency_ms,
+            }
+
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        if quote:
+            source = str(quote.source or "")
+            offline = source.lower() == "offline"
+            return {
+                "venue": venue,
+                "pair": pair,
+                "status": "ok",
+                "bid": float(quote.bid),
+                "ask": float(quote.ask),
+                "latency_ms": latency_ms,
+                "source": source,
+                "offline_source": offline,
+                "timestamp": int(quote.ts),
+            }
+
+        return {
+            "venue": venue,
+            "pair": pair,
+            "status": "no_data",
+            "latency_ms": latency_ms,
+        }
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for venue, adapter in adapters.items():
+            for pair in pairs_list:
+                future = executor.submit(_task, venue, adapter, pair)
+                futures[future] = (venue, pair)
+
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as exc:  # pragma: no cover - defensive
+                venue, pair = futures[future]
+                results.append(
+                    {
+                        "venue": venue,
+                        "pair": pair,
+                        "status": "error",
+                        "error": f"UnexpectedError: {exc}",
+                        "latency_ms": 0.0,
+                    }
+                )
+
+    return results
+
+
 def build_quote_snapshot(
     pair_quotes: Dict[str, Dict[str, Quote]], limit: int = 10
 ) -> Dict[str, Dict[str, Dict[str, float]]]:
@@ -3351,8 +3428,58 @@ def main():
     ap.add_argument("--interval", type=int, default=int(os.getenv("INTERVAL_SECONDS", "30")), help="Segundos entre corridas en modo loop")
     ap.add_argument("--web", action="store_true", help="Expone /health y corre el loop en background")
     ap.add_argument("--port", type=int, default=int(os.getenv("PORT", "10000")), help="Puerto HTTP para /health (Render usa $PORT)")
+    ap.add_argument("--diagnose-exchanges", action="store_true", help="Verifica conectividad de cada exchange y par configurado")
+    ap.add_argument("--diagnose-pair", action="append", dest="diagnose_pairs", help="Limita el diagnóstico a uno o más pares (puede repetirse)")
+    ap.add_argument("--diagnose-venue", action="append", dest="diagnose_venues", help="Limita el diagnóstico a uno o más exchanges (puede repetirse)")
 
     args = ap.parse_args()
+
+    if args.diagnose_exchanges:
+        selected_pairs = args.diagnose_pairs or CONFIG["pairs"]
+        selected_pairs = [pair.strip().upper() for pair in selected_pairs if pair]
+        adapters = build_adapters()
+        if args.diagnose_venues:
+            venues_filter = {venue.strip().lower() for venue in args.diagnose_venues if venue}
+            adapters = {name: adapter for name, adapter in adapters.items() if name in venues_filter}
+            missing = sorted(venues_filter.difference(adapters.keys()))
+            if missing:
+                print("Exchanges no habilitados:", ", ".join(missing))
+        if not selected_pairs:
+            print("Sin pares para diagnosticar")
+            return
+        if not adapters:
+            print("Sin exchanges habilitados para diagnosticar")
+            return
+        start_ts = time.time()
+        results = diagnose_exchange_pairs(selected_pairs, adapters)
+        results.sort(key=lambda item: (item["venue"], item["pair"]))
+        status_totals: Dict[str, int] = {}
+        for result in results:
+            status_totals[result["status"]] = status_totals.get(result["status"], 0) + 1
+            venue = result["venue"]
+            pair = result["pair"]
+            latency = f"{result['latency_ms']:.1f} ms"
+            if result["status"] == "ok":
+                source = result.get("source") or ""
+                offline_flag = " (offline)" if result.get("offline_source") else ""
+                bid = result.get("bid")
+                ask = result.get("ask")
+                print(
+                    f"[{venue}] {pair}: OK bid={bid:.8f} ask={ask:.8f} · origen={source or 'desconocido'} · latencia {latency}{offline_flag}"
+                )
+            elif result["status"] == "no_data":
+                print(f"[{venue}] {pair}: SIN DATOS · latencia {latency}")
+            else:
+                error = result.get("error") or "desconocido"
+                print(f"[{venue}] {pair}: ERROR ({error}) · latencia {latency}")
+        elapsed = time.time() - start_ts
+        total = sum(status_totals.values())
+        summary_parts = [f"total={total}"]
+        for status, count in sorted(status_totals.items()):
+            summary_parts.append(f"{status}={count}")
+        summary = " · ".join(summary_parts)
+        print(f"Diagnóstico completado en {elapsed:.2f} s · {summary}")
+        return
 
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
     if tg_enabled:
