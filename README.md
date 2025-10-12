@@ -15,6 +15,8 @@ Umbral de alerta: configurable (recomendado 0.8–1.0%).
 
 Simulación de PnL: incluida en cada alerta (ej.: capital = 10,000 USDT). 🧮
 
+Inteligencia histórica: ajuste dinámico del threshold, backtesting con costes realistas y clasificación de confianza por señal. 📈
+
 Alertas Telegram: múltiples destinos (DM y/o canal). 🔔
 
 Logs CSV: logs/opportunities.csv (timestamp, par, venues, spreads, PnL simulado). 🧾
