@@ -517,13 +517,14 @@ def tg_api_request(method: str, params: Optional[Dict] = None, http_method: str 
 
 
 def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) -> None:
+    global DYNAMIC_THRESHOLD_PERCENT
     command = command.lower()
     register_telegram_chat(chat_id)
 
     if command == "/start":
         response = (
             "Hola! Ya estás registrado para recibir señales.\n"
-            f"Threshold actual: {CONFIG['threshold_percent']:.3f}%\n"
+            f"Threshold base: {CONFIG['threshold_percent']:.3f}% | dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
             f"{format_command_help()}"
         )
         tg_send_message(response, enabled=enabled, chat_id=chat_id)
@@ -540,9 +541,16 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
     if command == "/status":
         pairs = CONFIG["pairs"]
         chats = get_registered_chat_ids()
+        analysis_summary = "Sin historial"
+        if LATEST_ANALYSIS and LATEST_ANALYSIS.rows_considered:
+            analysis_summary = (
+                f"SR: {LATEST_ANALYSIS.success_rate*100:.1f}%"
+                f" ({LATEST_ANALYSIS.rows_considered} señales)"
+            )
         response = (
             "Estado actual:\n"
-            f"Threshold: {CONFIG['threshold_percent']:.3f}%\n"
+            f"Threshold base: {CONFIG['threshold_percent']:.3f}% | dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
+            f"Histórico: {analysis_summary}\n"
             f"Pares ({len(pairs)}): {', '.join(pairs) if pairs else 'sin pares'}\n"
             f"Chats registrados: {', '.join(chats) if chats else 'ninguno'}"
         )
@@ -552,7 +560,10 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
     if command == "/threshold":
         if not argument:
             tg_send_message(
-                f"Threshold actual: {CONFIG['threshold_percent']:.3f}%",
+                (
+                    f"Threshold base: {CONFIG['threshold_percent']:.3f}% | "
+                    f"dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%"
+                ),
                 enabled=enabled,
                 chat_id=chat_id,
             )
@@ -563,6 +574,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             tg_send_message("Valor inválido. Ej: /threshold 0.8", enabled=enabled, chat_id=chat_id)
             return
         CONFIG["threshold_percent"] = value
+        DYNAMIC_THRESHOLD_PERCENT = value
         tg_send_message(
             f"Nuevo threshold guardado: {CONFIG['threshold_percent']:.3f}%",
             enabled=enabled,
@@ -1327,6 +1339,228 @@ class Opportunity:
     sell_price: float
     gross_percent: float
     net_percent: float
+    liquidity_score: float = 0.0
+    volatility_score: float = 0.0
+    priority_score: float = 0.0
+    confidence_label: str = "media"
+
+
+@dataclass
+class BacktestParams:
+    capital_quote: float
+    slippage_bps: float
+    rebalance_bps: float
+    latency_seconds: float
+    latency_penalty_multiplier: float
+
+
+@dataclass
+class BacktestReport:
+    total_trades: int = 0
+    profitable_trades: int = 0
+    cumulative_pnl: float = 0.0
+    average_pnl: float = 0.0
+    success_rate: float = 0.0
+    average_effective_percent: float = 0.0
+
+
+@dataclass
+class HistoricalAnalysis:
+    rows_considered: int
+    success_rate: float
+    average_net_percent: float
+    average_effective_percent: float
+    recommended_threshold: float
+    pair_volatility: Dict[str, float]
+    max_volatility: float
+    backtest: BacktestReport
+
+
+def safe_float(value: Optional[str], default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def load_historical_rows(path: str, lookback_hours: int) -> List[Dict[str, str]]:
+    if not os.path.exists(path):
+        return []
+
+    ensure_log_header(path)
+
+    cutoff_ts: Optional[int] = None
+    if lookback_hours > 0:
+        cutoff_ts = int(time.time() - lookback_hours * 3600)
+
+    rows: List[Dict[str, str]] = []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                ts = int(float(row.get("ts", 0)))
+            except (TypeError, ValueError):
+                continue
+            if cutoff_ts is not None and ts < cutoff_ts:
+                continue
+            rows.append(row)
+    return rows
+
+
+def compute_pair_volatility(rows: Iterable[Dict[str, str]]) -> Tuple[Dict[str, float], float]:
+    per_pair: Dict[str, List[float]] = {}
+    for row in rows:
+        pair = row.get("pair")
+        if not pair:
+            continue
+        per_pair.setdefault(pair, []).append(safe_float(row.get("net_%"), 0.0))
+
+    volatility: Dict[str, float] = {}
+    max_volatility = 0.0
+    for pair, values in per_pair.items():
+        if len(values) > 1:
+            try:
+                vol = pstdev(values)
+            except StatisticsError:
+                vol = 0.0
+        else:
+            vol = 0.0
+        volatility[pair] = vol
+        max_volatility = max(max_volatility, vol)
+    return volatility, max_volatility
+
+
+def build_backtest_params(capital: float, cfg: Dict[str, float]) -> BacktestParams:
+    return BacktestParams(
+        capital_quote=capital,
+        slippage_bps=float(cfg.get("slippage_bps", 0.0)),
+        rebalance_bps=float(cfg.get("rebalance_bps", 0.0)),
+        latency_seconds=float(cfg.get("latency_seconds", 0.0)),
+        latency_penalty_multiplier=float(cfg.get("latency_penalty_multiplier", 0.0)),
+    )
+
+
+def compute_effective_net_percent(net_percent: float, pair_volatility: float, params: BacktestParams) -> float:
+    penalty = (params.slippage_bps + params.rebalance_bps) / 100.0
+    if pair_volatility > 0 and params.latency_seconds > 0 and params.latency_penalty_multiplier > 0:
+        penalty += pair_volatility * (params.latency_seconds / 60.0) * params.latency_penalty_multiplier
+    return net_percent - penalty
+
+
+def run_backtest(rows: Iterable[Dict[str, str]], params: BacktestParams, pair_volatility: Dict[str, float]) -> Tuple[BacktestReport, List[float], List[float]]:
+    net_values: List[float] = []
+    effective_values: List[float] = []
+    cumulative_pnl = 0.0
+    profitable = 0
+
+    for row in rows:
+        pair = row.get("pair")
+        if not pair:
+            continue
+        net_percent = safe_float(row.get("net_%"), 0.0)
+        effective_net = compute_effective_net_percent(net_percent, pair_volatility.get(pair, 0.0), params)
+        net_values.append(net_percent)
+        effective_values.append(effective_net)
+        pnl = params.capital_quote * (effective_net / 100.0)
+        cumulative_pnl += pnl
+        if pnl > 0:
+            profitable += 1
+
+    total = len(effective_values)
+    average_pnl = cumulative_pnl / total if total else 0.0
+    average_effective = mean(effective_values) if effective_values else 0.0
+    success_rate = (profitable / total) if total else 0.0
+
+    report = BacktestReport(
+        total_trades=total,
+        profitable_trades=profitable,
+        cumulative_pnl=cumulative_pnl,
+        average_pnl=average_pnl,
+        success_rate=success_rate,
+        average_effective_percent=average_effective,
+    )
+
+    return report, net_values, effective_values
+
+
+def compute_dynamic_threshold(
+    net_values: List[float],
+    effective_values: List[float],
+    success_rate: float,
+    current_threshold: float,
+    cfg: Dict[str, float],
+) -> float:
+    if not net_values:
+        return current_threshold
+
+    target = float(cfg.get("target_success_rate", 0.6))
+    min_thr = float(cfg.get("min_threshold_percent", 0.1))
+    max_thr = float(cfg.get("max_threshold_percent", 5.0))
+    adjust_multiplier = float(cfg.get("adjust_multiplier", 0.4))
+
+    sorted_net = sorted(net_values)
+    # índice asociado al percentil que deja target% de señales por encima
+    idx = max(0, min(len(sorted_net) - 1, int(math.floor((1 - target) * len(sorted_net)))))
+    quantile_net = sorted_net[idx]
+
+    penalties: List[float] = []
+    for net, eff in zip(net_values, effective_values):
+        penalties.append(net - eff)
+    avg_penalty = mean(penalties) if penalties else 0.0
+
+    candidate = quantile_net + max(0.0, avg_penalty)
+
+    diff = success_rate - target
+    adjusted = current_threshold - diff * adjust_multiplier
+
+    blended = 0.5 * adjusted + 0.5 * candidate
+    return max(min_thr, min(max_thr, blended))
+
+
+def analyze_historical_performance(path: str, capital: float) -> HistoricalAnalysis:
+    analysis_cfg = CONFIG.get("analysis", {})
+    lookback_hours = int(analysis_cfg.get("lookback_hours", 0))
+    rows = load_historical_rows(path, lookback_hours)
+
+    params = build_backtest_params(capital, CONFIG.get("execution_costs", {}))
+
+    if not rows:
+        backtest = BacktestReport()
+        return HistoricalAnalysis(
+            rows_considered=0,
+            success_rate=backtest.success_rate,
+            average_net_percent=0.0,
+            average_effective_percent=backtest.average_effective_percent,
+            recommended_threshold=float(CONFIG["threshold_percent"]),
+            pair_volatility={},
+            max_volatility=0.0,
+            backtest=backtest,
+        )
+
+    volatility, max_volatility = compute_pair_volatility(rows)
+    backtest, net_values, effective_values = run_backtest(rows, params, volatility)
+
+    average_net = mean(net_values) if net_values else 0.0
+    recommended_threshold = compute_dynamic_threshold(
+        net_values,
+        effective_values,
+        backtest.success_rate,
+        float(CONFIG["threshold_percent"]),
+        analysis_cfg,
+    )
+
+    return HistoricalAnalysis(
+        rows_considered=len(net_values),
+        success_rate=backtest.success_rate,
+        average_net_percent=average_net,
+        average_effective_percent=backtest.average_effective_percent,
+        recommended_threshold=recommended_threshold,
+        pair_volatility=volatility,
+        max_volatility=max_volatility,
+        backtest=backtest,
+    )
 
 @dataclass
 class TriangleLeg:
@@ -1576,7 +1810,53 @@ def append_csv(
     sell_depth: Optional[DepthInfo],
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    exists = os.path.exists(path)
+
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(LOG_HEADER)
+        LOG_HEADER_INITIALIZED = True
+        return
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            header = []
+        rows = list(reader)
+
+    if header == LOG_HEADER:
+        LOG_HEADER_INITIALIZED = True
+        return
+
+    # Upgrade antiguo header -> nuevo formato con columnas extra
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(LOG_HEADER)
+        for row in rows:
+            record = {header[i]: row[i] for i in range(len(header))}
+            writer.writerow([
+                record.get("ts", ""),
+                record.get("pair", ""),
+                record.get("buy_venue", ""),
+                record.get("sell_venue", ""),
+                record.get("buy_price", ""),
+                record.get("sell_price", ""),
+                record.get("gross_%", ""),
+                record.get("net_%", ""),
+                record.get("est_profit_quote", ""),
+                record.get("base_qty", ""),
+                record.get("liquidity_score", ""),
+                record.get("volatility_score", ""),
+                record.get("priority_score", ""),
+                record.get("confidence", ""),
+            ])
+
+    LOG_HEADER_INITIALIZED = True
+
+
+def append_csv(path: str, opp: Opportunity, est_profit: float, base_qty: float) -> None:
+    ensure_log_header(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if not exists:
