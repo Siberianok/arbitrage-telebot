@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: arbitrage-telebot
+    env: python
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: |
+      python arbitrage_telebot.py --loop --interval 30
+    autoDeploy: true
+    envVars:
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TG_CHAT_IDS
+        sync: false
