@@ -361,6 +361,36 @@ def tg_command_menu_payload() -> List[Dict[str, str]]:
     return payload
 
 
+def build_test_signal_message() -> str:
+    capital = float(CONFIG.get("simulation_capital_quote", 0.0))
+
+    sample_opportunity = Opportunity(
+        pair="BTC/USDT",
+        buy_venue="binance",
+        sell_venue="bybit",
+        buy_price=30050.0,
+        sell_price=30290.0,
+        gross_percent=((30290.0 - 30050.0) / 30050.0) * 100,
+        net_percent=0.82,
+    )
+
+    base_qty = 0.0
+    if sample_opportunity.buy_price > 0 and capital > 0:
+        base_qty = capital / sample_opportunity.buy_price
+
+    est_profit = (capital * sample_opportunity.net_percent) / 100.0 if capital else 0.0
+
+    alert_message = fmt_alert(
+        sample_opportunity,
+        est_profit=est_profit,
+        est_percent=sample_opportunity.net_percent,
+        base_qty=base_qty,
+        capital_quote=capital,
+    )
+
+    return "Señal de prueba ✅\n\n" + alert_message
+
+
 def tg_sync_command_menu(enabled: bool = True) -> None:
     if not enabled:
         return
@@ -1130,7 +1160,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         return
 
     if command == "/test":
-        tg_send_message("Señal de prueba ✅", enabled=enabled, chat_id=chat_id)
+        tg_send_message(build_test_signal_message(), enabled=enabled, chat_id=chat_id)
         return
 
     tg_send_message("Comando no reconocido. Probá /help para ver el listado.", enabled=enabled, chat_id=chat_id)
@@ -2680,6 +2710,10 @@ def main():
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
     if tg_enabled:
         tg_sync_command_menu(enabled=True)
+        tg_send_message(
+            "🤖 Bot reiniciado.\n\n" + format_command_help(),
+            enabled=True,
+        )
     if tg_enabled and (args.loop or args.web):
         ensure_telegram_polling_thread(enabled=True, interval=1.0)
 
