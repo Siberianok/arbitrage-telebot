@@ -375,6 +375,8 @@ TELEGRAM_ADMIN_IDS: Set[str] = set()
 TELEGRAM_POLL_BACKOFF_UNTIL = 0.0
 
 TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS = 30.0
+TELEGRAM_WEBHOOK_RESET_COOLDOWN_SECONDS = 600.0
+TELEGRAM_LAST_WEBHOOK_RESET_TS = 0.0
 
 STATE_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
@@ -1533,6 +1535,34 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
     )
 
 
+def _reset_telegram_webhook_after_conflict(now: Optional[float] = None) -> None:
+    """Intenta limpiar un webhook residual que impide la lectura por getUpdates."""
+
+    global TELEGRAM_LAST_WEBHOOK_RESET_TS
+
+    moment = now if now is not None else time.monotonic()
+    if (
+        TELEGRAM_LAST_WEBHOOK_RESET_TS
+        and moment - TELEGRAM_LAST_WEBHOOK_RESET_TS < TELEGRAM_WEBHOOK_RESET_COOLDOWN_SECONDS
+    ):
+        log_event(
+            "telegram.poll.reset_webhook.skip",
+            reason="cooldown",
+            cooldown_seconds=TELEGRAM_WEBHOOK_RESET_COOLDOWN_SECONDS,
+        )
+        return
+
+    TELEGRAM_LAST_WEBHOOK_RESET_TS = moment
+    try:
+        tg_api_request("deleteWebhook")
+    except HttpError as exc:
+        log_event("telegram.poll.reset_webhook.error", error=str(exc))
+    except Exception as exc:  # pragma: no cover - logging only
+        log_event("telegram.poll.reset_webhook.exception", error=str(exc))
+    else:
+        log_event("telegram.poll.reset_webhook.success")
+
+
 def tg_process_updates(enabled: bool = True) -> None:
     global TELEGRAM_LAST_UPDATE_ID, TELEGRAM_POLL_BACKOFF_UNTIL
 
@@ -1559,6 +1589,7 @@ def tg_process_updates(enabled: bool = True) -> None:
                 error=str(e),
                 backoff_seconds=TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS,
             )
+            _reset_telegram_webhook_after_conflict()
         else:
             log_event("telegram.poll.error", error=str(e))
         return
