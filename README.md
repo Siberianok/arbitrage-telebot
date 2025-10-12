@@ -23,6 +23,19 @@ Diseño extensible: fácil de sumar exchanges, P2P, puentes fiat, límites y man
 
 Ejecución v1 (inventario): ejecutás el spread con saldo en ambos exchanges (sin transferencias) — realista para oportunidades rápidas. ⚡
 
+📟 Comandos de Telegram disponibles
+
+| Comando | Descripción |
+| --- | --- |
+| `/help` | Muestra el listado de comandos disponibles. |
+| `/ping` | Devuelve `pong` para verificar la conectividad del bot. |
+| `/status` | Resume el threshold configurado, pares monitoreados y chats registrados. |
+| `/threshold <valor>` | Consulta o actualiza el umbral de alerta (en %). |
+| `/pairs` | Lista los pares configurados actualmente. |
+| `/addpair <PAR>` | Agrega un nuevo par (por ejemplo `BTC/USDT`). |
+| `/delpair <PAR>` | Elimina un par del monitoreo. |
+| `/test` | Envía una señal de prueba para confirmar entregas. |
+
 🧠 Cómo funciona (resumen)
 
 Para cada par, obtiene best bid/ask de cada exchange habilitado.
