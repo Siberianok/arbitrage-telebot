@@ -39,7 +39,7 @@ Ejecución v1 (inventario): ejecutás el spread con saldo en ambos exchanges (si
 | `/status` | Resume el threshold configurado, pares monitoreados y chats registrados. |
 | `/capital <monto>` | Consulta o actualiza el capital simulado (USDT) _(solo admins pueden modificar)_. |
 | `/listapares` | Muestra la lista de pares configurados actualmente. |
-| `/adherirpar` | Solicita la cripto a adherir y la agrega como `BASE/WLVST` _(solo admins)_. |
+| `/adherirpar` | Solicita la cripto a adherir y la agrega como `BASE/USDT` _(solo admins)_. |
 | `/eliminarpar` | Despliega botones con los pares actuales para elegir cuál eliminar _(solo admins)_. |
 | `/senalprueba` | Envía una señal de prueba para confirmar entregas. |
 
@@ -68,7 +68,7 @@ Luego iniciar con `python arbitrage_telebot.py --web --interval 30 --port 10000`
 
 - `LOG_BASE_DIR` / `LOG_BACKUP_DIR`: directorios para logs y respaldos persistentes (por defecto `logs/` y `log_backups/`).
 - `QUOTE_WORKERS`: máximo de workers concurrentes para la recolección de precios (default 16).
-- `DEFAULT_QUOTE_ASSET`: moneda estable por defecto para componer pares al adherir o eliminar desde Telegram (default `WLVST`).
+- `DEFAULT_QUOTE_ASSET`: moneda estable por defecto para componer pares al adherir o eliminar desde Telegram (default `USDT`).
 
 🔎 Playbooks operativos
 

@@ -107,7 +107,7 @@ from observability import (
 LOG_BASE_DIR = os.getenv("LOG_BASE_DIR", "logs")
 LOG_BACKUP_DIR = os.getenv("LOG_BACKUP_DIR", "log_backups")
 DEFAULT_QUOTE_WORKERS = int(os.getenv("QUOTE_WORKERS", "16"))
-DEFAULT_QUOTE_ASSET = os.getenv("DEFAULT_QUOTE_ASSET", "WLVST").strip().upper() or "WLVST"
+DEFAULT_QUOTE_ASSET = os.getenv("DEFAULT_QUOTE_ASSET", "USDT").strip().upper() or "USDT"
 
 PROM_REGISTRY = CollectorRegistry()
 PROM_LAST_RUN_TS = Gauge(
