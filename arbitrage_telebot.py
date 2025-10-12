@@ -503,14 +503,15 @@ FEE_REGISTRY: Dict[Tuple[str, str], float] = {}
 
 
 COMMANDS_HELP: List[Tuple[str, str]] = [
-    ("/help", "Cómo acceder al menú de comandos"),
     ("/ping", "Responde con 'pong' para verificar conectividad"),
     ("/status", "Resume configuración actual y chats registrados"),
-    ("/threshold <valor>", "Consulta o actualiza el umbral de alerta (%)"),
-    ("/capital <USDT>", "Consulta o ajusta el capital simulado en USDT"),
+    (
+        "/threshold",
+        "Consulta o actualiza el umbral de alerta (%) — usar /threshold <valor>",
+    ),
     ("/pairs", "Lista los pares configurados"),
-    ("/addpair <PAR>", "Agrega un par nuevo al monitoreo"),
-    ("/delpair <PAR>", "Elimina un par del monitoreo"),
+    ("/addpair", "Agrega un par nuevo al monitoreo — usar /addpair <PAR>",),
+    ("/delpair", "Elimina un par del monitoreo — usar /delpair <PAR>"),
     ("/test", "Envía una señal de prueba"),
 ]
 
@@ -525,6 +526,27 @@ def format_command_help() -> str:
 
 def get_bot_token() -> str:
     return os.getenv(CONFIG["telegram"]["bot_token_env"], "").strip()
+
+
+def tg_commands_reply_markup() -> Dict[str, Any]:
+    """Construye un teclado con accesos directos a los comandos del bot."""
+
+    keyboard: List[List[Dict[str, str]]] = []
+    row: List[Dict[str, str]] = []
+    for idx, (command, _description) in enumerate(COMMANDS_HELP, start=1):
+        row.append({"text": command})
+        if idx % 2 == 0:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    return {
+        "keyboard": keyboard,
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "one_time_keyboard": False,
+    }
 
 
 def tg_command_menu_payload() -> List[Dict[str, str]]:
@@ -1251,16 +1273,22 @@ def ensure_admin(chat_id: str, enabled: bool) -> bool:
     return False
 
 
-def tg_send_message(text: str, enabled: bool = True, chat_id: Optional[str] = None) -> None:
-    global LAST_TELEGRAM_SEND_TS
-    preview = text if len(text) <= 400 else text[:400] + "…"
+def tg_send_message(
+    text: str,
+    *,
+    enabled: bool = True,
+    chat_id: Optional[str] = None,
+    preview: Optional[str] = None,
+    reply_markup: Optional[Dict[str, Any]] = None,
+) -> None:
+    effective_preview = preview or (text if len(text) <= 400 else text[:400] + "…")
     if not enabled:
-        log_event("telegram.send.skip", reason="disabled", preview=preview)
+        log_event("telegram.send.skip", reason="disabled", preview=effective_preview)
         return
 
     token = get_bot_token()
     if not token:
-        log_event("telegram.send.skip", reason="missing_token", preview=preview)
+        log_event("telegram.send.skip", reason="missing_token", preview=effective_preview)
         return
 
     targets: List[str]
@@ -1270,13 +1298,15 @@ def tg_send_message(text: str, enabled: bool = True, chat_id: Optional[str] = No
         targets = get_registered_chat_ids()
 
     if not targets:
-        log_event("telegram.send.skip", reason="no_targets", preview=preview)
+        log_event("telegram.send.skip", reason="no_targets", preview=effective_preview)
         return
 
     base = f"https://api.telegram.org/bot{token}/sendMessage"
     for cid in targets:
         try:
             payload = {"chat_id": cid, "text": text, "parse_mode": "Markdown"}
+            if reply_markup is not None:
+                payload["reply_markup"] = json.dumps(reply_markup)
             r = requests.post(base, data=payload, timeout=8)
             if r.status_code != 200:
                 log_event(
@@ -1326,11 +1356,12 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             f"Threshold base: {CONFIG['threshold_percent']:.3f}% | dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
             f"{format_command_help()}"
         )
-        tg_send_message(response, enabled=enabled, chat_id=chat_id)
-        return
-
-    if command == "/help":
-        tg_send_message(format_command_help(), enabled=enabled, chat_id=chat_id)
+        tg_send_message(
+            response,
+            enabled=enabled,
+            chat_id=chat_id,
+            reply_markup=tg_commands_reply_markup(),
+        )
         return
 
     if command == "/ping":
@@ -1383,38 +1414,6 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         )
         return
 
-    if command == "/capital":
-        if not argument:
-            tg_send_message(
-                f"Capital simulado: {CONFIG['simulation_capital_quote']:.2f} USDT",
-                enabled=enabled,
-                chat_id=chat_id,
-            )
-            return
-        if not ensure_admin(chat_id, enabled):
-            return
-        try:
-            value = float(argument.replace(",", "").strip())
-        except ValueError:
-            tg_send_message(
-                "Valor inválido. Ej: /capital 15000",
-                enabled=enabled,
-                chat_id=chat_id,
-            )
-            return
-        if value <= 0:
-            tg_send_message("El capital debe ser mayor que cero.", enabled=enabled, chat_id=chat_id)
-            return
-        with CONFIG_LOCK:
-            CONFIG["simulation_capital_quote"] = value
-        refresh_config_snapshot()
-        tg_send_message(
-            f"Nuevo capital simulado guardado: {CONFIG['simulation_capital_quote']:.2f} USDT",
-            enabled=enabled,
-            chat_id=chat_id,
-        )
-        return
-
     if command == "/pairs":
         pairs = CONFIG["pairs"]
         if not pairs:
@@ -1460,7 +1459,11 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         tg_send_message(build_test_signal_message(), enabled=enabled, chat_id=chat_id)
         return
 
-    tg_send_message("Comando no reconocido. Probá /help para ver el listado.", enabled=enabled, chat_id=chat_id)
+    tg_send_message(
+        "Comando no reconocido. Usá el botón de menú para ver las opciones disponibles.",
+        enabled=enabled,
+        chat_id=chat_id,
+    )
 
 
 def tg_process_updates(enabled: bool = True) -> None:
