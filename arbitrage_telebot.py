@@ -107,6 +107,7 @@ from observability import (
 LOG_BASE_DIR = os.getenv("LOG_BASE_DIR", "logs")
 LOG_BACKUP_DIR = os.getenv("LOG_BACKUP_DIR", "log_backups")
 DEFAULT_QUOTE_WORKERS = int(os.getenv("QUOTE_WORKERS", "16"))
+DEFAULT_QUOTE_ASSET = os.getenv("DEFAULT_QUOTE_ASSET", "USDT").strip().upper() or "USDT"
 
 PROM_REGISTRY = CollectorRegistry()
 PROM_LAST_RUN_TS = Gauge(
@@ -456,6 +457,7 @@ WEB_AUTH_PASS = os.getenv("WEB_AUTH_PASS", "").strip()
 
 LATEST_ANALYSIS: Optional[Any] = None
 LAST_TELEGRAM_SEND_TS: float = 0.0
+PENDING_CHAT_ACTIONS: Dict[str, str] = {}
 
 
 LOG_HEADER = [
@@ -504,20 +506,13 @@ FEE_REGISTRY: Dict[Tuple[str, str], float] = {}
 
 
 COMMANDS_HELP: List[Tuple[str, str]] = [
-    ("/ping", "Responde con 'pong' para verificar conectividad"),
-    ("/status", "Resume configuración actual y chats registrados"),
-    (
-        "/threshold",
-        "Consulta o actualiza el umbral de alerta (%) — usar /threshold <valor>",
-    ),
-    (
-        "/capital",
-        "Consulta o actualiza el capital simulado (USDT) — usar /capital <monto>",
-    ),
-    ("/pairs", "Lista los pares configurados"),
-    ("/addpair", "Agrega un par nuevo al monitoreo — usar /addpair <PAR>",),
-    ("/delpair", "Elimina un par del monitoreo — usar /delpair <PAR>"),
-    ("/test", "Envía una señal de prueba"),
+    ("/ping", "Ping"),
+    ("/status", "Estado"),
+    ("/capital", "Capital"),
+    ("/listapares", "Lista de pares"),
+    ("/adherirpar", "Adherir par"),
+    ("/eliminarpar", "Eliminar par"),
+    ("/senalprueba", "Señal de prueba"),
 ]
 
 
@@ -562,6 +557,48 @@ def tg_command_menu_payload() -> List[Dict[str, str]]:
             "description": description[:256],
         })
     return payload
+
+
+def set_pending_action(chat_id: str, action: Optional[str]) -> None:
+    if action:
+        PENDING_CHAT_ACTIONS[chat_id] = action
+    else:
+        PENDING_CHAT_ACTIONS.pop(chat_id, None)
+
+
+def get_pending_action(chat_id: str) -> Optional[str]:
+    return PENDING_CHAT_ACTIONS.get(chat_id)
+
+
+def normalize_pair_input(raw_value: str) -> Optional[str]:
+    cleaned = raw_value.strip().upper().replace(" ", "")
+    if not cleaned:
+        return None
+    if "/" in cleaned:
+        base, _, quote = cleaned.partition("/")
+        base = base.strip()
+        quote = quote.strip()
+        if not base or not quote:
+            return None
+        return f"{base}/{quote}"
+    return f"{cleaned}/{DEFAULT_QUOTE_ASSET}"
+
+
+def build_pairs_reply_keyboard(pairs: Iterable[str]) -> Dict[str, Any]:
+    keyboard: List[List[Dict[str, str]]] = []
+    row: List[Dict[str, str]] = []
+    for idx, pair in enumerate(sorted(pairs), start=1):
+        row.append({"text": pair})
+        if idx % 3 == 0:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    return {
+        "keyboard": keyboard,
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
 
 
 def tg_enable_menu_button(chat_id: Optional[str] = None) -> None:
@@ -1350,6 +1387,77 @@ def tg_api_request(method: str, params: Optional[Dict] = None, http_method: str 
     return data
 
 
+def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
+    action = get_pending_action(chat_id)
+    if not action:
+        return False
+
+    raw_text = text.strip()
+    value = normalize_pair_input(text)
+    if not value:
+        tg_send_message(
+            "No pude interpretar ese valor. Probá nuevamente o enviá otro comando para cancelar.",
+            enabled=enabled,
+            chat_id=chat_id,
+        )
+        return True
+
+    if action == "addpair":
+        pair = value
+        if pair in CONFIG["pairs"]:
+            tg_send_message(
+                (
+                    f"{pair} ya está configurado. Ingresá otra cripto o "
+                    "enviá cualquier comando para cancelar."
+                ),
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return True
+        with CONFIG_LOCK:
+            CONFIG["pairs"].append(pair)
+        refresh_config_snapshot()
+        set_pending_action(chat_id, None)
+        tg_send_message(
+            f"Par agregado: {pair}",
+            enabled=enabled,
+            chat_id=chat_id,
+        )
+        return True
+
+    if action == "delpair":
+        target = value
+        if "/" not in raw_text:
+            base = raw_text.strip().upper().replace(" ", "")
+            if base:
+                candidates = [p for p in CONFIG["pairs"] if p.startswith(f"{base}/")]
+                if len(candidates) == 1:
+                    target = candidates[0]
+        if target not in CONFIG["pairs"]:
+            tg_send_message(
+                (
+                    f"{target} no figura en la lista. Elegí otro de los botones "
+                    "o ingresá una cripto válida."
+                ),
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return True
+        with CONFIG_LOCK:
+            CONFIG["pairs"] = [p for p in CONFIG["pairs"] if p != target]
+        refresh_config_snapshot()
+        set_pending_action(chat_id, None)
+        tg_send_message(
+            f"Par eliminado: {target}",
+            enabled=enabled,
+            chat_id=chat_id,
+            reply_markup={"remove_keyboard": True},
+        )
+        return True
+
+    return False
+
+
 def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) -> None:
     global DYNAMIC_THRESHOLD_PERCENT
     command = command.lower()
@@ -1390,33 +1498,6 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             f"Chats registrados: {', '.join(chats) if chats else 'ninguno'}"
         )
         tg_send_message(response, enabled=enabled, chat_id=chat_id)
-        return
-
-    if command == "/threshold":
-        if not argument:
-            tg_send_message(
-                (
-                    f"Threshold base: {CONFIG['threshold_percent']:.3f}% | "
-                    f"dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%"
-                ),
-                enabled=enabled,
-                chat_id=chat_id,
-            )
-            return
-        if not ensure_admin(chat_id, enabled):
-            return
-        try:
-            value = float(argument.replace("%", "").strip())
-        except ValueError:
-            tg_send_message("Valor inválido. Ej: /threshold 0.8", enabled=enabled, chat_id=chat_id)
-            return
-        CONFIG["threshold_percent"] = value
-        DYNAMIC_THRESHOLD_PERCENT = value
-        tg_send_message(
-            f"Nuevo threshold guardado: {CONFIG['threshold_percent']:.3f}%",
-            enabled=enabled,
-            chat_id=chat_id,
-        )
         return
 
     if command == "/capital":
@@ -1465,7 +1546,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         )
         return
 
-    if command == "/pairs":
+    if command in ("/pairs", "/listapares"):
         pairs = CONFIG["pairs"]
         if not pairs:
             tg_send_message("No hay pares configurados.", enabled=enabled, chat_id=chat_id)
@@ -1474,39 +1555,39 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             tg_send_message(f"Pares actuales:\n{formatted}", enabled=enabled, chat_id=chat_id)
         return
 
-    if command == "/addpair":
-        if not argument:
-            tg_send_message("Uso: /addpair BTC/USDT", enabled=enabled, chat_id=chat_id)
-            return
+    if command in ("/addpair", "/adherirpar"):
         if not ensure_admin(chat_id, enabled):
             return
-        pair = argument.upper().strip()
-        if pair in CONFIG["pairs"]:
-            tg_send_message(f"{pair} ya estaba en la lista.", enabled=enabled, chat_id=chat_id)
-        else:
-            with CONFIG_LOCK:
-                CONFIG["pairs"].append(pair)
-            refresh_config_snapshot()
-            tg_send_message(f"Par agregado: {pair}", enabled=enabled, chat_id=chat_id)
+        set_pending_action(chat_id, "addpair")
+        default_quote = DEFAULT_QUOTE_ASSET
+        prompt = (
+            "Ingresá la cripto que querés adherir."
+            f" Se agregará como BASE/{default_quote}."
+        )
+        tg_send_message(prompt, enabled=enabled, chat_id=chat_id)
         return
 
-    if command == "/delpair":
-        if not argument:
-            tg_send_message("Uso: /delpair BTC/USDT", enabled=enabled, chat_id=chat_id)
-            return
+    if command in ("/delpair", "/eliminarpar"):
         if not ensure_admin(chat_id, enabled):
             return
-        pair = argument.upper().strip()
-        if pair not in CONFIG["pairs"]:
-            tg_send_message(f"{pair} no está en la lista.", enabled=enabled, chat_id=chat_id)
-        else:
-            with CONFIG_LOCK:
-                CONFIG["pairs"] = [p for p in CONFIG["pairs"] if p != pair]
-            refresh_config_snapshot()
-            tg_send_message(f"Par eliminado: {pair}", enabled=enabled, chat_id=chat_id)
+        pairs = CONFIG["pairs"]
+        if not pairs:
+            tg_send_message("No hay pares configurados para eliminar.", enabled=enabled, chat_id=chat_id)
+            return
+        set_pending_action(chat_id, "delpair")
+        keyboard = build_pairs_reply_keyboard(pairs)
+        tg_send_message(
+            (
+                "Elegí el par a eliminar desde los botones o ingresá "
+                "manual la cripto/par a remover."
+            ),
+            enabled=enabled,
+            chat_id=chat_id,
+            reply_markup=keyboard,
+        )
         return
 
-    if command == "/test":
+    if command in ("/test", "/senalprueba"):
         tg_send_message(build_test_signal_message(), enabled=enabled, chat_id=chat_id)
         return
 
@@ -1563,14 +1644,18 @@ def tg_process_updates(enabled: bool = True) -> None:
         if not chat_id or not text:
             continue
 
-        register_telegram_chat(chat_id)
-        if not text.startswith("/"):
+        chat_id_str = register_telegram_chat(chat_id)
+        if text.startswith("/"):
+            set_pending_action(chat_id_str, None)
+            parts = text.split(maxsplit=1)
+            command = parts[0]
+            argument = parts[1] if len(parts) > 1 else ""
+            tg_handle_command(command, argument, chat_id_str, enabled)
             continue
 
-        parts = text.split(maxsplit=1)
-        command = parts[0]
-        argument = parts[1] if len(parts) > 1 else ""
-        tg_handle_command(command, argument, str(chat_id), enabled)
+        if tg_handle_pending_input(chat_id_str, text, enabled):
+            continue
+
 
 
 def ensure_telegram_polling_thread(enabled: bool, interval: float = 1.0) -> None:
