@@ -6,22 +6,94 @@ import base64
 import csv
 import hashlib
 import itertools
-import math
 import json
+import math
 import os
+import random
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Dict, Optional, List, Tuple, Set, Any, Iterable
+from pathlib import Path
+from statistics import StatisticsError, mean, pstdev
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
+
+try:
+    from prometheus_client import (
+        CONTENT_TYPE_LATEST,
+        CollectorRegistry,
+        Gauge,
+        generate_latest,
+    )
+except Exception:  # pragma: no cover - fallback when prometheus_client is unavailable
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
+
+    class CollectorRegistry:  # type: ignore
+        def __init__(self):
+            self.metrics: List["_Gauge"] = []
+
+        def register(self, metric: "_Gauge") -> None:
+            self.metrics.append(metric)
+
+        def collect(self) -> List["_Gauge"]:
+            return list(self.metrics)
+
+    class _GaugeChild:
+        def __init__(self, parent: "_Gauge", labels: Tuple[Tuple[str, str], ...]):
+            self.parent = parent
+            self.labels = labels
+
+        def set(self, value: float) -> None:
+            self.parent.samples[self.labels] = float(value)
+
+    class _Gauge:
+        def __init__(
+            self,
+            name: str,
+            documentation: str,
+            labelnames: Optional[List[str]] = None,
+            registry: Optional[CollectorRegistry] = None,
+        ):
+            self.name = name
+            self.documentation = documentation
+            self.labelnames = tuple(labelnames or [])
+            self.samples: Dict[Tuple[Tuple[str, str], ...], float] = {}
+            if registry is not None:
+                registry.register(self)
+
+        def labels(self, **kwargs: str) -> _GaugeChild:
+            labels = tuple((label, str(kwargs.get(label, ""))) for label in self.labelnames)
+            return _GaugeChild(self, labels)
+
+        def set(self, value: float) -> None:
+            self.samples[tuple()] = float(value)
+
+    class Gauge(_Gauge):  # type: ignore
+        def __init__(self, name: str, documentation: str, labelnames: Optional[List[str]] = None, registry: Optional[CollectorRegistry] = None):
+            super().__init__(name, documentation, labelnames=labelnames, registry=registry)
+
+    def generate_latest(registry: CollectorRegistry) -> bytes:
+        lines: List[str] = []
+        for metric in registry.collect():
+            lines.append(f"# HELP {metric.name} {metric.documentation}")
+            lines.append(f"# TYPE {metric.name} gauge")
+            for labels, value in metric.samples.items():
+                if labels:
+                    label_str = ",".join(f"{k}=\"{v}\"" for k, v in labels)
+                    lines.append(f"{metric.name}{{{label_str}}} {value}")
+                else:
+                    lines.append(f"{metric.name} {value}")
+        return "\n".join(lines).encode("utf-8")
 
 from observability import (
     ERROR_RATE_ALERT_THRESHOLD,
     is_circuit_open,
     log_event,
+    metrics_snapshot,
     record_exchange_attempt,
     record_exchange_error,
     record_exchange_no_data,
@@ -29,6 +101,45 @@ from observability import (
     record_exchange_success,
     register_degradation_alert,
     reset_metrics,
+)
+
+
+LOG_BASE_DIR = os.getenv("LOG_BASE_DIR", "logs")
+LOG_BACKUP_DIR = os.getenv("LOG_BACKUP_DIR", "log_backups")
+DEFAULT_QUOTE_WORKERS = int(os.getenv("QUOTE_WORKERS", "16"))
+
+PROM_REGISTRY = CollectorRegistry()
+PROM_LAST_RUN_TS = Gauge(
+    "arbitrage_last_run_timestamp",
+    "Timestamp of the last successful scanning cycle",
+    registry=PROM_REGISTRY,
+)
+PROM_LAST_RUN_LATENCY_MS = Gauge(
+    "arbitrage_last_run_latency_ms",
+    "Execution time in milliseconds of the last scanning cycle",
+    registry=PROM_REGISTRY,
+)
+PROM_ALERTS_SENT = Gauge(
+    "arbitrage_alerts_sent_total",
+    "Number of alerts emitted in the last scanning cycle",
+    registry=PROM_REGISTRY,
+)
+PROM_TRIANGULAR_ALERTS = Gauge(
+    "arbitrage_triangular_alerts_sent_total",
+    "Number of triangular alerts emitted in the last scanning cycle",
+    registry=PROM_REGISTRY,
+)
+PROM_EXCHANGE_ATTEMPTS = Gauge(
+    "arbitrage_exchange_attempts",
+    "Requests attempted per exchange in the last cycle",
+    ["exchange"],
+    registry=PROM_REGISTRY,
+)
+PROM_EXCHANGE_ERRORS = Gauge(
+    "arbitrage_exchange_errors",
+    "Errors observed per exchange in the last cycle",
+    ["exchange"],
+    registry=PROM_REGISTRY,
 )
 
 # =========================
@@ -115,6 +226,22 @@ CONFIG = {
                     "deposit_minutes": 5,
                 },
             },
+            "endpoints": {
+                "ticker": {
+                    "primary": "https://api.binance.com/api/v3/ticker/bookTicker",
+                    "fallbacks": [
+                        "https://api1.binance.com/api/v3/ticker/bookTicker",
+                        "https://api2.binance.com/api/v3/ticker/bookTicker",
+                    ],
+                },
+                "depth": {
+                    "primary": "https://api.binance.com/api/v3/depth",
+                    "fallbacks": [
+                        "https://api1.binance.com/api/v3/depth",
+                        "https://api2.binance.com/api/v3/depth",
+                    ],
+                },
+            },
         },
         "bybit": {
             "enabled": True,
@@ -149,6 +276,22 @@ CONFIG = {
                     "withdraw_minutes": 20,
                     "deposit_fee": 0.0,
                     "deposit_minutes": 8,
+                },
+            },
+            "endpoints": {
+                "ticker": {
+                    "primary": "https://api.bybit.com/v5/market/tickers",
+                    "fallbacks": [
+                        "https://api2.bybit.com/v5/market/tickers",
+                        "https://api.bytick.com/v5/market/tickers",
+                    ],
+                },
+                "depth": {
+                    "primary": "https://api.bybit.com/v5/market/orderbook",
+                    "fallbacks": [
+                        "https://api2.bybit.com/v5/market/orderbook",
+                        "https://api.bytick.com/v5/market/orderbook",
+                    ],
                 },
             },
         },
@@ -187,6 +330,22 @@ CONFIG = {
                     "deposit_minutes": 10,
                 },
             },
+            "endpoints": {
+                "ticker": {
+                    "primary": "https://api.kucoin.com/api/v1/market/orderbook/level1",
+                    "fallbacks": [
+                        "https://api1.kucoin.com/api/v1/market/orderbook/level1",
+                        "https://api2.kucoin.com/api/v1/market/orderbook/level1",
+                    ],
+                },
+                "depth": {
+                    "primary": "https://api.kucoin.com/api/v1/market/orderbook/level2_20",
+                    "fallbacks": [
+                        "https://api1.kucoin.com/api/v1/market/orderbook/level2_20",
+                        "https://api2.kucoin.com/api/v1/market/orderbook/level2_20",
+                    ],
+                },
+            },
         },
         "okx": {
             "enabled": True,
@@ -222,6 +381,22 @@ CONFIG = {
                     "deposit_minutes": 6,
                 },
             },
+            "endpoints": {
+                "ticker": {
+                    "primary": "https://www.okx.com/api/v5/market/ticker",
+                    "fallbacks": [
+                        "https://aws.okx.com/api/v5/market/ticker",
+                        "https://www.okx.cab/api/v5/market/ticker",
+                    ],
+                },
+                "depth": {
+                    "primary": "https://www.okx.com/api/v5/market/books",
+                    "fallbacks": [
+                        "https://aws.okx.com/api/v5/market/books",
+                        "https://www.okx.cab/api/v5/market/books",
+                    ],
+                },
+            },
         },
         # add more venues aquí
     },
@@ -252,8 +427,8 @@ CONFIG = {
         "bot_token_env": "TG_BOT_TOKEN",
         "chat_ids_env": "TG_CHAT_IDS",   # coma-separado: "-100123...,123456..."
     },
-    "log_csv_path": "logs/opportunities.csv",
-    "triangular_log_csv_path": "logs/triangular_opportunities.csv",
+    "log_csv_path": str(Path(LOG_BASE_DIR) / "opportunities.csv"),
+    "triangular_log_csv_path": str(Path(LOG_BASE_DIR) / "triangular_opportunities.csv"),
 }
 
 TELEGRAM_CHAT_IDS: Set[str] = set()
@@ -270,6 +445,7 @@ DASHBOARD_STATE: Dict[str, Any] = {
     "last_run_summary": None,
     "latest_alerts": [],
     "config_snapshot": {},
+    "exchange_metrics": {},
 }
 
 MAX_ALERT_HISTORY = 20
@@ -278,6 +454,7 @@ WEB_AUTH_USER = os.getenv("WEB_AUTH_USER", "").strip()
 WEB_AUTH_PASS = os.getenv("WEB_AUTH_PASS", "").strip()
 
 LATEST_ANALYSIS: Optional[Any] = None
+LAST_TELEGRAM_SEND_TS: float = 0.0
 
 
 LOG_HEADER = [
@@ -424,6 +601,14 @@ def build_test_signal_message() -> str:
         base_qty = capital / sample_opportunity.buy_price
 
     est_profit = (capital * sample_opportunity.net_percent) / 100.0 if capital else 0.0
+    capital_used = base_qty * sample_opportunity.buy_price
+    sample_opportunity.liquidity_score = 0.5
+    sample_opportunity.volatility_score = 0.3
+    sample_opportunity.priority_score = sample_opportunity.net_percent
+    sample_opportunity.confidence_label = "media"
+    link_items = build_trade_link_items(
+        sample_opportunity.buy_venue, sample_opportunity.sell_venue, sample_opportunity.pair
+    )
 
     alert_message = fmt_alert(
         sample_opportunity,
@@ -431,6 +616,8 @@ def build_test_signal_message() -> str:
         est_percent=sample_opportunity.net_percent,
         base_qty=base_qty,
         capital_quote=capital,
+        capital_used=capital_used,
+        links=link_items,
     )
 
     return "Señal de prueba ✅\n\n" + alert_message
@@ -492,6 +679,51 @@ refresh_config_snapshot()
 # =========================
 # HTTP / Dashboard
 # =========================
+
+
+def build_health_payload() -> Dict[str, Any]:
+    now = time.time()
+    metrics = metrics_snapshot()
+    with STATE_LOCK:
+        summary = DASHBOARD_STATE.get("last_run_summary") or {}
+        latest_alerts = list(DASHBOARD_STATE.get("latest_alerts", []))[:5]
+        latest_quotes = DASHBOARD_STATE.get("latest_quotes", {})
+        quote_latency = DASHBOARD_STATE.get("last_quote_latency_ms")
+
+    status = "ok"
+    if not summary:
+        status = "booting"
+    elif any(stats.get("errors") for stats in metrics.values()):
+        status = "degraded"
+
+    telegram_enabled = bool(CONFIG.get("telegram", {}).get("enabled", False))
+    if telegram_enabled and LAST_TELEGRAM_SEND_TS:
+        seconds_since_last_send = now - LAST_TELEGRAM_SEND_TS
+    else:
+        seconds_since_last_send = None
+
+    payload = {
+        "status": status,
+        "timestamp": int(now),
+        "last_run_ts": summary.get("ts"),
+        "last_run_iso": summary.get("ts_str"),
+        "run_latency_ms": summary.get("run_latency_ms"),
+        "quote_latency_ms": quote_latency or summary.get("quote_latency_ms"),
+        "alerts_sent_last_run": summary.get("alerts_sent", 0),
+        "triangular_alerts_last_run": summary.get("triangular_alerts", 0),
+        "metrics": metrics,
+        "latest_alerts": latest_alerts,
+        "latest_quotes": latest_quotes,
+        "telegram": {
+            "enabled": telegram_enabled,
+            "last_send_ts": LAST_TELEGRAM_SEND_TS or None,
+            "seconds_since_last_send": seconds_since_last_send,
+            "registered_chats": len(get_registered_chat_ids()),
+        },
+    }
+    return payload
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang=\"es\">
 <head>
@@ -552,6 +784,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <th>Vender</th>
             <th>Spread Neto</th>
             <th>PnL estimado</th>
+            <th>Confianza</th>
+            <th>Liquidez</th>
             <th>Links</th>
           </tr>
         </thead>
@@ -630,6 +864,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <td>${opp.sell_venue} · ${formatNumber(opp.sell_price, 6)}</td>
             <td>${formatNumber(opp.net_percent, 3)} %</td>
             <td>${formatNumber(opp.est_profit_quote, 2)} USDT</td>
+            <td>${(opp.confidence || '').toUpperCase()}</td>
+            <td>${formatNumber(opp.liquidity_score ?? 0, 2)}</td>
             <td>${renderLinks(opp.links)}</td>`;
           tbody.appendChild(row);
         });
@@ -645,6 +881,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <p>${alert.buy_venue} ➜ ${alert.sell_venue}</p>
           <p>PnL estimado: ${formatNumber(alert.est_profit_quote, 2)} USDT (${formatNumber(alert.est_percent, 3)} %)</p>
           <p>${renderLinks(alert.links)}</p>
+          <p>Confianza: ${(alert.confidence || '').toUpperCase()} · Liquidez: ${formatNumber(alert.liquidity_score ?? 0, 2)}</p>
           <p class='timestamp'>${alert.ts_str}</p>`;
         alertsRoot.appendChild(card);
       });
@@ -770,14 +1007,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self._is_healthcheck():
+            payload = build_health_payload()
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"ok")
+            self.wfile.write(body)
             return
         if self.path in ("/", "/dashboard"):
             if not self._require_authentication():
                 return
             self._send_html(DASHBOARD_HTML)
+            return
+        if self.path == "/metrics":
+            body = generate_latest(PROM_REGISTRY)
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if self.path == "/api/state":
             if not self._require_authentication():
@@ -787,6 +1037,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "last_run_summary": DASHBOARD_STATE.get("last_run_summary"),
                     "latest_alerts": DASHBOARD_STATE.get("latest_alerts", []),
                     "config_snapshot": DASHBOARD_STATE.get("config_snapshot", {}),
+                    "exchange_metrics": DASHBOARD_STATE.get("exchange_metrics", {}),
                 }
             self._send_json(payload)
             return
@@ -886,34 +1137,45 @@ def http_get_json(
     timeout: int = 8,
     retries: int = 3,
     integrity_key: Optional[str] = None,
+    fallback_endpoints: Optional[List[Tuple[str, Optional[dict]]]] = None,
 ) -> HttpJsonResponse:
     last_exc: Optional[Exception] = None
-    for _ in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code != 200:
-                raise HttpError(
-                    f"HTTP {r.status_code} {url} params={params}", status_code=r.status_code
-                )
+    endpoints: List[Tuple[str, Optional[dict]]] = [(url, params)]
+    if fallback_endpoints:
+        endpoints.extend(fallback_endpoints)
 
-            received_ts = current_millis()
-            checksum = hashlib.sha256(r.content).hexdigest()
-            payload = r.json()
-            if not isinstance(payload, dict):
-                raise HttpError(f"Respuesta no es JSON objeto en {url}")
-
-            if integrity_key:
-                last_checksum, last_ts = LAST_CHECKSUMS.get(integrity_key, (None, 0))
-                if last_checksum == checksum and received_ts - last_ts > MAX_CHECKSUM_STALENESS_MS:
+    for endpoint_url, endpoint_params in endpoints:
+        for attempt in range(retries):
+            try:
+                r = requests.get(endpoint_url, params=endpoint_params, timeout=timeout)
+                if r.status_code != 200:
                     raise HttpError(
-                        f"Checksum sin cambios por {received_ts - last_ts} ms para {integrity_key}"
+                        f"HTTP {r.status_code} {endpoint_url} params={endpoint_params}",
+                        status_code=r.status_code,
                     )
-                LAST_CHECKSUMS[integrity_key] = (checksum, received_ts)
 
-            return HttpJsonResponse(payload, checksum, received_ts)
-        except Exception as e:
-            last_exc = e
-            time.sleep(0.5)
+                received_ts = current_millis()
+                checksum = hashlib.sha256(r.content).hexdigest()
+                payload = r.json()
+                if not isinstance(payload, dict):
+                    raise HttpError(f"Respuesta no es JSON objeto en {endpoint_url}")
+
+                if integrity_key:
+                    last_checksum, last_ts = LAST_CHECKSUMS.get(integrity_key, (None, 0))
+                    if last_checksum == checksum and received_ts - last_ts > MAX_CHECKSUM_STALENESS_MS:
+                        raise HttpError(
+                            f"Checksum sin cambios por {received_ts - last_ts} ms para {integrity_key}"
+                        )
+                    LAST_CHECKSUMS[integrity_key] = (checksum, received_ts)
+
+                return HttpJsonResponse(payload, checksum, received_ts)
+            except Exception as e:
+                last_exc = e
+                backoff = min(0.5 * (2 ** attempt), 5.0)
+                time.sleep(backoff + random.uniform(0, 0.25))
+        if fallback_endpoints:
+            print(f"[http] cambiando a endpoint alternativo {endpoint_url}: {last_exc}")
+
     raise last_exc or HttpError("GET failed")
 
 
@@ -1055,6 +1317,7 @@ def tg_send_message(
                 )
             else:
                 log_event("telegram.send.success", chat_id=cid)
+                LAST_TELEGRAM_SEND_TS = time.time()
         except Exception as e:
             log_event("telegram.send.exception", chat_id=cid, error=str(e))
 
@@ -1392,6 +1655,12 @@ class VenueFees:
         self.per_pair[pair] = schedule
         self.last_updated = time.time()
 
+    @property
+    def taker_fee_percent(self) -> float:
+        """Expose the active taker fee for venues that require a flat rate."""
+
+        return float(self.default.taker_fee_percent)
+
 
 @dataclass
 class TransferProfile:
@@ -1617,6 +1886,18 @@ class ExchangeAdapter:
     def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
         return None
 
+    def _endpoint_config(self, endpoint: str, default: str) -> Tuple[str, List[str]]:
+        venue_cfg = CONFIG.get("venues", {}).get(self.name, {})
+        endpoints_cfg = venue_cfg.get("endpoints", {})
+        endpoint_cfg = endpoints_cfg.get(endpoint, {}) if isinstance(endpoints_cfg, dict) else {}
+        primary = str(endpoint_cfg.get("primary") or default)
+        fallbacks = [
+            str(url)
+            for url in endpoint_cfg.get("fallbacks", [])
+            if url
+        ]
+        return primary, fallbacks
+
     def _integrity_key(self, symbol: str, endpoint: str) -> str:
         return f"{self.name}:{symbol}:{endpoint}"
 
@@ -1685,13 +1966,16 @@ class Binance(ExchangeAdapter):
 
     def fetch_quote(self, pair: str) -> Optional[Quote]:
         sym = self.normalize_symbol(pair)
-        url = "https://api.binance.com/api/v3/ticker/bookTicker"
+        url, fallbacks = self._endpoint_config(
+            "ticker", "https://api.binance.com/api/v3/ticker/bookTicker"
+        )
         quote: Optional[Quote] = None
         try:
             response = http_get_json(
                 url,
                 params={"symbol": sym},
                 integrity_key=self._integrity_key(sym, "ticker"),
+                fallback_endpoints=[(fallback, {"symbol": sym}) for fallback in fallbacks],
             )
             data = response.data
             bid = safe_float(data.get("bidPrice"))
@@ -1714,12 +1998,15 @@ class Binance(ExchangeAdapter):
 
     def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
         sym = self.normalize_symbol(pair)
-        url = "https://api.binance.com/api/v3/depth"
+        url, fallbacks = self._endpoint_config(
+            "depth", "https://api.binance.com/api/v3/depth"
+        )
         try:
             response = http_get_json(
                 url,
                 params={"symbol": sym, "limit": 20},
                 integrity_key=self._integrity_key(sym, "depth"),
+                fallback_endpoints=[(fallback, {"symbol": sym, "limit": 20}) for fallback in fallbacks],
             )
             bids = response.data.get("bids") or []
             asks = response.data.get("asks") or []
@@ -1745,13 +2032,18 @@ class Bybit(ExchangeAdapter):
 
     def fetch_quote(self, pair: str) -> Optional[Quote]:
         sym = self.normalize_symbol(pair)
-        url = "https://api.bybit.com/v5/market/tickers"
+        url, fallbacks = self._endpoint_config(
+            "ticker", "https://api.bybit.com/v5/market/tickers"
+        )
         quote: Optional[Quote] = None
         try:
             response = http_get_json(
                 url,
                 params={"category": "spot", "symbol": sym},
                 integrity_key=self._integrity_key(sym, "ticker"),
+                fallback_endpoints=[
+                    (fallback, {"category": "spot", "symbol": sym}) for fallback in fallbacks
+                ],
             )
             result = response.data.get("result") or {}
             items = result.get("list") or []
@@ -1778,12 +2070,21 @@ class Bybit(ExchangeAdapter):
 
     def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
         sym = self.normalize_symbol(pair)
-        url = "https://api.bybit.com/v5/market/orderbook"
+        url, fallbacks = self._endpoint_config(
+            "depth", "https://api.bybit.com/v5/market/orderbook"
+        )
         try:
             response = http_get_json(
                 url,
                 params={"category": "spot", "symbol": sym, "limit": 25},
                 integrity_key=self._integrity_key(sym, "depth"),
+                fallback_endpoints=[
+                    (
+                        fallback,
+                        {"category": "spot", "symbol": sym, "limit": 25},
+                    )
+                    for fallback in fallbacks
+                ],
             )
             result = response.data.get("result") or {}
             bids = result.get("b") or []
@@ -1814,13 +2115,16 @@ class KuCoin(ExchangeAdapter):
 
     def fetch_quote(self, pair: str) -> Optional[Quote]:
         sym = self.normalize_symbol(pair)
-        url = "https://api.kucoin.com/api/v1/market/orderbook/level1"
+        url, fallbacks = self._endpoint_config(
+            "ticker", "https://api.kucoin.com/api/v1/market/orderbook/level1"
+        )
         quote: Optional[Quote] = None
         try:
             response = http_get_json(
                 url,
                 params={"symbol": sym},
                 integrity_key=self._integrity_key(sym, "ticker"),
+                fallback_endpoints=[(fallback, {"symbol": sym}) for fallback in fallbacks],
             )
             data = response.data.get("data") or {}
             bid = safe_float(data.get("bestBid"))
@@ -1843,12 +2147,15 @@ class KuCoin(ExchangeAdapter):
 
     def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
         sym = self.normalize_symbol(pair)
-        url = "https://api.kucoin.com/api/v1/market/orderbook/level2_20"
+        url, fallbacks = self._endpoint_config(
+            "depth", "https://api.kucoin.com/api/v1/market/orderbook/level2_20"
+        )
         try:
             response = http_get_json(
                 url,
                 params={"symbol": sym},
                 integrity_key=self._integrity_key(sym, "depth"),
+                fallback_endpoints=[(fallback, {"symbol": sym}) for fallback in fallbacks],
             )
             data = response.data.get("data") or {}
             bids = data.get("bids") or []
@@ -1880,13 +2187,16 @@ class OKX(ExchangeAdapter):
 
     def fetch_quote(self, pair: str) -> Optional[Quote]:
         sym = self.normalize_symbol(pair)
-        url = "https://www.okx.com/api/v5/market/ticker"
+        url, fallbacks = self._endpoint_config(
+            "ticker", "https://www.okx.com/api/v5/market/ticker"
+        )
         quote: Optional[Quote] = None
         try:
             response = http_get_json(
                 url,
                 params={"instId": sym},
                 integrity_key=self._integrity_key(sym, "ticker"),
+                fallback_endpoints=[(fallback, {"instId": sym}) for fallback in fallbacks],
             )
             items = response.data.get("data") or []
             if not items:
@@ -1912,12 +2222,15 @@ class OKX(ExchangeAdapter):
 
     def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
         sym = self.normalize_symbol(pair)
-        url = "https://www.okx.com/api/v5/market/books"
+        url, fallbacks = self._endpoint_config(
+            "depth", "https://www.okx.com/api/v5/market/books"
+        )
         try:
             response = http_get_json(
                 url,
                 params={"instId": sym, "sz": "20"},
                 integrity_key=self._integrity_key(sym, "depth"),
+                fallback_endpoints=[(fallback, {"instId": sym, "sz": "20"}) for fallback in fallbacks],
             )
             items = response.data.get("data") or []
             if not items:
@@ -1962,23 +2275,86 @@ def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) 
         return pair_quotes
 
     futures_map: Dict[Any, Tuple[str, str]] = {}
-    max_workers = min(32, max(1, len(pairs) * len(adapters)))
+
+    def _task(adapter: ExchangeAdapter, pair: str, venue: str) -> Optional[Quote]:
+        record_exchange_attempt(venue, pair)
+        try:
+            quote = adapter.fetch_quote(pair)
+        except Exception as exc:
+            record_exchange_error(venue, str(exc), pair)
+            return None
+
+        if quote:
+            record_exchange_success(venue, pair)
+            log_event(
+                "exchange.quote",
+                exchange=venue,
+                pair=pair,
+                bid=float(quote.bid),
+                ask=float(quote.ask),
+            )
+            return quote
+
+        record_exchange_no_data(venue, pair)
+        return None
+
+    max_workers = min(
+        max(1, DEFAULT_QUOTE_WORKERS),
+        max(1, len(pairs) * max(1, len(adapters))),
+    )
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for pair in pairs:
-            for vname, adapter in adapters.items():
-                futures_map[executor.submit(adapter.fetch_quote, pair)] = (pair, vname)
+            for venue, adapter in adapters.items():
+                if is_circuit_open(venue):
+                    record_exchange_skip(venue, "circuit_open", pair)
+                    continue
+                futures_map[executor.submit(_task, adapter, pair, venue)] = (pair, venue)
 
         for future in as_completed(futures_map):
-            pair, vname = futures_map[future]
+            pair, venue = futures_map[future]
             try:
                 quote = future.result()
             except Exception as exc:
-                print(f"[{vname}] error fetch {pair}: {exc}")
+                print(f"[{venue}] error fetch {pair}: {exc}")
                 continue
             if quote:
-                pair_quotes[pair][vname] = quote
+                pair_quotes[pair][venue] = quote
 
     return pair_quotes
+
+
+def build_quote_snapshot(
+    pair_quotes: Dict[str, Dict[str, Quote]], limit: int = 10
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    snapshot: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for pair in sorted(pair_quotes.keys())[:limit]:
+        venues = pair_quotes.get(pair, {})
+        if not venues:
+            continue
+        snapshot[pair] = {
+            venue: {
+                "bid": float(quote.bid),
+                "ask": float(quote.ask),
+                "ts": int(quote.ts),
+            }
+            for venue, quote in venues.items()
+        }
+    return snapshot
+
+
+def update_prometheus_metrics(
+    metrics: Dict[str, Dict[str, Any]], summary: Dict[str, Any], tri_alerts: int
+) -> None:
+    if summary:
+        PROM_LAST_RUN_TS.set(float(summary.get("ts", 0)))
+        PROM_LAST_RUN_LATENCY_MS.set(float(summary.get("run_latency_ms", 0)))
+        PROM_ALERTS_SENT.set(float(summary.get("alerts_sent", 0)))
+        PROM_TRIANGULAR_ALERTS.set(float(tri_alerts))
+
+    for exchange, stats in metrics.items():
+        PROM_EXCHANGE_ATTEMPTS.labels(exchange=exchange).set(float(stats.get("attempts", 0)))
+        PROM_EXCHANGE_ERRORS.labels(exchange=exchange).set(float(stats.get("errors", 0)))
 
 # =========================
 # Engine
@@ -2254,6 +2630,11 @@ def compute_opportunities_for_pair(
         if not buy_quote or not sell_quote:
             continue
 
+        buy_fee_cfg = fees.get(buy_v)
+        sell_fee_cfg = fees.get(sell_v)
+        if not buy_fee_cfg or not sell_fee_cfg:
+            continue
+
         buy_price = float(buy_quote.ask)
         sell_price = float(sell_quote.bid)
         if buy_price <= 0 or sell_price <= 0:
@@ -2280,6 +2661,8 @@ def compute_opportunities_for_pair(
                 sell_price=sell_price,
                 gross_percent=gross_percent,
                 net_percent=net_percent,
+                buy_depth=getattr(buy_quote, "depth", None),
+                sell_depth=getattr(sell_quote, "depth", None),
             )
         )
 
@@ -2372,45 +2755,92 @@ def compute_triangular_opportunity(route: TriangularRoute,
 # =========================
 # Simulación PnL (avanzada)
 # =========================
+
+
+def _available_depth_qty(depth: Optional[DepthInfo], side: str) -> float:
+    if not depth:
+        return 0.0
+    if side == "buy":
+        return float(depth.ask_volume)
+    return float(depth.bid_volume)
+
+
+def compute_liquidity_score(opp: Opportunity, required_base_qty: float) -> float:
+    if required_base_qty <= 0:
+        return 0.0
+
+    buy_available = _available_depth_qty(opp.buy_depth, "buy")
+    sell_available = _available_depth_qty(opp.sell_depth, "sell")
+    if buy_available <= 0 and sell_available <= 0:
+        return 0.0
+
+    coverage_buy = min(1.0, buy_available / required_base_qty) if buy_available > 0 else 0.0
+    coverage_sell = min(1.0, sell_available / required_base_qty) if sell_available > 0 else 0.0
+    depth_factor = 0.0
+    if opp.buy_depth and opp.sell_depth:
+        depth_factor = min(1.0, (opp.buy_depth.levels + opp.sell_depth.levels) / 40.0)
+
+    raw_score = (coverage_buy + coverage_sell) / 2.0
+    blended = 0.7 * raw_score + 0.3 * depth_factor
+    return round(min(1.0, blended), 4)
+
+
+def compute_volatility_score(pair: str) -> float:
+    if not LATEST_ANALYSIS or not getattr(LATEST_ANALYSIS, "max_volatility", 0):
+        return 0.0
+    max_vol = max(1e-9, float(LATEST_ANALYSIS.max_volatility))
+    pair_vol = float(LATEST_ANALYSIS.pair_volatility.get(pair, 0.0))
+    return round(min(1.0, pair_vol / max_vol), 4)
+
+
+def compute_priority_score(net_percent: float, liquidity_score: float, volatility_score: float) -> float:
+    net = float(net_percent)
+    liquidity_bonus = net * 0.5 * liquidity_score
+    volatility_penalty = abs(net) * 0.4 * volatility_score
+    return round(net + liquidity_bonus - volatility_penalty, 6)
+
+
+def classify_confidence(
+    net_percent: float,
+    threshold: float,
+    liquidity_score: float,
+    volatility_score: float,
+    priority_score: float,
+) -> str:
+    if net_percent >= threshold * 1.5 and liquidity_score >= 0.65 and volatility_score <= 0.3:
+        return "alta"
+    if net_percent >= threshold and liquidity_score >= 0.4 and priority_score >= threshold * 1.1:
+        return "media"
+    return "baja"
+
+
 def estimate_profit(
     capital_quote: float,
     buy_price: float,
     sell_price: float,
     total_percent_fee: float,
     max_base_qty: Optional[float] = None,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float]:
     if buy_price <= 0 or sell_price <= 0 or capital_quote <= 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     base_qty = capital_quote / buy_price
     if max_base_qty is not None:
         base_qty = min(base_qty, max_base_qty)
 
     if base_qty <= 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     effective_capital = base_qty * buy_price
     gross_proceeds = base_qty * sell_price
     fee_loss = (total_percent_fee / 100.0) * effective_capital
     profit = gross_proceeds - effective_capital - fee_loss
     net_pct = (profit / effective_capital) * 100.0 if effective_capital > 0 else 0.0
-    return profit, net_pct, base_qty
+    return profit, net_pct, base_qty, effective_capital
 
 # =========================
 # Logging CSV
 # =========================
-LOG_HEADER = [
-    "ts",
-    "pair",
-    "buy_venue",
-    "sell_venue",
-    "buy_price",
-    "sell_price",
-    "gross_%",
-    "net_%",
-    "est_profit_quote",
-    "base_qty",
-]
 
 
 def ensure_log_header(path: str) -> None:
@@ -2420,22 +2850,64 @@ def ensure_log_header(path: str) -> None:
             csv.writer(f).writerow(LOG_HEADER)
 
 
-def append_csv(path: str, opp: Opportunity, est_profit: float, base_qty: float) -> None:
+def append_csv(
+    path: str,
+    opp: Opportunity,
+    est_profit: float,
+    base_qty: float,
+    capital_used: float,
+    buy_depth: Optional[DepthInfo],
+    sell_depth: Optional[DepthInfo],
+) -> None:
     ensure_log_header(path)
+    buy_depth_qty = _available_depth_qty(buy_depth, "buy")
+    sell_depth_qty = _available_depth_qty(sell_depth, "sell")
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            int(time.time()),
-            opp.pair,
-            opp.buy_venue,
-            opp.sell_venue,
-            f"{opp.buy_price:.8f}",
-            f"{opp.sell_price:.8f}",
-            f"{opp.gross_percent:.4f}",
-            f"{opp.net_percent:.4f}",
-            f"{est_profit:.4f}",
-            f"{base_qty:.8f}",
-        ])
+        writer.writerow(
+            [
+                int(time.time()),
+                opp.pair,
+                opp.buy_venue,
+                opp.sell_venue,
+                f"{opp.buy_price:.8f}",
+                f"{opp.sell_price:.8f}",
+                f"{opp.gross_percent:.4f}",
+                f"{opp.net_percent:.4f}",
+                f"{est_profit:.4f}",
+                f"{base_qty:.8f}",
+                f"{capital_used:.8f}",
+                f"{buy_depth_qty:.8f}",
+                f"{sell_depth_qty:.8f}",
+                f"{opp.liquidity_score:.4f}",
+                f"{opp.volatility_score:.4f}",
+                f"{opp.priority_score:.6f}",
+                opp.confidence_label,
+            ]
+        )
+
+
+def ensure_log_backups(paths: Iterable[str]) -> None:
+    backup_dir = Path(LOG_BACKUP_DIR)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        file_path = Path(raw_path)
+        if not file_path.exists() or file_path.is_dir():
+            continue
+        target = backup_dir / f"{file_path.stem}-{timestamp}{file_path.suffix}"
+        shutil.copy2(file_path, target)
+
+    backups = sorted(
+        backup_dir.glob("*.csv"), key=lambda item: item.stat().st_mtime, reverse=True
+    )
+    for obsolete in backups[20:]:
+        try:
+            obsolete.unlink()
+        except OSError:
+            pass
 
 
 def append_triangular_csv(path: str, opp: TriangularOpportunity) -> None:
@@ -2480,16 +2952,24 @@ def fmt_alert(
     est_percent: float,
     base_qty: float,
     capital_quote: float,
+    capital_used: float,
+    links: Optional[List[Dict[str, str]]] = None,
 ) -> str:
+    buy_label = opp.buy_venue.upper()
+    sell_label = opp.sell_venue.upper()
+    formatted_links = " · ".join(
+        f"[{item['label']}]({item['url']})" for item in (links or [])
+    ) or "—"
+
     lines = [
-        "ARBITRAJE SPOT",
-        f"Par: {opp.pair}",
-        f"Comprar en {opp.buy_venue}: {opp.buy_price:.6f}",
-        f"Vender en {opp.sell_venue}: {opp.sell_price:.6f}",
-        f"Spread bruto: {opp.gross_percent:.3f}%  |  Neto: {opp.net_percent:.3f}%",
-        f"PnL estimado: ~{est_profit:.2f} USDT  (~{est_percent:.3f}%)",
-        f"Capital simulado: {capital_quote:.2f} USDT",
-        f"Cantidad base estimada: {base_qty:.6f}",
+        "🚨 *Arbitraje spot detectado*",
+        f"*Par:* `{opp.pair}`",
+        f"*Ruta:* Comprar en *{buy_label}* a `{opp.buy_price:.6f}` · Vender en *{sell_label}* a `{opp.sell_price:.6f}`",
+        f"*Spreads:* bruto `{opp.gross_percent:.3f}%` · neto `{opp.net_percent:.3f}%`",
+        f"*PnL estimado:* `~{est_profit:.2f} USDT` (`{est_percent:.3f}%`) sobre {capital_quote:.2f} USDT",
+        f"*Cantidad base:* `{base_qty:.6f}` ({capital_used:.2f} USDT usados)",
+        f"*Confianza:* {opp.confidence_label.title()} · *Liquidez:* {opp.liquidity_score:.2f} · *Volatilidad:* {opp.volatility_score:.2f}",
+        f"*Links:* {formatted_links}",
         time.strftime("%Y-%m-%d %H:%M:%S"),
     ]
     return "\n".join(lines)
@@ -2553,6 +3033,7 @@ def run_once() -> None:
         log_event("run.skip", reason="no_venues")
         return
 
+    run_start = time.time()
     reset_metrics(adapters.keys())
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
     polling_active = TELEGRAM_POLLING_THREAD and TELEGRAM_POLLING_THREAD.is_alive()
@@ -2570,38 +3051,24 @@ def run_once() -> None:
     pair_weight_cfg = CONFIG.get("capital_weights", {}).get("pairs", {})
     triangle_weight_cfg = CONFIG.get("capital_weights", {}).get("triangles", {})
     fee_map = build_fee_map(all_pairs)
-
-    fee_map = build_fee_map(all_pairs)
     summary_opps: List[Dict[str, Any]] = []
     alert_records: List[Dict[str, Any]] = []
     run_ts = int(time.time())
 
-    pair_quotes: Dict[str, Dict[str, Quote]] = {p: {} for p in all_pairs}
-    for pair in all_pairs:
-        for vname, adapter in adapters.items():
-            if is_circuit_open(vname):
-                record_exchange_skip(vname, "circuit_open", pair)
-                continue
+    fetch_started = time.time()
+    pair_quotes = collect_pair_quotes(all_pairs, adapters)
+    quote_latency_ms = int((time.time() - fetch_started) * 1000)
+    log_event(
+        "run.quotes_collected",
+        pairs=len(all_pairs),
+        venues=len(adapters),
+        latency_ms=quote_latency_ms,
+    )
 
-            record_exchange_attempt(vname, pair)
-            quote: Optional[Quote] = None
-            try:
-                quote = adapter.fetch_quote(pair)
-            except Exception as exc:
-                record_exchange_error(vname, str(exc), pair)
-            else:
-                if quote:
-                    record_exchange_success(vname, pair)
-                    pair_quotes[pair][vname] = quote
-                    log_event(
-                        "exchange.quote",
-                        exchange=vname,
-                        pair=pair,
-                        bid=quote.bid,
-                        ask=quote.ask,
-                    )
-                else:
-                    record_exchange_no_data(vname, pair)
+    with STATE_LOCK:
+        DASHBOARD_STATE["last_quote_latency_ms"] = quote_latency_ms
+        DASHBOARD_STATE["last_quote_count"] = sum(len(v) for v in pair_quotes.values())
+        DASHBOARD_STATE["latest_quotes"] = build_quote_snapshot(pair_quotes)
 
     alerts = 0
     for pair in pairs:
@@ -2620,12 +3087,41 @@ def run_once() -> None:
             buy_schedule = fee_buy.schedule_for_pair(pair)
             sell_schedule = fee_sell.schedule_for_pair(pair)
             total_fee_pct = buy_schedule.taker_fee_percent + sell_schedule.taker_fee_percent
+            depth_volumes = [
+                v
+                for v in (
+                    _available_depth_qty(opp.buy_depth, "buy"),
+                    _available_depth_qty(opp.sell_depth, "sell"),
+                )
+                if v > 0
+            ]
+            max_depth_qty = min(depth_volumes) if len(depth_volumes) == 2 else None
             est_profit, est_percent, base_qty, capital_used = estimate_profit(
                 capital_for_pair,
                 opp.buy_price,
                 opp.sell_price,
                 total_fee_pct,
+                max_base_qty=max_depth_qty,
             )
+
+            liquidity_score = compute_liquidity_score(opp, base_qty)
+            volatility_score = compute_volatility_score(pair)
+            priority_score = compute_priority_score(
+                opp.net_percent, liquidity_score, volatility_score
+            )
+            confidence_label = classify_confidence(
+                opp.net_percent,
+                threshold,
+                liquidity_score,
+                volatility_score,
+                priority_score,
+            )
+
+            opp.liquidity_score = liquidity_score
+            opp.volatility_score = volatility_score
+            opp.priority_score = priority_score
+            opp.confidence_label = confidence_label
+
             link_items = build_trade_link_items(opp.buy_venue, opp.sell_venue, opp.pair)
             entry = {
                 "pair": opp.pair,
@@ -2640,17 +3136,14 @@ def run_once() -> None:
                 "base_qty": base_qty,
                 "capital_used_quote": capital_used,
                 "links": link_items,
+                "liquidity_score": liquidity_score,
+                "volatility_score": volatility_score,
+                "priority_score": priority_score,
+                "confidence": confidence_label,
                 "threshold_hit": opp.net_percent >= threshold,
             }
             summary_opps.append(entry)
             if opp.net_percent >= threshold:
-                est_profit, est_percent, base_qty, capital_used = estimate_profit(
-                    capital_for_pair,
-                    opp.buy_price,
-                    opp.sell_price,
-                    total_fee_pct,
-                )
-
                 append_csv(
                     log_csv,
                     opp,
@@ -2667,8 +3160,7 @@ def run_once() -> None:
                     base_qty,
                     capital_for_pair,
                     capital_used,
-                    opp.buy_depth,
-                    opp.sell_depth,
+                    link_items,
                 )
                 tg_send_message(msg, enabled=tg_enabled)
                 log_event(
@@ -2685,30 +3177,9 @@ def run_once() -> None:
                 alert_entry["ts_str"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(alert_entry["ts"]))
                 alert_records.append(alert_entry)
 
-    summary_opps.sort(key=lambda item: item["net_percent"], reverse=True)
+    summary_opps.sort(key=lambda item: item.get("priority_score", item["net_percent"]), reverse=True)
     if len(summary_opps) > 20:
         summary_opps = summary_opps[:20]
-
-    summary = {
-        "ts": run_ts,
-        "ts_str": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(run_ts)),
-        "threshold": threshold,
-        "capital": capital,
-        "pairs": pairs,
-        "opportunities": summary_opps,
-        "alerts_sent": alerts,
-    }
-
-    if alert_records:
-        alert_records.sort(key=lambda item: item["ts"], reverse=True)
-
-    with STATE_LOCK:
-        DASHBOARD_STATE["last_run_summary"] = summary
-        if alert_records:
-            history = DASHBOARD_STATE.get("latest_alerts", [])
-            history.extend(alert_records)
-            history.sort(key=lambda item: item.get("ts", 0), reverse=True)
-            DASHBOARD_STATE["latest_alerts"] = history[:MAX_ALERT_HISTORY]
 
     tri_alerts = 0
     for route in routes:
@@ -2727,7 +3198,51 @@ def run_once() -> None:
         tg_send_message(msg, enabled=tg_enabled)
         tri_alerts += 1
 
-    print(f"Run complete. Oportunidades enviadas: {alerts} (cross) / {tri_alerts} (triangulares)")
+    total_latency_ms = int((time.time() - run_start) * 1000)
+    metrics_data = metrics_snapshot()
+
+    summary = {
+        "ts": run_ts,
+        "ts_str": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(run_ts)),
+        "threshold": threshold,
+        "capital": capital,
+        "pairs": pairs,
+        "opportunities": summary_opps,
+        "alerts_sent": alerts,
+        "triangular_alerts": tri_alerts,
+        "quote_latency_ms": quote_latency_ms,
+        "run_latency_ms": total_latency_ms,
+        "metrics": metrics_data,
+    }
+
+    if alert_records:
+        alert_records.sort(key=lambda item: item["ts"], reverse=True)
+
+    with STATE_LOCK:
+        DASHBOARD_STATE["last_run_summary"] = summary
+        DASHBOARD_STATE["exchange_metrics"] = metrics_data
+        if alert_records:
+            history = DASHBOARD_STATE.get("latest_alerts", [])
+            history.extend(alert_records)
+            history.sort(key=lambda item: item.get("ts", 0), reverse=True)
+            DASHBOARD_STATE["latest_alerts"] = history[:MAX_ALERT_HISTORY]
+
+    degradation_alerts = build_degradation_alerts(metrics_data)
+    for alert_msg in degradation_alerts:
+        tg_send_message(f"🚨 {alert_msg}", enabled=tg_enabled)
+
+    update_prometheus_metrics(metrics_data, summary, tri_alerts)
+
+    backup_targets = [log_csv]
+    if tri_log_csv:
+        backup_targets.append(tri_log_csv)
+    ensure_log_backups(backup_targets)
+
+    print(
+        "Run complete. Oportunidades enviadas: "
+        f"{alerts} (cross) / {tri_alerts} (triangulares)"
+        f" · latencia total {total_latency_ms} ms"
+    )
 
 # =========================
 # CLI
