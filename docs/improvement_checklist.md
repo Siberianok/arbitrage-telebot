@@ -14,10 +14,10 @@ Este checklist agrupa iniciativas para llevar el bot a un siguiente nivel en cua
 - [ ] Añadir verificación de integridad (checksum) de respuestas y fallback a endpoints secundarios.
 
 ## 3. Gestión avanzada de fees y costes
-- [ ] Registrar y actualizar automáticamente las comisiones por exchange/pareja (niveles VIP, descuentos de token nativo, etc.).
-- [ ] Modelar costes de retiro/deposito y tiempos de confirmación para evaluar arbitrajes de “vuelta completa”.
-- [ ] Ajustar `estimate_profit` para aplicar comisiones sobre ambas piernas y considerar deslizamiento esperado.
-- [ ] Simular impacto de rebalanceo de inventarios (transferencias entre exchanges) y costos asociados.
+- [x] Registrar y actualizar automáticamente las comisiones por exchange/pareja (niveles VIP, descuentos de token nativo, etc.).
+- [x] Modelar costes de retiro/deposito y tiempos de confirmación para evaluar arbitrajes de “vuelta completa”.
+- [x] Ajustar `estimate_profit` para aplicar comisiones sobre ambas piernas y considerar deslizamiento esperado.
+- [x] Simular impacto de rebalanceo de inventarios (transferencias entre exchanges) y costos asociados.
 
 ## 4. Monitoreo, alertas y confiabilidad
 - [ ] Centralizar logging estructurado (JSON) y métricas (exitos/fallos por exchange) para observabilidad.
@@ -26,10 +26,10 @@ Este checklist agrupa iniciativas para llevar el bot a un siguiente nivel en cua
 - [ ] Crear pruebas automatizadas de conectividad/API que se ejecuten en el despliegue y previo a producción.
 
 ## 5. Inteligencia de señales y análisis
-- [ ] Evaluar precisión histórica de las señales guardadas (`logs/opportunities.csv`) y ajustar thresholds dinámicamente.
-- [ ] Priorizar oportunidades según liquidez estimada y volatilidad reciente del par.
-- [ ] Añadir clasificación del tipo de señal (alta confianza, media, baja) basada en métricas de estabilidad.
-- [ ] Integrar un módulo de backtesting para medir PnL realista (fees, slippage, rebalanceos, latencias).
+- [x] Evaluar precisión histórica de las señales guardadas (`logs/opportunities.csv`) y ajustar thresholds dinámicamente.
+- [x] Priorizar oportunidades según liquidez estimada y volatilidad reciente del par.
+- [x] Añadir clasificación del tipo de señal (alta confianza, media, baja) basada en métricas de estabilidad.
+- [x] Integrar un módulo de backtesting para medir PnL realista (fees, slippage, rebalanceos, latencias).
 
 ## 6. Experiencia de usuario y operativa
 - [ ] Exponer una interfaz web/dashboard con estado en tiempo real, últimas señales y controles de configuración.
