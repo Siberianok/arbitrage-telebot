@@ -10,7 +10,7 @@ import threading
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple, Set, Any
 
 import requests
