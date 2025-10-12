@@ -165,6 +165,7 @@ CONFIG = {
         "BUSD/USDC",
     ],
     "simulation_capital_quote": 10_000,  # capital (USDT) para estimar PnL en alerta
+    "max_quote_age_seconds": 15,  # descarta cotizaciones más viejas que este límite
     "capital_weights": {
         "pairs": {
             "default": 1.0,
@@ -508,6 +509,10 @@ COMMANDS_HELP: List[Tuple[str, str]] = [
     (
         "/threshold",
         "Consulta o actualiza el umbral de alerta (%) — usar /threshold <valor>",
+    ),
+    (
+        "/capital",
+        "Consulta o actualiza el capital simulado (USDT) — usar /capital <monto>",
     ),
     ("/pairs", "Lista los pares configurados"),
     ("/addpair", "Agrega un par nuevo al monitoreo — usar /addpair <PAR>",),
@@ -1409,6 +1414,52 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         DYNAMIC_THRESHOLD_PERCENT = value
         tg_send_message(
             f"Nuevo threshold guardado: {CONFIG['threshold_percent']:.3f}%",
+            enabled=enabled,
+            chat_id=chat_id,
+        )
+        return
+
+    if command == "/capital":
+        if not argument:
+            capital = float(CONFIG.get("simulation_capital_quote", 0.0))
+            tg_send_message(
+                f"Capital simulado actual: {format_decimal_comma(capital, decimals=2)} USDT",
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return
+        if not ensure_admin(chat_id, enabled):
+            return
+        cleaned = argument.lower().replace("usdt", "").strip()
+        cleaned = cleaned.replace(" ", "")
+        if "," in cleaned and "." in cleaned:
+            cleaned = cleaned.replace(",", "")
+        elif cleaned.count(",") == 1 and cleaned.count(".") == 0:
+            cleaned = cleaned.replace(",", ".")
+        try:
+            value = float(cleaned)
+        except ValueError:
+            tg_send_message(
+                "Valor inválido. Ej: /capital 2500 o /capital 2.500,50",
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return
+        if value <= 0:
+            tg_send_message(
+                "El capital debe ser mayor a 0.",
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return
+        with CONFIG_LOCK:
+            CONFIG["simulation_capital_quote"] = value
+        refresh_config_snapshot()
+        tg_send_message(
+            (
+                "Nuevo capital simulado guardado: "
+                f"{format_decimal_comma(value, decimals=2)} USDT"
+            ),
             enabled=enabled,
             chat_id=chat_id,
         )
@@ -2319,6 +2370,34 @@ def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) 
                 print(f"[{venue}] error fetch {pair}: {exc}")
                 continue
             if quote:
+                source = str(getattr(quote, "source", "")).lower()
+                if source == "offline":
+                    log_event(
+                        "exchange.quote.skip",
+                        exchange=venue,
+                        pair=pair,
+                        reason="offline_source",
+                    )
+                    record_exchange_no_data(venue, pair)
+                    continue
+
+                max_age_seconds = float(CONFIG.get("max_quote_age_seconds", 0.0))
+                if max_age_seconds > 0:
+                    try:
+                        age_ms = max(0, current_millis() - int(quote.ts))
+                    except Exception:
+                        age_ms = None
+                    if age_ms is None or age_ms > max_age_seconds * 1000:
+                        log_event(
+                            "exchange.quote.skip",
+                            exchange=venue,
+                            pair=pair,
+                            reason="stale_quote",
+                            age_ms=age_ms,
+                        )
+                        record_exchange_no_data(venue, pair)
+                        continue
+
                 pair_quotes[pair][venue] = quote
 
     return pair_quotes
@@ -2628,6 +2707,10 @@ def compute_opportunities_for_pair(
         buy_quote = quotes.get(buy_v)
         sell_quote = quotes.get(sell_v)
         if not buy_quote or not sell_quote:
+            continue
+        if str(getattr(buy_quote, "source", "")).lower() == "offline":
+            continue
+        if str(getattr(sell_quote, "source", "")).lower() == "offline":
             continue
 
         buy_fee_cfg = fees.get(buy_v)
@@ -2946,6 +3029,21 @@ def append_triangular_csv(path: str, opp: TriangularOpportunity) -> None:
 # =========================
 # Formato de alerta
 # =========================
+def format_decimal_comma(value: float, decimals: int = 2, min_int_digits: int = 2) -> str:
+    sign = "-" if value < 0 else ""
+    abs_value = abs(value)
+    formatted = f"{abs_value:.{decimals}f}"
+    integer_part = str(int(abs_value))
+    if len(integer_part) < min_int_digits:
+        total_length = min_int_digits + decimals + 1
+        formatted = formatted.zfill(total_length)
+    return f"{sign}{formatted.replace('.', ',')}"
+
+
+def format_percent_comma(value: float) -> str:
+    return f"{format_decimal_comma(value, decimals=2)}%"
+
+
 def fmt_alert(
     opp: Opportunity,
     est_profit: float,
@@ -2957,19 +3055,18 @@ def fmt_alert(
 ) -> str:
     buy_label = opp.buy_venue.upper()
     sell_label = opp.sell_venue.upper()
-    formatted_links = " · ".join(
-        f"[{item['label']}]({item['url']})" for item in (links or [])
-    ) or "—"
 
     lines = [
         "🚨 *Arbitraje spot detectado*",
         f"*Par:* `{opp.pair}`",
         f"*Ruta:* Comprar en *{buy_label}* a `{opp.buy_price:.6f}` · Vender en *{sell_label}* a `{opp.sell_price:.6f}`",
-        f"*Spreads:* bruto `{opp.gross_percent:.3f}%` · neto `{opp.net_percent:.3f}%`",
-        f"*PnL estimado:* `~{est_profit:.2f} USDT` (`{est_percent:.3f}%`) sobre {capital_quote:.2f} USDT",
-        f"*Cantidad base:* `{base_qty:.6f}` ({capital_used:.2f} USDT usados)",
-        f"*Confianza:* {opp.confidence_label.title()} · *Liquidez:* {opp.liquidity_score:.2f} · *Volatilidad:* {opp.volatility_score:.2f}",
-        f"*Links:* {formatted_links}",
+        f"*Spreads:* bruto `{format_percent_comma(opp.gross_percent)}` · neto `{format_percent_comma(opp.net_percent)}`",
+        (
+            "*PnL estimado:* `~"
+            f"{format_decimal_comma(est_profit, decimals=2)} USDT` "
+            f"(`{format_percent_comma(est_percent)}`) sobre {format_decimal_comma(capital_quote, decimals=2)} USDT"
+        ),
+        f"*Cantidad base:* `{base_qty:.6f}` ({format_decimal_comma(capital_used, decimals=2)} USDT usados)",
         time.strftime("%Y-%m-%d %H:%M:%S"),
     ]
     return "\n".join(lines)
