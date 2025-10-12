@@ -27,8 +27,30 @@ CONFIG = {
         "ADA/USDT",
         "ALGO/USDT",
         "SHIB/USDT",
+        "SOL/USDT",
+        "MATIC/USDT",
+        "BTC/USDC",
+        "ETH/BTC",
+        "BTC/EUR",
+        "ETH/EUR",
+        "USDC/USDT",
+        "BUSD/USDT",
+        "BUSD/USDC",
     ],
     "simulation_capital_quote": 10_000,  # capital (USDT) para estimar PnL en alerta
+    "capital_weights": {
+        "pairs": {
+            "default": 1.0,
+            "BTC/USDT": 1.5,
+            "ETH/USDT": 1.2,
+            "ETH/BTC": 0.8,
+        },
+        "triangles": {
+            "default": 0.6,
+            "binance::USDT-USDC-BUSD": 1.0,
+            "bybit::USDT-BTC-USDC": 0.8,
+        },
+    },
     "venues": {
         "binance": {"enabled": True,  "taker_fee_percent": 0.10},
         "bybit":   {"enabled": True,  "taker_fee_percent": 0.10},
@@ -36,12 +58,35 @@ CONFIG = {
         "okx":     {"enabled": True,  "taker_fee_percent": 0.10},
         # add more venues aquí
     },
+    "triangular_routes": [
+        {
+            "name": "USDT-USDC-BUSD",
+            "venue": "binance",
+            "start_asset": "USDT",
+            "legs": [
+                {"pair": "USDC/USDT", "action": "BUY_BASE"},
+                {"pair": "BUSD/USDC", "action": "BUY_BASE"},
+                {"pair": "BUSD/USDT", "action": "SELL_BASE"},
+            ],
+        },
+        {
+            "name": "USDT-BTC-USDC",
+            "venue": "bybit",
+            "start_asset": "USDT",
+            "legs": [
+                {"pair": "BTC/USDT", "action": "BUY_BASE"},
+                {"pair": "BTC/USDC", "action": "SELL_BASE"},
+                {"pair": "USDC/USDT", "action": "SELL_BASE"},
+            ],
+        },
+    ],
     "telegram": {
         "enabled": True,                 # poner False para pruebas sin enviar
         "bot_token_env": "TG_BOT_TOKEN",
         "chat_ids_env": "TG_CHAT_IDS",   # coma-separado: "-100123...,123456..."
     },
     "log_csv_path": "logs/opportunities.csv",
+    "triangular_log_csv_path": "logs/triangular_opportunities.csv",
 }
 
 TELEGRAM_CHAT_IDS: Set[str] = set()
@@ -855,6 +900,41 @@ class Opportunity:
     gross_percent: float
     net_percent: float
 
+@dataclass
+class TriangleLeg:
+    pair: str
+    action: str  # BUY_BASE o SELL_BASE
+
+    def normalized_action(self) -> str:
+        return self.action.strip().upper()
+
+
+@dataclass
+class TriangularRoute:
+    name: str
+    venue: str
+    start_asset: str
+    legs: List[TriangleLeg]
+
+    @property
+    def identifier(self) -> str:
+        return f"{self.venue}::{self.name}"
+
+
+@dataclass
+class TriangularOpportunity:
+    route: TriangularRoute
+    start_capital: float
+    final_capital_gross: float
+    final_capital_net: float
+    gross_percent: float
+    net_percent: float
+    leg_prices: List[Tuple[TriangleLeg, float]]
+
+    @property
+    def net_profit(self) -> float:
+        return self.final_capital_net - self.start_capital
+
 def compute_opportunities_for_pair(pair: str,
                                    quotes: Dict[str, Quote],
                                    fees: Dict[str, VenueFees]) -> List[Opportunity]:
@@ -879,6 +959,90 @@ def compute_opportunities_for_pair(pair: str,
         out.append(Opportunity(pair, buy_v, sell_v, buy_price, sell_price, gross, net))
 
     return sorted(out, key=lambda o: o.net_percent, reverse=True)
+
+
+def get_weighted_capital(base_capital: float, weights_cfg: Dict[str, float], key: str) -> float:
+    if base_capital <= 0:
+        return 0.0
+    default = float(weights_cfg.get("default", 1.0)) if weights_cfg else 1.0
+    weight = float(weights_cfg.get(key, default)) if weights_cfg else default
+    return base_capital * weight
+
+
+def load_triangular_routes() -> List[TriangularRoute]:
+    routes_cfg = CONFIG.get("triangular_routes", []) or []
+    routes: List[TriangularRoute] = []
+    for rcfg in routes_cfg:
+        legs_cfg = rcfg.get("legs", []) or []
+        legs = [
+            TriangleLeg(
+                pair=str(leg_cfg.get("pair", "")).upper(),
+                action=str(leg_cfg.get("action", "BUY_BASE")),
+            )
+            for leg_cfg in legs_cfg
+            if leg_cfg.get("pair")
+        ]
+        if not legs:
+            continue
+        name = str(rcfg.get("name", "triangle")).strip() or "triangle"
+        venue = str(rcfg.get("venue", "")).strip().lower()
+        if not venue:
+            continue
+        start_asset = str(rcfg.get("start_asset", "USDT")).upper() or "USDT"
+        routes.append(TriangularRoute(name=name, venue=venue, start_asset=start_asset, legs=legs))
+    return routes
+
+
+def compute_triangular_opportunity(route: TriangularRoute,
+                                   quotes_by_pair: Dict[str, Dict[str, Quote]],
+                                   fees: Dict[str, VenueFees],
+                                   start_capital: float) -> Optional[TriangularOpportunity]:
+    if start_capital <= 0:
+        return None
+
+    fee_cfg = fees.get(route.venue)
+    fee_rate = (fee_cfg.taker_fee_percent / 100.0) if fee_cfg else 0.0
+
+    gross_amount = start_capital
+    net_amount = start_capital
+    legs_with_prices: List[Tuple[TriangleLeg, float]] = []
+
+    for leg in route.legs:
+        quotes_for_pair = quotes_by_pair.get(leg.pair, {})
+        quote = quotes_for_pair.get(route.venue)
+        if not quote:
+            return None
+
+        action = leg.normalized_action()
+        if action == "BUY_BASE":
+            price = quote.ask
+            if price <= 0:
+                return None
+            gross_amount = gross_amount / price
+            net_amount = (net_amount / price) * (1 - fee_rate)
+        elif action == "SELL_BASE":
+            price = quote.bid
+            if price <= 0:
+                return None
+            gross_amount = gross_amount * price
+            net_amount = (net_amount * price) * (1 - fee_rate)
+        else:
+            return None
+
+        legs_with_prices.append((leg, price))
+
+    gross_percent = (gross_amount - start_capital) / start_capital * 100.0
+    net_percent = (net_amount - start_capital) / start_capital * 100.0
+
+    return TriangularOpportunity(
+        route=route,
+        start_capital=start_capital,
+        final_capital_gross=gross_amount,
+        final_capital_net=net_amount,
+        gross_percent=gross_percent,
+        net_percent=net_percent,
+        leg_prices=legs_with_prices,
+    )
 
 # =========================
 # Simulación PnL (simple)
@@ -952,6 +1116,40 @@ def append_csv(
             f"{(sell_depth.bid_volume if sell_depth else 0.0):.8f}" if sell_depth else "",
         ])
 
+
+def append_triangular_csv(path: str, opp: TriangularOpportunity) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow([
+                "ts",
+                "route",
+                "venue",
+                "start_asset",
+                "start_capital",
+                "final_capital_net",
+                "gross_%",
+                "net_%",
+                "legs",
+            ])
+        leg_summary = " | ".join(
+            f"{leg.pair}:{leg.normalized_action()}@{price:.8f}"
+            for leg, price in opp.leg_prices
+        )
+        w.writerow([
+            int(time.time()),
+            opp.route.name,
+            opp.route.venue,
+            opp.route.start_asset,
+            f"{opp.start_capital:.8f}",
+            f"{opp.final_capital_net:.8f}",
+            f"{opp.gross_percent:.4f}",
+            f"{opp.net_percent:.4f}",
+            leg_summary,
+        ])
+
 # =========================
 # Formato de alerta
 # =========================
@@ -995,6 +1193,24 @@ def fmt_alert(
     lines.append(time.strftime('%Y-%m-%d %H:%M:%S'))
     return "\n".join(lines)
 
+
+def fmt_triangular_alert(opp: TriangularOpportunity, fee_percent: float) -> str:
+    legs_lines = []
+    for leg, price in opp.leg_prices:
+        action = leg.normalized_action()
+        legs_lines.append(f"- {leg.pair} [{action}] @ {price:.8f}")
+    legs_block = "\n".join(legs_lines)
+    return (
+        "ARBITRAJE TRIANGULAR\n"
+        f"Ruta: {opp.route.name} ({opp.route.venue})\n"
+        f"Asset inicial: {opp.route.start_asset}\n"
+        f"Capital simulado: {opp.start_capital:.4f} {opp.route.start_asset}\n"
+        f"Resultado neto: {opp.final_capital_net:.4f} {opp.route.start_asset} (PnL {opp.net_profit:.4f}, {opp.net_percent:.3f}%)\n"
+        f"Spread bruto: {opp.gross_percent:.3f}% | Fees considerados: {fee_percent:.3f}% por trade\n"
+        f"Legs:\n{legs_block}\n"
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
 # =========================
 # Run (una vez)
 # =========================
@@ -1010,61 +1226,65 @@ def run_once() -> None:
     if tg_enabled and not polling_active:
         tg_process_updates(enabled=tg_enabled)
 
-    pairs = list(CONFIG["pairs"])
+    routes = load_triangular_routes()
+    pairs = list(dict.fromkeys(CONFIG["pairs"]))
+    extra_pairs = {leg.pair for route in routes for leg in route.legs}
+    all_pairs = sorted(set(pairs) | extra_pairs)
     threshold = float(CONFIG["threshold_percent"])
     capital = float(CONFIG["simulation_capital_quote"])
     log_csv = CONFIG["log_csv_path"]
+    tri_log_csv = CONFIG.get("triangular_log_csv_path")
+    pair_weight_cfg = CONFIG.get("capital_weights", {}).get("pairs", {})
+    triangle_weight_cfg = CONFIG.get("capital_weights", {}).get("triangles", {})
 
-    pair_quotes = collect_pair_quotes(pairs, adapters)
+    pair_quotes: Dict[str, Dict[str, Quote]] = {p: {} for p in all_pairs}
+    for pair in all_pairs:
+        for vname, adapter in adapters.items():
+            try:
+                q = adapter.fetch_quote(pair)
+            except Exception as e:
+                q = None
+                print(f"[{vname}] error fetch {pair}: {e}")
+            if q:
+                pair_quotes[pair][vname] = q
 
     alerts = 0
-    for pair, quotes in pair_quotes.items():
+    for pair in pairs:
+        quotes = pair_quotes.get(pair, {})
         if len(quotes) < 2:
+            continue
+        capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
+        if capital_for_pair <= 0:
             continue
         opps = compute_opportunities_for_pair(pair, quotes, fee_map)
         for opp in opps:
             if opp.net_percent >= threshold:
                 total_fee_pct = fee_map[opp.buy_venue].taker_fee_percent + fee_map[opp.sell_venue].taker_fee_percent
-                buy_quote = quotes.get(opp.buy_venue)
-                sell_quote = quotes.get(opp.sell_venue)
-                if not buy_quote or not sell_quote:
-                    continue
+                est_profit, est_percent, base_qty = estimate_profit(capital_for_pair, opp.buy_price, opp.sell_price, total_fee_pct)
 
-                available_base: Optional[float] = None
-                volumes: List[float] = []
-                if buy_quote.depth and buy_quote.depth.ask_volume > 0:
-                    volumes.append(buy_quote.depth.ask_volume)
-                if sell_quote.depth and sell_quote.depth.bid_volume > 0:
-                    volumes.append(sell_quote.depth.bid_volume)
-                if volumes:
-                    available_base = min(volumes)
-
-                est_profit, est_percent, base_qty, capital_used = estimate_profit(
-                    capital,
-                    opp.buy_price,
-                    opp.sell_price,
-                    total_fee_pct,
-                    max_base_qty=available_base,
-                )
-
-                if base_qty <= 0 or capital_used <= 0:
-                    continue
-
-                append_csv(log_csv, opp, est_profit, base_qty, capital_used, buy_quote.depth, sell_quote.depth)
-                msg = fmt_alert(
-                    opp,
-                    est_profit,
-                    est_percent,
-                    base_qty,
-                    capital,
-                    capital_used,
-                    buy_quote.depth,
-                    sell_quote.depth,
-                )
+                append_csv(log_csv, opp, est_profit, base_qty)
+                msg = fmt_alert(opp, est_profit, est_percent, base_qty, capital_for_pair)
                 tg_send_message(msg, enabled=tg_enabled)
                 alerts += 1
 
-    print(f"Run complete. Oportunidades enviadas: {alerts}")
+    tri_alerts = 0
+    for route in routes:
+        route_capital = get_weighted_capital(capital, triangle_weight_cfg, route.identifier)
+        if route_capital <= 0:
+            continue
+        opp = compute_triangular_opportunity(route, pair_quotes, fee_map, route_capital)
+        if not opp or opp.net_percent < threshold:
+            continue
+
+        if tri_log_csv:
+            append_triangular_csv(tri_log_csv, opp)
+        fee_cfg = fee_map.get(route.venue)
+        fee_pct = fee_cfg.taker_fee_percent if fee_cfg else 0.0
+        msg = fmt_triangular_alert(opp, fee_pct)
+        tg_send_message(msg, enabled=tg_enabled)
+        tri_alerts += 1
+
+    print(f"Run complete. Oportunidades enviadas: {alerts} (cross) / {tri_alerts} (triangulares)")
 
 # =========================
 # CLI
