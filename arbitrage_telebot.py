@@ -364,6 +364,35 @@ def tg_command_menu_payload() -> List[Dict[str, str]]:
 def build_test_signal_message() -> str:
     capital = float(CONFIG.get("simulation_capital_quote", 0.0))
 
+    with STATE_LOCK:
+        history = list(DASHBOARD_STATE.get("latest_alerts", []))
+
+    if history:
+        latest = history[0]
+        capital_used = float(latest.get("capital_used_quote") or 0.0)
+        est_profit = float(latest.get("est_profit_quote") or 0.0)
+        est_percent = float(latest.get("est_percent") or 0.0)
+        base_qty = float(latest.get("base_qty") or 0.0)
+
+        alert_message = fmt_alert(
+            Opportunity(
+                pair=str(latest.get("pair", "N/A")),
+                buy_venue=str(latest.get("buy_venue", "?")),
+                sell_venue=str(latest.get("sell_venue", "?")),
+                buy_price=float(latest.get("buy_price") or 0.0),
+                sell_price=float(latest.get("sell_price") or 0.0),
+                gross_percent=float(latest.get("gross_percent") or 0.0),
+                net_percent=float(latest.get("net_percent") or 0.0),
+            ),
+            est_profit=est_profit,
+            est_percent=est_percent,
+            base_qty=base_qty,
+            capital_quote=capital_used or capital,
+        )
+
+        header = "Última señal registrada 📡" if latest.get("threshold_hit") else "Oportunidad reciente registrada"
+        return f"{header}\n\n{alert_message}"
+
     sample_opportunity = Opportunity(
         pair="BTC/USDT",
         buy_venue="binance",
@@ -388,7 +417,10 @@ def build_test_signal_message() -> str:
         capital_quote=capital,
     )
 
-    return "Señal de prueba ✅\n\n" + alert_message
+    return (
+        "Sin señales recientes. Mostrando ejemplo de arbitraje 📊\n\n"
+        + alert_message
+    )
 
 
 def tg_sync_command_menu(enabled: bool = True) -> None:
