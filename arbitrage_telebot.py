@@ -15,6 +15,20 @@ from typing import Dict, Optional, List, Tuple, Set
 
 import requests
 
+from observability import (
+    ERROR_RATE_ALERT_THRESHOLD,
+    is_circuit_open,
+    log_event,
+    metrics_snapshot,
+    record_exchange_attempt,
+    record_exchange_error,
+    record_exchange_no_data,
+    record_exchange_skip,
+    record_exchange_success,
+    register_degradation_alert,
+    reset_metrics,
+)
+
 # =========================
 # CONFIG
 # =========================
@@ -105,7 +119,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def serve_http(port: int):
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"[WEB] listening on 0.0.0.0:{port}")
+    log_event("web.listen_start", port=port)
     server.serve_forever()
 
 def run_loop_forever(interval: int):
@@ -113,7 +127,7 @@ def run_loop_forever(interval: int):
         try:
             run_once()
         except Exception as e:
-            print("[ERROR loop]", e)
+            log_event("loop.error", error=str(e))
         time.sleep(max(5, interval))
 
 # =========================
@@ -122,17 +136,32 @@ def run_loop_forever(interval: int):
 class HttpError(Exception):
     pass
 
-def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 8, retries: int = 3) -> dict:
+def http_get_json(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: int = 8,
+    retries: int = 3,
+    backoff_initial: float = 0.5,
+    backoff_max: float = 5.0,
+) -> dict:
     last_exc = None
-    for _ in range(retries):
+    delay = backoff_initial
+    for attempt in range(1, retries + 1):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code != 200:
-                raise HttpError(f"HTTP {r.status_code} {url} params={params}")
-            return r.json()
-        except Exception as e:
-            last_exc = e
-            time.sleep(0.5)
+            response = requests.get(url, params=params, timeout=timeout)
+            if response.status_code != 200:
+                raise HttpError(f"HTTP {response.status_code} {url} params={params}")
+            log_event("http.success", url=url, params=params, status=response.status_code)
+            return response.json()
+        except Exception as exc:
+            last_exc = exc
+            log_event("http.retry", url=url, params=params, attempt=attempt, error=str(exc))
+            if attempt >= retries:
+                break
+            time.sleep(delay)
+            delay = min(backoff_max, delay * 2)
+    error_message = str(last_exc) if last_exc else "GET failed"
+    log_event("http.failure", url=url, params=params, error=error_message)
     raise last_exc or HttpError("GET failed")
 
 # =========================
@@ -143,7 +172,7 @@ def register_telegram_chat(chat_id) -> str:
     if cid not in TELEGRAM_CHAT_IDS:
         TELEGRAM_CHAT_IDS.add(cid)
         os.environ[CONFIG["telegram"]["chat_ids_env"]] = ",".join(sorted(TELEGRAM_CHAT_IDS))
-        print(f"[TELEGRAM] Nuevo chat registrado: {cid}")
+        log_event("telegram.chat_registered", chat_id=cid)
     return cid
 
 
@@ -152,14 +181,14 @@ def get_registered_chat_ids() -> List[str]:
 
 
 def tg_send_message(text: str, enabled: bool = True, chat_id: Optional[str] = None) -> None:
+    preview = text if len(text) <= 400 else text[:400] + "…"
     if not enabled:
-        print("[TELEGRAM DISABLED] Would send:\n" + text)
+        log_event("telegram.send.skip", reason="disabled", preview=preview)
         return
 
     token = get_bot_token()
     if not token:
-        print("[TELEGRAM] Falta TG_BOT_TOKEN. No se envía.")
-        print("Mensaje:\n" + text)
+        log_event("telegram.send.skip", reason="missing_token", preview=preview)
         return
 
     targets: List[str]
@@ -169,8 +198,7 @@ def tg_send_message(text: str, enabled: bool = True, chat_id: Optional[str] = No
         targets = get_registered_chat_ids()
 
     if not targets:
-        print("[TELEGRAM] No hay chats registrados. No se envía.")
-        print("Mensaje:\n" + text)
+        log_event("telegram.send.skip", reason="no_targets", preview=preview)
         return
 
     base = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -179,9 +207,16 @@ def tg_send_message(text: str, enabled: bool = True, chat_id: Optional[str] = No
             payload = {"chat_id": cid, "text": text, "parse_mode": "Markdown"}
             r = requests.post(base, data=payload, timeout=8)
             if r.status_code != 200:
-                print(f"[TELEGRAM] HTTP {r.status_code} chat_id={cid} -> {r.text}")
+                log_event(
+                    "telegram.send.error",
+                    chat_id=cid,
+                    status=r.status_code,
+                    response=r.text[:200],
+                )
+            else:
+                log_event("telegram.send.success", chat_id=cid)
         except Exception as e:
-            print(f"[TELEGRAM] Error enviando a {cid}: {e}")
+            log_event("telegram.send.exception", chat_id=cid, error=str(e))
 
 
 def tg_api_request(method: str, params: Optional[Dict] = None, http_method: str = "get") -> Dict:
@@ -314,7 +349,7 @@ def tg_process_updates(enabled: bool = True) -> None:
     try:
         data = tg_api_request("getUpdates", params=params or None)
     except Exception as e:
-        print(f"[TELEGRAM] Error leyendo updates: {e}")
+        log_event("telegram.poll.error", error=str(e))
         return
 
     for update in data.get("result", []):
@@ -355,7 +390,7 @@ def ensure_telegram_polling_thread(enabled: bool, interval: float = 1.0) -> None
             try:
                 tg_process_updates(enabled=True)
             except Exception as exc:  # pragma: no cover - logging only
-                print(f"[TELEGRAM] Error en polling: {exc}")
+                log_event("telegram.poll.exception", error=str(exc))
             time.sleep(max(0.5, interval))
 
     TELEGRAM_POLLING_THREAD = threading.Thread(
@@ -548,6 +583,38 @@ def fmt_alert(opp: Opportunity, est_profit: float, est_percent: float, base_qty:
         f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
+
+def build_degradation_alerts(snapshot: Dict[str, Dict]) -> List[str]:
+    alerts: List[str] = []
+    for exchange, stats in snapshot.items():
+        attempts = int(stats.get("attempts", 0))
+        successes = int(stats.get("successes", 0))
+        errors = int(stats.get("errors", 0))
+        no_data = int(stats.get("no_data", 0))
+
+        if attempts == 0:
+            if register_degradation_alert(exchange, "no_attempts"):
+                alerts.append(
+                    f"⚠️ {exchange}: sin intentos de consulta recientes. Revisar configuración o circuito abierto."
+                )
+            continue
+
+        if successes == 0:
+            if register_degradation_alert(exchange, "no_data"):
+                alerts.append(
+                    f"⚠️ {exchange}: sin datos recibidos en la última corrida (intentos={attempts}, sin_datos={no_data})."
+                )
+            continue
+
+        error_rate = errors / float(attempts)
+        if errors and error_rate >= ERROR_RATE_ALERT_THRESHOLD:
+            if register_degradation_alert(exchange, "high_error_rate"):
+                alerts.append(
+                    f"⚠️ {exchange}: tasa de errores {error_rate:.0%} (errores={errors}, intentos={attempts})."
+                )
+
+    return alerts
+
 # =========================
 # Run (una vez)
 # =========================
@@ -555,9 +622,10 @@ def run_once() -> None:
     adapters = build_adapters()
     fee_map = build_fee_map()
     if not adapters:
-        print("No hay venues habilitados en CONFIG['venues'].")
+        log_event("run.skip", reason="no_venues")
         return
 
+    reset_metrics(adapters.keys())
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
     polling_active = TELEGRAM_POLLING_THREAD and TELEGRAM_POLLING_THREAD.is_alive()
     if tg_enabled and not polling_active:
@@ -571,13 +639,29 @@ def run_once() -> None:
     pair_quotes: Dict[str, Dict[str, Quote]] = {p: {} for p in pairs}
     for pair in pairs:
         for vname, adapter in adapters.items():
+            if is_circuit_open(vname):
+                record_exchange_skip(vname, "circuit_open", pair)
+                continue
+
+            record_exchange_attempt(vname, pair)
+            quote: Optional[Quote] = None
             try:
-                q = adapter.fetch_quote(pair)
-            except Exception as e:
-                q = None
-                print(f"[{vname}] error fetch {pair}: {e}")
-            if q:
-                pair_quotes[pair][vname] = q
+                quote = adapter.fetch_quote(pair)
+            except Exception as exc:
+                record_exchange_error(vname, str(exc), pair)
+            else:
+                if quote:
+                    record_exchange_success(vname, pair)
+                    pair_quotes[pair][vname] = quote
+                    log_event(
+                        "exchange.quote",
+                        exchange=vname,
+                        pair=pair,
+                        bid=quote.bid,
+                        ask=quote.ask,
+                    )
+                else:
+                    record_exchange_no_data(vname, pair)
 
     alerts = 0
     for pair, quotes in pair_quotes.items():
@@ -592,9 +676,29 @@ def run_once() -> None:
                 append_csv(log_csv, opp, est_profit, base_qty)
                 msg = fmt_alert(opp, est_profit, est_percent, base_qty, capital)
                 tg_send_message(msg, enabled=tg_enabled)
+                log_event(
+                    "opportunity.alert",
+                    pair=opp.pair,
+                    buy_venue=opp.buy_venue,
+                    sell_venue=opp.sell_venue,
+                    net_percent=opp.net_percent,
+                    est_profit=est_profit,
+                )
                 alerts += 1
 
-    print(f"Run complete. Oportunidades enviadas: {alerts}")
+    snapshot = metrics_snapshot()
+    log_event("run.metrics", metrics=snapshot)
+    degradation_alerts = build_degradation_alerts(snapshot)
+    for alert_text in degradation_alerts:
+        tg_send_message(alert_text, enabled=tg_enabled)
+
+    log_event(
+        "run.complete",
+        alerts=alerts,
+        pairs=len(pairs),
+        venues=len(adapters),
+        degradation_alerts=len(degradation_alerts),
+    )
 
 # =========================
 # CLI
@@ -620,17 +724,18 @@ def main():
         return
 
     if args.once and args.loop:
-        print("Elegí --once o --loop, no ambos.")
+        log_event("cli.invalid_args", once=args.once, loop=args.loop)
         return
 
     if args.once or not args.loop:
-        run_once(); return
+        run_once()
+        return
 
     while True:
         try:
             run_once()
         except Exception as e:
-            print("[ERROR]", e)
+            log_event("loop.error", error=str(e))
         time.sleep(max(5, args.interval))
 
 if __name__ == "__main__":
