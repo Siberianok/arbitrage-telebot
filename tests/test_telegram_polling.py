@@ -72,3 +72,23 @@ def test_tg_process_updates_skips_webhook_reset_during_cooldown(monkeypatch):
     assert any(event == "telegram.poll.reset_webhook.skip" for event, _ in events)
     assert bot.TELEGRAM_POLL_BACKOFF_UNTIL == fake_time.monotonic() + bot.TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS
     assert bot.TELEGRAM_LAST_WEBHOOK_RESET_TS == 100.0
+
+
+def test_tg_handle_command_status_includes_dynamic_threshold(monkeypatch):
+    messages = []
+
+    monkeypatch.setattr(bot, "log_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "tg_enable_menu_button", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "tg_send_message", lambda text, **payload: messages.append(text))
+    monkeypatch.setattr(bot, "register_telegram_chat", lambda chat_id: str(chat_id))
+    monkeypatch.setattr(bot, "get_registered_chat_ids", lambda: ["123"])
+
+    monkeypatch.setitem(bot.CONFIG, "pairs", ["BTC/USDT"])
+    bot.TELEGRAM_CHAT_IDS = {"123"}
+    bot.CONFIG["threshold_percent"] = 0.3
+    bot.DYNAMIC_THRESHOLD_PERCENT = 0.55
+
+    bot.tg_handle_command("/status", "", "123", enabled=True)
+
+    assert messages
+    assert any("0.550%" in msg for msg in messages)

@@ -406,6 +406,8 @@ CONFIG = {
     "triangular_log_csv_path": str(Path(LOG_BASE_DIR) / "triangular_opportunities.csv"),
 }
 
+DYNAMIC_THRESHOLD_PERCENT: float = float(CONFIG.get("threshold_percent", 0.0))
+
 TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
 TELEGRAM_POLLING_THREAD: Optional[threading.Thread] = None
@@ -423,6 +425,7 @@ DASHBOARD_STATE: Dict[str, Any] = {
     "latest_alerts": [],
     "config_snapshot": {},
     "exchange_metrics": {},
+    "analysis": None,
 }
 
 MAX_ALERT_HISTORY = 20
@@ -476,6 +479,51 @@ def snapshot_public_config() -> Dict[str, Any]:
 def refresh_config_snapshot() -> None:
     with STATE_LOCK:
         DASHBOARD_STATE["config_snapshot"] = snapshot_public_config()
+
+def update_analysis_state(capital_quote: float, log_path: str) -> None:
+    """Refresh cached analysis metrics and dynamic threshold from CSV history."""
+
+    global LATEST_ANALYSIS, DYNAMIC_THRESHOLD_PERCENT
+
+    if not log_path:
+        return
+
+    base_threshold = float(CONFIG.get("threshold_percent", 0.0))
+    analysis_cfg = CONFIG.get("analysis") or {}
+    if not analysis_cfg.get("enabled", True):
+        DYNAMIC_THRESHOLD_PERCENT = base_threshold
+        with STATE_LOCK:
+            DASHBOARD_STATE["analysis"] = None
+        return
+
+    try:
+        analysis = analyze_historical_performance(log_path, capital_quote)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log_event("analysis.error", error=str(exc))
+        return
+
+    recommended = float(analysis.recommended_threshold or base_threshold)
+    if not math.isfinite(recommended) or recommended <= 0:
+        recommended = base_threshold
+
+    LATEST_ANALYSIS = analysis
+    DYNAMIC_THRESHOLD_PERCENT = recommended
+
+    with STATE_LOCK:
+        DASHBOARD_STATE["analysis"] = {
+            "rows_considered": analysis.rows_considered,
+            "success_rate": analysis.success_rate,
+            "average_net_percent": analysis.average_net_percent,
+            "average_effective_percent": analysis.average_effective_percent,
+            "recommended_threshold": recommended,
+        }
+
+    log_event(
+        "analysis.updated",
+        recommended_threshold=recommended,
+        rows=analysis.rows_considered,
+        success_rate=analysis.success_rate,
+    )
 
 FEE_REGISTRY: Dict[Tuple[str, str], float] = {}
 
@@ -1070,6 +1118,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "latest_alerts": DASHBOARD_STATE.get("latest_alerts", []),
                     "config_snapshot": DASHBOARD_STATE.get("config_snapshot", {}),
                     "exchange_metrics": DASHBOARD_STATE.get("exchange_metrics", {}),
+                    "analysis": DASHBOARD_STATE.get("analysis"),
                 }
             self._send_json(payload)
             return
@@ -1078,6 +1127,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/config":
+            global DYNAMIC_THRESHOLD_PERCENT
             if not self._require_authentication():
                 return
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -1092,6 +1142,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     try:
                         value = float(data["threshold_percent"])
                         CONFIG["threshold_percent"] = value
+                        DYNAMIC_THRESHOLD_PERCENT = value
                         updated["threshold_percent"] = value
                     except (TypeError, ValueError):
                         errors.append("threshold_percent inválido")
@@ -1115,6 +1166,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     else:
                         errors.append("pairs debe ser lista")
             refresh_config_snapshot()
+            if not errors:
+                capital = float(CONFIG.get("simulation_capital_quote", 0.0))
+                log_path = str(CONFIG.get("log_csv_path", ""))
+                update_analysis_state(capital, log_path)
             status = 200 if not errors else 400
             self._send_json({"updated": updated, "errors": errors, "config": DASHBOARD_STATE["config_snapshot"]}, status=status)
             return
@@ -3590,6 +3645,7 @@ def build_degradation_alerts(snapshot: Dict[str, Dict]) -> List[str]:
 # Run (una vez)
 # =========================
 def run_once() -> None:
+    global DYNAMIC_THRESHOLD_PERCENT
     adapters = build_adapters()
     if not adapters:
         log_event("run.skip", reason="no_venues")
@@ -3606,10 +3662,12 @@ def run_once() -> None:
     pairs = normalize_pair_list(CONFIG["pairs"])
     extra_pairs = {leg.pair for route in routes for leg in route.legs}
     all_pairs = sorted(set(pairs) | extra_pairs)
-    threshold = float(CONFIG["threshold_percent"])
+    base_threshold = float(CONFIG.get("threshold_percent", 0.0))
     capital = float(CONFIG["simulation_capital_quote"])
     log_csv = CONFIG["log_csv_path"]
     tri_log_csv = CONFIG.get("triangular_log_csv_path")
+    update_analysis_state(capital, log_csv)
+    threshold = float(DYNAMIC_THRESHOLD_PERCENT or base_threshold)
     pair_weight_cfg = CONFIG.get("capital_weights", {}).get("pairs", {})
     triangle_weight_cfg = CONFIG.get("capital_weights", {}).get("triangles", {})
     fee_map = build_fee_map(all_pairs)
@@ -3777,6 +3835,8 @@ def run_once() -> None:
         "ts": run_ts,
         "ts_str": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(run_ts)),
         "threshold": threshold,
+        "base_threshold": base_threshold,
+        "dynamic_threshold": DYNAMIC_THRESHOLD_PERCENT,
         "capital": capital,
         "pairs": pairs,
         "opportunities": summary_opps,
