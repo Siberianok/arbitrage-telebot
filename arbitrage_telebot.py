@@ -168,7 +168,7 @@ CONFIG = {
         "XRP/USDT",
     ],
     "simulation_capital_quote": 10_000,  # capital (USDT) para estimar PnL en alerta
-    "max_quote_age_seconds": 15,  # descarta cotizaciones más viejas que este límite
+    "max_quote_age_seconds": 12,  # descarta cotizaciones más viejas que este límite
     "capital_weights": {
         "pairs": {
             "default": 1.0,
@@ -180,6 +180,12 @@ CONFIG = {
             "default": 0.6,
         },
     },
+    "strategies": {
+        "spot_spot": True,
+        "spot_p2p": True,
+        "p2p_p2p": True,
+        "triangular_intra_venue": True,
+    },
     "offline_quotes": {
         # Valores de respaldo en caso de faltar la configuración de pruebas
         "BTC/USDT": {"bid": 30050.0, "ask": 30060.0},
@@ -187,8 +193,8 @@ CONFIG = {
         "XRP/USDT": {"bid": 0.52, "ask": 0.521},
     },
     "test_mode": {
-        "enabled": True,
-        "pause_live_requests": True,
+        "enabled": False,
+        "pause_live_requests": False,
         "venues": {
             "binance": {
                 "pairs": {
@@ -262,15 +268,41 @@ CONFIG = {
                 ],
                 "rows": 10,
                 "merchant_types": [],
+                "fees": {
+                    "default_percent": 0.80,
+                    "per_asset_percent": {
+                        "BTC": 1.00,
+                        "ETH": 0.95,
+                        "XRP": 0.90,
+                        "USDT": 0.70,
+                    },
+                },
+                "min_notional_usdt": {
+                    "BTC": 200.0,
+                    "ETH": 150.0,
+                    "XRP": 80.0,
+                    "USDT": 50.0,
+                },
+                "payment_methods": ["BANK_TRANSFER"],
                 "pairs": {
-                    "USDT/ARS": {
+                    "USDT/USD": {
                         "asset": "USDT",
-                        "fiat": "ARS",
+                        "fiat": "USD",
                         "pay_types": [],
                     },
-                    "BTC/ARS": {
+                    "BTC/USD": {
                         "asset": "BTC",
-                        "fiat": "ARS",
+                        "fiat": "USD",
+                        "pay_types": [],
+                    },
+                    "ETH/USD": {
+                        "asset": "ETH",
+                        "fiat": "USD",
+                        "pay_types": [],
+                    },
+                    "XRP/USD": {
+                        "asset": "XRP",
+                        "fiat": "USD",
                         "pay_types": [],
                     },
                 },
@@ -336,16 +368,44 @@ CONFIG = {
                 "enabled": True,
                 "endpoint": "https://api2.bybit.com/fiat/otc/item/online",
                 "rows": 10,
+                "fees": {
+                    "default_percent": 0.95,
+                    "per_asset_percent": {
+                        "BTC": 1.10,
+                        "ETH": 1.00,
+                        "USDT": 0.75,
+                        "XRP": 0.95,
+                    },
+                },
+                "min_notional_usdt": {
+                    "BTC": 180.0,
+                    "ETH": 120.0,
+                    "USDT": 40.0,
+                    "XRP": 60.0,
+                },
+                "payment_methods": ["BANK_TRANSFER"],
                 "pairs": {
-                    "USDT/ARS": {
+                    "USDT/USD": {
                         "asset": "USDT",
-                        "fiat": "ARS",
+                        "fiat": "USD",
                         "ask_side": "1",
                         "bid_side": "0",
                     },
-                    "BTC/ARS": {
+                    "BTC/USD": {
                         "asset": "BTC",
-                        "fiat": "ARS",
+                        "fiat": "USD",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
+                    "ETH/USD": {
+                        "asset": "ETH",
+                        "fiat": "USD",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
+                    "XRP/USD": {
+                        "asset": "XRP",
+                        "fiat": "USD",
                         "ask_side": "1",
                         "bid_side": "0",
                     },
@@ -396,7 +456,48 @@ CONFIG = {
         },
         # add more venues aquí
     },
-    "triangular_routes": [],
+    "triangular_routes": [
+        {
+            "name": "usdt-btc-eth",
+            "venue": "binance",
+            "start_asset": "USDT",
+            "legs": [
+                {"pair": "BTC/USDT", "action": "BUY_BASE"},
+                {"pair": "ETH/BTC", "action": "BUY_BASE"},
+                {"pair": "ETH/USDT", "action": "SELL_BASE"},
+            ],
+        },
+        {
+            "name": "usdt-eth-btc",
+            "venue": "binance",
+            "start_asset": "USDT",
+            "legs": [
+                {"pair": "ETH/USDT", "action": "BUY_BASE"},
+                {"pair": "ETH/BTC", "action": "SELL_BASE"},
+                {"pair": "BTC/USDT", "action": "SELL_BASE"},
+            ],
+        },
+        {
+            "name": "usdt-btc-eth",
+            "venue": "bybit",
+            "start_asset": "USDT",
+            "legs": [
+                {"pair": "BTC/USDT", "action": "BUY_BASE"},
+                {"pair": "ETH/BTC", "action": "BUY_BASE"},
+                {"pair": "ETH/USDT", "action": "SELL_BASE"},
+            ],
+        },
+        {
+            "name": "usdt-eth-btc",
+            "venue": "bybit",
+            "start_asset": "USDT",
+            "legs": [
+                {"pair": "ETH/USDT", "action": "BUY_BASE"},
+                {"pair": "ETH/BTC", "action": "SELL_BASE"},
+                {"pair": "BTC/USDT", "action": "SELL_BASE"},
+            ],
+        },
+    ],
     "telegram": {
         "enabled": True,                 # poner False para pruebas sin enviar
         "bot_token_env": "TG_BOT_TOKEN",
@@ -404,6 +505,18 @@ CONFIG = {
     },
     "log_csv_path": str(Path(LOG_BASE_DIR) / "opportunities.csv"),
     "triangular_log_csv_path": str(Path(LOG_BASE_DIR) / "triangular_opportunities.csv"),
+    "market_rules": {
+        "binance": {
+            "BTC/USDT": {"min_notional": 10.0, "min_qty": 0.0001, "step_size": 0.000001},
+            "ETH/USDT": {"min_notional": 10.0, "min_qty": 0.001, "step_size": 0.0001},
+            "XRP/USDT": {"min_notional": 5.0, "min_qty": 1.0, "step_size": 0.1},
+        },
+        "bybit": {
+            "BTC/USDT": {"min_notional": 10.0, "min_qty": 0.0001, "step_size": 0.000001},
+            "ETH/USDT": {"min_notional": 10.0, "min_qty": 0.001, "step_size": 0.0001},
+            "XRP/USDT": {"min_notional": 5.0, "min_qty": 1.0, "step_size": 0.1},
+        },
+    },
 }
 
 DYNAMIC_THRESHOLD_PERCENT: float = float(CONFIG.get("threshold_percent", 0.0))
@@ -1817,6 +1930,7 @@ class Quote:
     depth: Optional[DepthInfo] = None
     checksum: Optional[str] = None
     source: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class FeeSchedule:
@@ -2128,6 +2242,177 @@ def build_trade_link_items(buy_venue: str, sell_venue: str, pair: str) -> List[D
         items.append({"label": f"Vender en {sell_venue.title()}", "url": sell_link})
     return items
 
+
+def is_strategy_enabled(name: str) -> bool:
+    strategies = CONFIG.get("strategies") or {}
+    return bool(strategies.get(name, False))
+
+
+def configured_p2p_pairs() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    venues_cfg = CONFIG.get("venues", {}) or {}
+    configured: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for venue, cfg in venues_cfg.items():
+        p2p_cfg = cfg.get("p2p") or {}
+        if not p2p_cfg.get("enabled", False):
+            continue
+        pairs_cfg = p2p_cfg.get("pairs") or {}
+        venue_pairs: Dict[str, Dict[str, Any]] = {}
+        for pair, pcfg in pairs_cfg.items():
+            if not pair:
+                continue
+            venue_pairs[pair.strip().upper()] = pcfg or {}
+        if venue_pairs:
+            configured[venue] = venue_pairs
+    return configured
+
+
+def market_rules_for(venue: str, pair: str) -> Dict[str, float]:
+    rules_cfg = CONFIG.get("market_rules") or {}
+    venue_rules = rules_cfg.get(venue) if isinstance(rules_cfg, dict) else None
+    if not isinstance(venue_rules, dict):
+        return {}
+    data = venue_rules.get(pair)
+    return data if isinstance(data, dict) else {}
+
+
+def validate_market_trade(
+    venue: str,
+    pair: str,
+    base_qty: float,
+    price: float,
+    tolerance: float = 1e-9,
+) -> Tuple[bool, str]:
+    rules = market_rules_for(venue, pair)
+    if not rules:
+        return True, ""
+
+    min_qty = float(rules.get("min_qty", 0.0) or 0.0)
+    if min_qty > 0 and base_qty + tolerance < min_qty:
+        return False, "min_notional"
+
+    min_notional = float(rules.get("min_notional", 0.0) or 0.0)
+    notional = base_qty * price
+    if min_notional > 0 and notional + tolerance < min_notional:
+        return False, "min_notional"
+
+    step_size = float(rules.get("step_size", 0.0) or 0.0)
+    if step_size > 0:
+        steps = round(base_qty / step_size)
+        aligned = steps * step_size
+        if abs(aligned - base_qty) > max(step_size * 1e-3, tolerance):
+            return False, "min_notional"
+
+    return True, ""
+
+
+def get_p2p_fee_percent(venue: str, asset: str) -> float:
+    p2p_cfg = CONFIG.get("venues", {}).get(venue, {}).get("p2p") or {}
+    fees_cfg = p2p_cfg.get("fees") or {}
+    default = float(fees_cfg.get("default_percent", fees_cfg.get("fee_percent", 0.0)) or 0.0)
+    per_asset = fees_cfg.get("per_asset_percent") or {}
+    try:
+        return float(per_asset.get(asset.upper(), default))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_p2p_min_notional(venue: str, asset: str) -> float:
+    p2p_cfg = CONFIG.get("venues", {}).get(venue, {}).get("p2p") or {}
+    min_cfg = p2p_cfg.get("min_notional_usdt") or {}
+    try:
+        return float(min_cfg.get(asset.upper(), 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_p2p_payment_filters(venue: str) -> List[str]:
+    p2p_cfg = CONFIG.get("venues", {}).get(venue, {}).get("p2p") or {}
+    filters = p2p_cfg.get("payment_methods") or []
+    return [f for f in filters if isinstance(f, str) and f]
+
+
+def validate_p2p_notional(venue: str, asset: str, quote_amount: float) -> Tuple[bool, str]:
+    min_notional = get_p2p_min_notional(venue, asset)
+    if min_notional > 0 and quote_amount < min_notional:
+        return False, "min_notional"
+    return True, ""
+
+
+def emit_p2p_log(
+    venue: str,
+    asset: str,
+    fiat: str,
+    side: str,
+    quote: Quote,
+    offers: int,
+    filters: Iterable[str],
+) -> None:
+    filters_label = ",".join(sorted(set(filters))) or "any"
+    price = quote.ask if side.upper() == "BUY" else quote.bid
+    print(
+        "[P2P] "
+        f"{asset}: venue={venue} fiat={fiat} offers={offers} side={side.upper()} "
+        f"filtros={filters_label} elegido={price:.6f}"
+    )
+
+
+def build_p2p_quote_index(
+    pair_quotes: Dict[str, Dict[str, Quote]],
+) -> Dict[str, Dict[str, Dict[str, Quote]]]:
+    index: Dict[str, Dict[str, Dict[str, Quote]]] = {}
+    for pair, venues in pair_quotes.items():
+        base, quote = split_pair(pair)
+        for venue, q in venues.items():
+            if str(getattr(q, "source", "")).lower() != "p2p":
+                continue
+            venue_entry = index.setdefault(venue, {})
+            fiat_entry = venue_entry.setdefault(quote, {})
+            fiat_entry[base] = q
+    return index
+
+
+def build_effective_p2p_quotes(
+    p2p_index: Dict[str, Dict[str, Dict[str, Quote]]],
+    stable_asset: str = DEFAULT_QUOTE_ASSET,
+) -> Dict[str, Dict[str, Quote]]:
+    effective: Dict[str, Dict[str, Quote]] = {}
+    for venue, fiat_map in p2p_index.items():
+        payment_filters = get_p2p_payment_filters(venue)
+        for fiat, assets in fiat_map.items():
+            stable_quote = assets.get(stable_asset)
+            if not stable_quote:
+                continue
+            stable_bid = max(stable_quote.bid, 1e-12)
+            stable_ask = max(stable_quote.ask, 1e-12)
+            offers_meta = stable_quote.metadata.get("offers", {})
+            offers_buy = int(offers_meta.get("BUY", 0)) if isinstance(offers_meta, dict) else 0
+            offers_sell = int(offers_meta.get("SELL", 0)) if isinstance(offers_meta, dict) else 0
+            emit_p2p_log(venue, stable_asset, fiat, "BUY", stable_quote, offers_buy, payment_filters)
+            emit_p2p_log(venue, stable_asset, fiat, "SELL", stable_quote, offers_sell, payment_filters)
+            for asset, quote in assets.items():
+                if asset == stable_asset:
+                    continue
+                bid = quote.bid / stable_ask if stable_ask > 0 else 0.0
+                ask = quote.ask / stable_bid if stable_bid > 0 else 0.0
+                ts = min(int(stable_quote.ts), int(quote.ts))
+                metadata = dict(quote.metadata)
+                metadata.update({"fiat": fiat, "source_pair": quote.symbol})
+                asset_quote = Quote(
+                    f"{asset}/{stable_asset}",
+                    bid,
+                    ask,
+                    ts,
+                    source="p2p_effective",
+                    metadata=metadata,
+                )
+                offers_meta = quote.metadata.get("offers", {}) if isinstance(quote.metadata, dict) else {}
+                offers_buy = int(offers_meta.get("BUY", 0)) if isinstance(offers_meta, dict) else 0
+                offers_sell = int(offers_meta.get("SELL", 0)) if isinstance(offers_meta, dict) else 0
+                emit_p2p_log(venue, asset, fiat, "BUY", quote, offers_buy, payment_filters)
+                emit_p2p_log(venue, asset, fiat, "SELL", quote, offers_sell, payment_filters)
+                effective.setdefault(asset, {})[venue] = asset_quote
+    return effective
+
 # =========================
 # Adapters de Exchanges
 # =========================
@@ -2361,6 +2646,8 @@ class Binance(ExchangeAdapter):
         rows = max(1, int(p2p_cfg.get("rows", 10)))
         merchant_types = p2p_cfg.get("merchant_types") or []
 
+        offers_info: Dict[str, int] = {}
+
         def _fetch_side(trade_type: str) -> Optional[float]:
             payload: Dict[str, Any] = {
                 "page": 1,
@@ -2398,6 +2685,7 @@ class Binance(ExchangeAdapter):
                 price = safe_float(price_str)
                 if price > 0:
                     prices.append(price)
+            offers_info[trade_type.upper()] = len(data)
             if not prices:
                 return None
             if trade_type.upper() == "BUY":
@@ -2412,7 +2700,13 @@ class Binance(ExchangeAdapter):
             return None
 
         symbol = self.normalize_symbol(pair)
-        return Quote(symbol, bid_price, ask_price, current_millis(), source="p2p")
+        metadata = {
+            "asset": asset,
+            "fiat": fiat,
+            "offers": offers_info,
+            "pay_types": pay_types,
+        }
+        return Quote(symbol, bid_price, ask_price, current_millis(), source="p2p", metadata=metadata)
 
 class Bybit(ExchangeAdapter):
     name = "bybit"
@@ -2518,6 +2812,8 @@ class Bybit(ExchangeAdapter):
         ask_side = str(cfg.get("ask_side", "1"))
         bid_side = str(cfg.get("bid_side", "0"))
 
+        offers_info: Dict[str, int] = {}
+
         def _fetch_side(side: str, prefer_min: bool) -> Optional[float]:
             payload: Dict[str, Any] = {
                 "userId": "",
@@ -2545,6 +2841,7 @@ class Bybit(ExchangeAdapter):
                 price = safe_float(item.get("price") if isinstance(item, dict) else None)
                 if price > 0:
                     prices.append(price)
+            offers_info[side.upper()] = len(items)
             if not prices:
                 return None
             return min(prices) if prefer_min else max(prices)
@@ -2557,7 +2854,12 @@ class Bybit(ExchangeAdapter):
             return None
 
         symbol = self.normalize_symbol(pair)
-        return Quote(symbol, bid_price, ask_price, current_millis(), source="p2p")
+        metadata = {
+            "asset": asset,
+            "fiat": fiat,
+            "offers": offers_info,
+        }
+        return Quote(symbol, bid_price, ask_price, current_millis(), source="p2p", metadata=metadata)
 
 class KuCoin(ExchangeAdapter):
     name = "kucoin"
@@ -2973,6 +3275,8 @@ class Opportunity:
     volatility_score: float = 0.0
     priority_score: float = 0.0
     confidence_label: str = "media"
+    strategy: str = "spot_spot"
+    notes: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -3266,9 +3570,123 @@ def compute_opportunities_for_pair(
                 net_percent=net_percent,
                 buy_depth=getattr(buy_quote, "depth", None),
                 sell_depth=getattr(sell_quote, "depth", None),
+                strategy="spot_spot",
             )
         )
 
+    return sorted(opportunities, key=lambda o: o.net_percent, reverse=True)
+
+
+def compute_spot_p2p_opportunities(
+    pair: str,
+    spot_quotes: Dict[str, Quote],
+    p2p_quotes: Dict[str, Quote],
+    fees: Dict[str, VenueFees],
+) -> List[Opportunity]:
+    opportunities: List[Opportunity] = []
+    base, _ = split_pair(pair)
+    asset = base.upper()
+    for spot_venue, spot_quote in spot_quotes.items():
+        fee_cfg = fees.get(spot_venue)
+        if not fee_cfg:
+            continue
+        buy_schedule = fee_cfg.schedule_for_pair(pair)
+        sell_schedule = fee_cfg.schedule_for_pair(pair)
+        spot_buy = apply_slippage(spot_quote.ask, buy_schedule.slippage_bps, "buy")
+        spot_sell = apply_slippage(spot_quote.bid, sell_schedule.slippage_bps, "sell")
+        if spot_buy <= 0 or spot_sell <= 0:
+            continue
+        for p2p_venue, p2p_quote in p2p_quotes.items():
+            buy_fee = buy_schedule.taker_fee_percent
+            sell_fee = sell_schedule.taker_fee_percent
+            p2p_fee = get_p2p_fee_percent(p2p_venue, asset)
+            p2p_bid = p2p_quote.bid
+            p2p_ask = p2p_quote.ask
+            if p2p_bid > 0:
+                gross = (p2p_bid - spot_buy) / spot_buy * 100.0
+                net = gross - buy_fee - p2p_fee
+                opportunities.append(
+                    Opportunity(
+                        pair=pair,
+                        buy_venue=spot_venue,
+                        sell_venue=f"{p2p_venue}_p2p",
+                        buy_price=spot_buy,
+                        sell_price=p2p_bid,
+                        gross_percent=gross,
+                        net_percent=net,
+                        buy_depth=getattr(spot_quote, "depth", None),
+                        sell_depth=None,
+                        strategy="spot_p2p",
+                        notes={
+                            "side": "spot_to_p2p",
+                            "p2p_fee_percent": p2p_fee,
+                            "p2p_venue": p2p_venue,
+                            "fiat": p2p_quote.metadata.get("fiat"),
+                        },
+                    )
+                )
+            if p2p_ask > 0:
+                gross = (spot_sell - p2p_ask) / p2p_ask * 100.0
+                net = gross - sell_fee - p2p_fee
+                opportunities.append(
+                    Opportunity(
+                        pair=pair,
+                        buy_venue=f"{p2p_venue}_p2p",
+                        sell_venue=spot_venue,
+                        buy_price=p2p_ask,
+                        sell_price=spot_sell,
+                        gross_percent=gross,
+                        net_percent=net,
+                        buy_depth=None,
+                        sell_depth=getattr(spot_quote, "depth", None),
+                        strategy="spot_p2p",
+                        notes={
+                            "side": "p2p_to_spot",
+                            "p2p_fee_percent": p2p_fee,
+                            "p2p_venue": p2p_venue,
+                            "fiat": p2p_quote.metadata.get("fiat"),
+                        },
+                    )
+                )
+    return sorted(opportunities, key=lambda o: o.net_percent, reverse=True)
+
+
+def compute_p2p_cross_opportunities(
+    pair: str,
+    quotes: Dict[str, Quote],
+) -> List[Opportunity]:
+    base, _ = split_pair(pair)
+    opportunities: List[Opportunity] = []
+    venues = list(quotes.keys())
+    for buy_v, sell_v in itertools.permutations(venues, 2):
+        buy_quote = quotes.get(buy_v)
+        sell_quote = quotes.get(sell_v)
+        if not buy_quote or not sell_quote:
+            continue
+        buy_price = buy_quote.ask
+        sell_price = sell_quote.bid
+        if buy_price <= 0 or sell_price <= 0:
+            continue
+        buy_fee = get_p2p_fee_percent(buy_v, base)
+        sell_fee = get_p2p_fee_percent(sell_v, base)
+        gross_percent = (sell_price - buy_price) / buy_price * 100.0
+        net_percent = gross_percent - buy_fee - sell_fee
+        opportunities.append(
+            Opportunity(
+                pair=pair,
+                buy_venue=f"{buy_v}_p2p",
+                sell_venue=f"{sell_v}_p2p",
+                buy_price=buy_price,
+                sell_price=sell_price,
+                gross_percent=gross_percent,
+                net_percent=net_percent,
+                strategy="p2p_p2p",
+                notes={
+                    "p2p_buy_fee_percent": buy_fee,
+                    "p2p_sell_fee_percent": sell_fee,
+                },
+            )
+        )
     return sorted(opportunities, key=lambda o: o.net_percent, reverse=True)
 
 
@@ -3564,6 +3982,14 @@ def format_percent_comma(value: float) -> str:
     return f"{format_decimal_comma(value, decimals=2)}%"
 
 
+def format_venue_label(venue: str) -> str:
+    normalized = venue.strip()
+    if normalized.lower().endswith("_p2p"):
+        base = normalized[:-4]
+        return f"{base.upper()} P2P"
+    return normalized.upper()
+
+
 def fmt_alert(
     opp: Opportunity,
     est_profit: float,
@@ -3573,11 +3999,19 @@ def fmt_alert(
     capital_used: float,
     links: Optional[List[Dict[str, str]]] = None,
 ) -> str:
-    buy_label = opp.buy_venue.upper()
-    sell_label = opp.sell_venue.upper()
+    strategy = getattr(opp, "strategy", "spot_spot")
+    if strategy == "spot_p2p":
+        title = "🚨 *Arbitraje spot↔P2P*"
+    elif strategy == "p2p_p2p":
+        title = "🚨 *Arbitraje P2P↔P2P*"
+    else:
+        title = "🚨 *Arbitraje spot detectado*"
+
+    buy_label = format_venue_label(opp.buy_venue)
+    sell_label = format_venue_label(opp.sell_venue)
 
     lines = [
-        "🚨 *Arbitraje spot detectado*",
+        title,
         f"*Par:* `{opp.pair}`",
         f"*Ruta:* Comprar en *{buy_label}* a `{opp.buy_price:.6f}` · Vender en *{sell_label}* a `{opp.sell_price:.6f}`",
         f"*Spreads:* bruto `{format_percent_comma(opp.gross_percent)}` · neto `{format_percent_comma(opp.net_percent)}`",
@@ -3587,8 +4021,19 @@ def fmt_alert(
             f"(`{format_percent_comma(est_percent)}`) sobre {format_decimal_comma(capital_quote, decimals=2)} USDT"
         ),
         f"*Cantidad base:* `{base_qty:.6f}` ({format_decimal_comma(capital_used, decimals=2)} USDT usados)",
-        time.strftime("%Y-%m-%d %H:%M:%S"),
     ]
+    fiat = opp.notes.get("fiat") if isinstance(opp.notes, dict) else None
+    if fiat:
+        lines.append(f"*Fiat P2P:* `{fiat}`")
+    transfer_cost = opp.notes.get("transfer_cost_quote") if isinstance(opp.notes, dict) else None
+    transfer_minutes = opp.notes.get("transfer_minutes") if isinstance(opp.notes, dict) else None
+    if transfer_cost:
+        eta = f" · ETA `{transfer_minutes:.1f}m`" if transfer_minutes is not None else ""
+        lines.append(
+            "*Transferencia estimada:* `"
+            f"{format_decimal_comma(float(transfer_cost), decimals=2)} USDT`{eta}"
+        )
+    lines.append(time.strftime("%Y-%m-%d %H:%M:%S"))
     return "\n".join(lines)
 
 
@@ -3661,7 +4106,9 @@ def run_once() -> None:
     routes = load_triangular_routes()
     pairs = normalize_pair_list(CONFIG["pairs"])
     extra_pairs = {leg.pair for route in routes for leg in route.legs}
-    all_pairs = sorted(set(pairs) | extra_pairs)
+    p2p_pairs_cfg = configured_p2p_pairs()
+    p2p_pairs = sorted({pair for venue_pairs in p2p_pairs_cfg.values() for pair in venue_pairs})
+    all_pairs = sorted(set(pairs) | extra_pairs | set(p2p_pairs))
     base_threshold = float(CONFIG.get("threshold_percent", 0.0))
     capital = float(CONFIG["simulation_capital_quote"])
     log_csv = CONFIG["log_csv_path"]
@@ -3671,6 +4118,7 @@ def run_once() -> None:
     pair_weight_cfg = CONFIG.get("capital_weights", {}).get("pairs", {})
     triangle_weight_cfg = CONFIG.get("capital_weights", {}).get("triangles", {})
     fee_map = build_fee_map(all_pairs)
+    transfers = build_transfer_profiles()
     summary_opps: List[Dict[str, Any]] = []
     alert_records: List[Dict[str, Any]] = []
     run_ts = int(time.time())
@@ -3694,45 +4142,100 @@ def run_once() -> None:
         venues_available = sorted(pair_quotes.get(pair, {}).keys())
         emit_pair_coverage(pair, venues_available)
 
-    alerts = 0
-    for pair in pairs:
-        quotes = pair_quotes.get(pair, {})
-        if len(quotes) < 2:
-            available = sorted(quotes.keys())
-            print(
-                "[SKIP] "
-                f"{pair}: solo {available} tiene spot; se necesitan 2 venues. "
-                "Sugerencia: BTC/USDT, ETH/USDT, XRP/USDT."
-            )
-            continue
-        capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
-        if capital_for_pair <= 0:
-            continue
-        opps = compute_opportunities_for_pair(pair, quotes, fee_map)
-        for opp in opps[:5]:
-            fee_buy = fee_map.get(opp.buy_venue)
-            fee_sell = fee_map.get(opp.sell_venue)
-            if not fee_buy or not fee_sell:
-                continue
-            buy_schedule = fee_buy.schedule_for_pair(pair)
-            sell_schedule = fee_sell.schedule_for_pair(pair)
-            total_fee_pct = buy_schedule.taker_fee_percent + sell_schedule.taker_fee_percent
-            depth_volumes = [
-                v
-                for v in (
-                    _available_depth_qty(opp.buy_depth, "buy"),
-                    _available_depth_qty(opp.sell_depth, "sell"),
+    p2p_index = build_p2p_quote_index(pair_quotes)
+    effective_p2p_quotes: Dict[str, Dict[str, Quote]] = {}
+    if (is_strategy_enabled("spot_p2p") or is_strategy_enabled("p2p_p2p")) and p2p_index:
+        effective_p2p_quotes = build_effective_p2p_quotes(p2p_index)
+
+    spot_alerts = 0
+    if is_strategy_enabled("spot_spot"):
+        for pair in pairs:
+            quotes = pair_quotes.get(pair, {})
+            if len(quotes) < 2:
+                available = sorted(quotes.keys())
+                print(
+                    "[SKIP] "
+                    f"{pair}: solo {available} tiene spot; se necesitan 2 venues. "
+                    "Sugerencia: BTC/USDT, ETH/USDT, XRP/USDT."
                 )
-                if v > 0
-            ]
-            max_depth_qty = min(depth_volumes) if len(depth_volumes) == 2 else None
-            est_profit, est_percent, base_qty, capital_used = estimate_profit(
-                capital_for_pair,
-                opp.buy_price,
-                opp.sell_price,
-                total_fee_pct,
-                max_base_qty=max_depth_qty,
-            )
+                continue
+            capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
+            if capital_for_pair <= 0:
+                continue
+            opps = compute_opportunities_for_pair(pair, quotes, fee_map)
+            for opp in opps[:5]:
+                fee_buy = fee_map.get(opp.buy_venue)
+                fee_sell = fee_map.get(opp.sell_venue)
+                if not fee_buy or not fee_sell:
+                    continue
+                buy_schedule = fee_buy.schedule_for_pair(pair)
+                sell_schedule = fee_sell.schedule_for_pair(pair)
+                total_fee_pct = buy_schedule.taker_fee_percent + sell_schedule.taker_fee_percent
+                depth_volumes = [
+                    v
+                    for v in (
+                        _available_depth_qty(opp.buy_depth, "buy"),
+                        _available_depth_qty(opp.sell_depth, "sell"),
+                    )
+                    if v > 0
+                ]
+                max_depth_qty = min(depth_volumes) if len(depth_volumes) == 2 else None
+                est_profit, est_percent, base_qty, capital_used = estimate_profit(
+                    capital_for_pair,
+                    opp.buy_price,
+                    opp.sell_price,
+                    total_fee_pct,
+                    max_base_qty=max_depth_qty,
+                )
+                if base_qty <= 0 or capital_used <= 0:
+                    continue
+                valid_buy, reason_buy = validate_market_trade(
+                    opp.buy_venue, opp.pair, base_qty, opp.buy_price
+                )
+                if not valid_buy:
+                    print(
+                        f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} {reason_buy}"
+                    )
+                    continue
+                valid_sell, reason_sell = validate_market_trade(
+                    opp.sell_venue, opp.pair, base_qty, opp.sell_price
+                )
+                if not valid_sell:
+                    print(
+                        f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} {reason_sell}"
+                    )
+                    continue
+                transfer_est = estimate_round_trip_transfer_cost(
+                    opp.pair,
+                    opp.buy_venue,
+                    opp.sell_venue,
+                    base_qty,
+                    opp.sell_price,
+                    transfers,
+                )
+                est_profit_net = est_profit - transfer_est.total_cost_quote
+                if est_profit_net <= 0:
+                    print(
+                        f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} transfer_fee/ETA"
+                    )
+                    continue
+                effective_net_percent = (
+                    (est_profit_net / capital_used) * 100.0 if capital_used > 0 else 0.0
+                )
+                if effective_net_percent < threshold:
+                    print(
+                        f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} transfer_fee/ETA"
+                    )
+                    continue
+                opp.net_percent = effective_net_percent
+                opp.notes.update(
+                    {
+                        "transfer_cost_quote": transfer_est.total_cost_quote,
+                        "transfer_minutes": transfer_est.total_minutes,
+                    }
+                )
+                est_profit = est_profit_net
+                est_percent = effective_net_percent
 
             liquidity_score = compute_liquidity_score(opp, base_qty)
             volatility_score = compute_volatility_score(pair)
@@ -3770,10 +4273,14 @@ def run_once() -> None:
                 "volatility_score": volatility_score,
                 "priority_score": priority_score,
                 "confidence": confidence_label,
-                "threshold_hit": opp.net_percent >= threshold,
+                "threshold_hit": est_percent >= threshold,
+                "transfer_cost_quote": transfer_est.total_cost_quote,
+                "transfer_minutes": transfer_est.total_minutes,
+                "strategy": opp.strategy,
+                "notes": opp.notes,
             }
             summary_opps.append(entry)
-            if opp.net_percent >= threshold:
+            if est_percent >= threshold:
                 append_csv(
                     log_csv,
                     opp,
@@ -3801,7 +4308,257 @@ def run_once() -> None:
                     net_percent=opp.net_percent,
                     est_profit=est_profit,
                 )
-                alerts += 1
+                spot_alerts += 1
+                alert_entry = dict(entry)
+                alert_entry["ts"] = int(time.time())
+                alert_entry["ts_str"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(alert_entry["ts"]))
+                alert_records.append(alert_entry)
+
+    spot_p2p_alerts = 0
+    if is_strategy_enabled("spot_p2p"):
+        for pair in pairs:
+            asset, _ = split_pair(pair)
+            p2p_asset_quotes = effective_p2p_quotes.get(asset)
+            if not p2p_asset_quotes:
+                print(f"[SKIP] {pair}: p2p_sin_ofertas")
+                continue
+            spot_quotes = {
+                venue: quote
+                for venue, quote in pair_quotes.get(pair, {}).items()
+                if str(getattr(quote, "source", "")).lower() != "p2p"
+            }
+            if not spot_quotes:
+                continue
+            capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
+            if capital_for_pair <= 0:
+                continue
+            opps = compute_spot_p2p_opportunities(pair, spot_quotes, p2p_asset_quotes, fee_map)
+            for opp in opps[:5]:
+                side = opp.notes.get("side")
+                p2p_venue = str(opp.notes.get("p2p_venue") or "")
+                p2p_fee = float(opp.notes.get("p2p_fee_percent", 0.0) or 0.0)
+                fiat = opp.notes.get("fiat")
+                if side == "spot_to_p2p":
+                    spot_venue = opp.buy_venue
+                    spot_fee_cfg = fee_map.get(spot_venue)
+                    if not spot_fee_cfg:
+                        continue
+                    buy_schedule = spot_fee_cfg.schedule_for_pair(pair)
+                    adjusted_sell = opp.sell_price * (1 - p2p_fee / 100.0)
+                    est_profit, est_percent, base_qty, capital_used = estimate_profit(
+                        capital_for_pair,
+                        opp.buy_price,
+                        adjusted_sell,
+                        buy_schedule.taker_fee_percent,
+                    )
+                    if base_qty <= 0 or capital_used <= 0:
+                        continue
+                    valid_spot, reason = validate_market_trade(spot_venue, pair, base_qty, opp.buy_price)
+                    if not valid_spot:
+                        print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason}")
+                        continue
+                    notional = base_qty * opp.sell_price
+                    valid_p2p, reason_p2p = validate_p2p_notional(p2p_venue, asset, notional)
+                    if not valid_p2p:
+                        print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason_p2p}")
+                        continue
+                else:
+                    spot_venue = opp.sell_venue
+                    spot_fee_cfg = fee_map.get(spot_venue)
+                    if not spot_fee_cfg:
+                        continue
+                    sell_schedule = spot_fee_cfg.schedule_for_pair(pair)
+                    adjusted_buy = opp.buy_price * (1 + p2p_fee / 100.0)
+                    est_profit, est_percent, base_qty, capital_used = estimate_profit(
+                        capital_for_pair,
+                        adjusted_buy,
+                        opp.sell_price,
+                        sell_schedule.taker_fee_percent,
+                    )
+                    if base_qty <= 0 or capital_used <= 0:
+                        continue
+                    valid_spot, reason = validate_market_trade(spot_venue, pair, base_qty, opp.sell_price)
+                    if not valid_spot:
+                        print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason}")
+                        continue
+                    notional = base_qty * opp.buy_price
+                    valid_p2p, reason_p2p = validate_p2p_notional(p2p_venue, asset, notional)
+                    if not valid_p2p:
+                        print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason_p2p}")
+                        continue
+                if est_percent < threshold:
+                    continue
+                opp.net_percent = est_percent
+                opp.notes.setdefault("fiat", fiat)
+                liquidity_score = compute_liquidity_score(opp, base_qty)
+                volatility_score = compute_volatility_score(pair)
+                priority_score = compute_priority_score(est_percent, liquidity_score, volatility_score)
+                confidence_label = classify_confidence(
+                    est_percent, threshold, liquidity_score, volatility_score, priority_score
+                )
+                opp.liquidity_score = liquidity_score
+                opp.volatility_score = volatility_score
+                opp.priority_score = priority_score
+                opp.confidence_label = confidence_label
+                link_items = build_trade_link_items(opp.buy_venue, opp.sell_venue, opp.pair)
+                entry = {
+                    "pair": opp.pair,
+                    "buy_venue": opp.buy_venue,
+                    "sell_venue": opp.sell_venue,
+                    "buy_price": opp.buy_price,
+                    "sell_price": opp.sell_price,
+                    "gross_percent": opp.gross_percent,
+                    "net_percent": est_percent,
+                    "est_profit_quote": est_profit,
+                    "est_percent": est_percent,
+                    "base_qty": base_qty,
+                    "capital_used_quote": capital_used,
+                    "links": link_items,
+                    "liquidity_score": liquidity_score,
+                    "volatility_score": volatility_score,
+                    "priority_score": priority_score,
+                    "confidence": confidence_label,
+                    "threshold_hit": True,
+                    "strategy": opp.strategy,
+                    "notes": opp.notes,
+                }
+                summary_opps.append(entry)
+                append_csv(
+                    log_csv,
+                    opp,
+                    est_profit,
+                    base_qty,
+                    capital_used,
+                    opp.buy_depth,
+                    opp.sell_depth,
+                )
+                msg = fmt_alert(
+                    opp,
+                    est_profit,
+                    est_percent,
+                    base_qty,
+                    capital_for_pair,
+                    capital_used,
+                    link_items,
+                )
+                tg_send_message(msg, enabled=tg_enabled)
+                log_event(
+                    "opportunity.alert",
+                    pair=opp.pair,
+                    buy_venue=opp.buy_venue,
+                    sell_venue=opp.sell_venue,
+                    net_percent=est_percent,
+                    est_profit=est_profit,
+                )
+                spot_p2p_alerts += 1
+                alert_entry = dict(entry)
+                alert_entry["ts"] = int(time.time())
+                alert_entry["ts_str"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(alert_entry["ts"]))
+                alert_records.append(alert_entry)
+
+    p2p_cross_alerts = 0
+    if is_strategy_enabled("p2p_p2p"):
+        for pair in p2p_pairs:
+            quotes = {
+                venue: quote
+                for venue, quote in pair_quotes.get(pair, {}).items()
+                if str(getattr(quote, "source", "")).lower() == "p2p"
+            }
+            if len(quotes) < 2:
+                print(f"[SKIP] {pair}: p2p_sin_ofertas")
+                continue
+            capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
+            if capital_for_pair <= 0:
+                continue
+            opps = compute_p2p_cross_opportunities(pair, quotes)
+            asset, _ = split_pair(pair)
+            for opp in opps[:5]:
+                buy_fee = float(opp.notes.get("p2p_buy_fee_percent", 0.0) or 0.0)
+                sell_fee = float(opp.notes.get("p2p_sell_fee_percent", 0.0) or 0.0)
+                adjusted_buy = opp.buy_price * (1 + buy_fee / 100.0)
+                adjusted_sell = opp.sell_price * (1 - sell_fee / 100.0)
+                est_profit, est_percent, base_qty, capital_used = estimate_profit(
+                    capital_for_pair,
+                    adjusted_buy,
+                    adjusted_sell,
+                    0.0,
+                )
+                if base_qty <= 0 or capital_used <= 0:
+                    continue
+                notional_buy = base_qty * opp.buy_price
+                valid_buy, reason_buy = validate_p2p_notional(opp.buy_venue.replace("_p2p", ""), asset, notional_buy)
+                if not valid_buy:
+                    print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason_buy}")
+                    continue
+                notional_sell = base_qty * opp.sell_price
+                valid_sell, reason_sell = validate_p2p_notional(opp.sell_venue.replace("_p2p", ""), asset, notional_sell)
+                if not valid_sell:
+                    print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason_sell}")
+                    continue
+                if est_percent < threshold:
+                    continue
+                opp.net_percent = est_percent
+                liquidity_score = 0.0
+                volatility_score = compute_volatility_score(pair)
+                priority_score = compute_priority_score(est_percent, liquidity_score, volatility_score)
+                confidence_label = classify_confidence(
+                    est_percent, threshold, liquidity_score, volatility_score, priority_score
+                )
+                opp.liquidity_score = liquidity_score
+                opp.volatility_score = volatility_score
+                opp.priority_score = priority_score
+                opp.confidence_label = confidence_label
+                link_items = build_trade_link_items(opp.buy_venue, opp.sell_venue, opp.pair)
+                entry = {
+                    "pair": opp.pair,
+                    "buy_venue": opp.buy_venue,
+                    "sell_venue": opp.sell_venue,
+                    "buy_price": opp.buy_price,
+                    "sell_price": opp.sell_price,
+                    "gross_percent": opp.gross_percent,
+                    "net_percent": est_percent,
+                    "est_profit_quote": est_profit,
+                    "est_percent": est_percent,
+                    "base_qty": base_qty,
+                    "capital_used_quote": capital_used,
+                    "links": link_items,
+                    "liquidity_score": liquidity_score,
+                    "volatility_score": volatility_score,
+                    "priority_score": priority_score,
+                    "confidence": confidence_label,
+                    "threshold_hit": True,
+                    "strategy": opp.strategy,
+                    "notes": opp.notes,
+                }
+                summary_opps.append(entry)
+                append_csv(
+                    log_csv,
+                    opp,
+                    est_profit,
+                    base_qty,
+                    capital_used,
+                    None,
+                    None,
+                )
+                msg = fmt_alert(
+                    opp,
+                    est_profit,
+                    est_percent,
+                    base_qty,
+                    capital_for_pair,
+                    capital_used,
+                    link_items,
+                )
+                tg_send_message(msg, enabled=tg_enabled)
+                log_event(
+                    "opportunity.alert",
+                    pair=opp.pair,
+                    buy_venue=opp.buy_venue,
+                    sell_venue=opp.sell_venue,
+                    net_percent=est_percent,
+                    est_profit=est_profit,
+                )
+                p2p_cross_alerts += 1
                 alert_entry = dict(entry)
                 alert_entry["ts"] = int(time.time())
                 alert_entry["ts_str"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(alert_entry["ts"]))
@@ -3831,6 +4588,8 @@ def run_once() -> None:
     total_latency_ms = int((time.time() - run_start) * 1000)
     metrics_data = metrics_snapshot()
 
+    total_alerts = spot_alerts + spot_p2p_alerts + p2p_cross_alerts
+
     summary = {
         "ts": run_ts,
         "ts_str": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(run_ts)),
@@ -3840,7 +4599,9 @@ def run_once() -> None:
         "capital": capital,
         "pairs": pairs,
         "opportunities": summary_opps,
-        "alerts_sent": alerts,
+        "alerts_sent": total_alerts,
+        "alerts_spot": spot_alerts,
+        "alerts_p2p": spot_p2p_alerts + p2p_cross_alerts,
         "triangular_alerts": tri_alerts,
         "quote_latency_ms": quote_latency_ms,
         "run_latency_ms": total_latency_ms,
@@ -3872,7 +4633,7 @@ def run_once() -> None:
 
     print(
         "Run complete. Oportunidades enviadas: "
-        f"{alerts} (cross) / {tri_alerts} (triangulares)"
+        f"{spot_alerts} (spot) / {spot_p2p_alerts + p2p_cross_alerts} (p2p) / {tri_alerts} (triangulares)"
         f" · latencia total {total_latency_ms} ms"
     )
 
