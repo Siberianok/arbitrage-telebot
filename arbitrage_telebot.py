@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from statistics import StatisticsError, mean, pstdev
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
 
 import requests
 
@@ -166,6 +166,7 @@ CONFIG = {
         "BTC/USDT",
         "ETH/USDT",
         "XRP/USDT",
+        "SOL/USDT",
     ],
     "simulation_capital_quote": 10_000,  # capital (USDT) para estimar PnL en alerta
     "max_quote_age_seconds": 12,  # descarta cotizaciones más viejas que este límite
@@ -175,6 +176,7 @@ CONFIG = {
             "BTC/USDT": 1.5,
             "ETH/USDT": 1.2,
             "XRP/USDT": 1.1,
+            "SOL/USDT": 1.1,
         },
         "triangles": {
             "default": 0.6,
@@ -191,6 +193,7 @@ CONFIG = {
         "BTC/USDT": {"bid": 30050.0, "ask": 30060.0},
         "ETH/USDT": {"bid": 1800.0, "ask": 1801.5},
         "XRP/USDT": {"bid": 0.52, "ask": 0.521},
+        "SOL/USDT": {"bid": 22.4, "ask": 22.45},
     },
     "test_mode": {
         "enabled": False,
@@ -213,6 +216,11 @@ CONFIG = {
                         "ask": 0.520,
                         "source": "spot-test",
                     },
+                    "SOL/USDT": {
+                        "bid": 22.35,
+                        "ask": 22.4,
+                        "source": "spot-test",
+                    },
                 }
             },
             "bybit": {
@@ -230,6 +238,11 @@ CONFIG = {
                     "XRP/USDT": {
                         "bid": 0.521,
                         "ask": 0.522,
+                        "source": "spot-test",
+                    },
+                    "SOL/USDT": {
+                        "bid": 22.5,
+                        "ask": 22.58,
                         "source": "spot-test",
                     },
                 }
@@ -251,6 +264,7 @@ CONFIG = {
                     "BTC/USDT": {"taker": 0.10, "slippage_bps": 0.8},
                     "ETH/USDT": {"taker": 0.10, "slippage_bps": 1.2},
                     "XRP/USDT": {"taker": 0.10, "slippage_bps": 2.0},
+                    "SOL/USDT": {"taker": 0.10, "slippage_bps": 1.5},
                 },
                 "vip_level": "VIP0",
                 "vip_multipliers": {
@@ -275,6 +289,7 @@ CONFIG = {
                         "ETH": 0.95,
                         "XRP": 0.90,
                         "USDT": 0.70,
+                        "SOL": 0.90,
                     },
                 },
                 "min_notional_usdt": {
@@ -282,6 +297,7 @@ CONFIG = {
                     "ETH": 150.0,
                     "XRP": 80.0,
                     "USDT": 50.0,
+                    "SOL": 60.0,
                 },
                 "payment_methods": ["BANK_TRANSFER"],
                 "pairs": {
@@ -305,6 +321,36 @@ CONFIG = {
                         "fiat": "USD",
                         "pay_types": [],
                     },
+                    "SOL/USD": {
+                        "asset": "SOL",
+                        "fiat": "USD",
+                        "pay_types": [],
+                    },
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "pay_types": [],
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "pay_types": [],
+                    },
+                    "ETH/ARS": {
+                        "asset": "ETH",
+                        "fiat": "ARS",
+                        "pay_types": [],
+                    },
+                    "XRP/ARS": {
+                        "asset": "XRP",
+                        "fiat": "ARS",
+                        "pay_types": [],
+                    },
+                    "SOL/ARS": {
+                        "asset": "SOL",
+                        "fiat": "ARS",
+                        "pay_types": [],
+                    },
                 },
             },
             "transfers": {
@@ -323,6 +369,12 @@ CONFIG = {
                 "USDT": {
                     "withdraw_fee": 1.0,
                     "withdraw_minutes": 15,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 5,
+                },
+                "SOL": {
+                    "withdraw_fee": 0.01,
+                    "withdraw_minutes": 12,
                     "deposit_fee": 0.0,
                     "deposit_minutes": 5,
                 },
@@ -356,6 +408,7 @@ CONFIG = {
                 "per_pair": {
                     "ETH/USDT": {"taker": 0.10, "slippage_bps": 1.5},
                     "XRP/USDT": {"taker": 0.10, "slippage_bps": 2.5},
+                    "SOL/USDT": {"taker": 0.10, "slippage_bps": 1.8},
                 },
                 "vip_level": "VIP0",
                 "vip_multipliers": {
@@ -375,6 +428,7 @@ CONFIG = {
                         "ETH": 1.00,
                         "USDT": 0.75,
                         "XRP": 0.95,
+                        "SOL": 0.98,
                     },
                 },
                 "min_notional_usdt": {
@@ -382,6 +436,7 @@ CONFIG = {
                     "ETH": 120.0,
                     "USDT": 40.0,
                     "XRP": 60.0,
+                    "SOL": 55.0,
                 },
                 "payment_methods": ["BANK_TRANSFER"],
                 "pairs": {
@@ -409,6 +464,42 @@ CONFIG = {
                         "ask_side": "1",
                         "bid_side": "0",
                     },
+                    "SOL/USD": {
+                        "asset": "SOL",
+                        "fiat": "USD",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
+                    "ETH/ARS": {
+                        "asset": "ETH",
+                        "fiat": "ARS",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
+                    "XRP/ARS": {
+                        "asset": "XRP",
+                        "fiat": "ARS",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
+                    "SOL/ARS": {
+                        "asset": "SOL",
+                        "fiat": "ARS",
+                        "ask_side": "1",
+                        "bid_side": "0",
+                    },
                 },
             },
             "transfers": {
@@ -430,6 +521,12 @@ CONFIG = {
                     "deposit_fee": 0.0,
                     "deposit_minutes": 8,
                 },
+                "SOL": {
+                    "withdraw_fee": 0.012,
+                    "withdraw_minutes": 18,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 7,
+                },
             },
             "endpoints": {
                 "ticker": {
@@ -445,6 +542,423 @@ CONFIG = {
                         "https://api2.bybit.com/v5/market/orderbook",
                         "https://api.bytick.com/v5/market/orderbook",
                     ],
+                },
+            },
+        },
+        "feewin": {
+            "enabled": True,
+            "adapter": "generic_p2p",
+            "taker_fee_percent": 0.20,
+            "fees": {
+                "default": {
+                    "taker": 0.20,
+                    "maker": 0.20,
+                    "slippage_bps": 15.0,
+                }
+            },
+            "trade_links": {
+                "default": "https://feewin.com/otc?asset={base}&fiat={quote}",
+            },
+            "p2p": {
+                "enabled": True,
+                "endpoint": "https://api.feewin.com/v1/otc/rates",
+                "method": "GET",
+                "data_path": ["data"],
+                "bid_path": ["{asset}", "{fiat}", "sell"],
+                "ask_path": ["{asset}", "{fiat}", "buy"],
+                "invert_sides": True,
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 565.0, "ask": 575.0},
+                    },
+                    "USDT/USD": {
+                        "asset": "USDT",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.995, "ask": 1.005},
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 16200000.0, "ask": 16650000.0},
+                    },
+                    "BTC/USD": {
+                        "asset": "BTC",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 30100.0, "ask": 30400.0},
+                    },
+                    "ETH/ARS": {
+                        "asset": "ETH",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 1025000.0, "ask": 1055000.0},
+                    },
+                    "ETH/USD": {
+                        "asset": "ETH",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 1825.0, "ask": 1845.0},
+                    },
+                    "XRP/ARS": {
+                        "asset": "XRP",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 285.0, "ask": 296.0},
+                    },
+                    "XRP/USD": {
+                        "asset": "XRP",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.53, "ask": 0.55},
+                    },
+                    "SOL/ARS": {
+                        "asset": "SOL",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 12500.0, "ask": 13000.0},
+                    },
+                    "SOL/USD": {
+                        "asset": "SOL",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 22.6, "ask": 23.0},
+                    },
+                },
+            },
+            "transfers": {
+                "USDT": {
+                    "withdraw_fee": 1.0,
+                    "withdraw_minutes": 25,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 20,
+                },
+                "USD": {
+                    "withdraw_fee": 5.0,
+                    "withdraw_minutes": 60,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 45,
+                },
+            },
+        },
+        "tiendacrypto": {
+            "enabled": True,
+            "adapter": "generic_p2p",
+            "taker_fee_percent": 0.25,
+            "fees": {
+                "default": {
+                    "taker": 0.25,
+                    "maker": 0.20,
+                    "slippage_bps": 20.0,
+                }
+            },
+            "trade_links": {
+                "default": "https://tiendacrypto.com/otc?asset={base}&fiat={quote}",
+            },
+            "p2p": {
+                "enabled": True,
+                "endpoint": "https://api.tiendacrypto.com/v1/rates",
+                "method": "GET",
+                "data_path": ["rates"],
+                "bid_path": ["{asset}", "{fiat}", "bid"],
+                "ask_path": ["{asset}", "{fiat}", "ask"],
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 562.0, "ask": 578.0},
+                    },
+                    "USDT/USD": {
+                        "asset": "USDT",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.994, "ask": 1.006},
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 16150000.0, "ask": 16700000.0},
+                    },
+                    "BTC/USD": {
+                        "asset": "BTC",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 30080.0, "ask": 30450.0},
+                    },
+                    "ETH/ARS": {
+                        "asset": "ETH",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 1018000.0, "ask": 1060000.0},
+                    },
+                    "ETH/USD": {
+                        "asset": "ETH",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 1818.0, "ask": 1850.0},
+                    },
+                    "XRP/ARS": {
+                        "asset": "XRP",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 282.0, "ask": 297.0},
+                    },
+                    "XRP/USD": {
+                        "asset": "XRP",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.52, "ask": 0.545},
+                    },
+                    "SOL/ARS": {
+                        "asset": "SOL",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 12450.0, "ask": 13100.0},
+                    },
+                    "SOL/USD": {
+                        "asset": "SOL",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 22.5, "ask": 23.1},
+                    },
+                },
+            },
+            "transfers": {
+                "USDT": {
+                    "withdraw_fee": 1.5,
+                    "withdraw_minutes": 35,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 25,
+                },
+                "USD": {
+                    "withdraw_fee": 7.0,
+                    "withdraw_minutes": 70,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 45,
+                },
+            },
+        },
+        "onebit": {
+            "enabled": True,
+            "adapter": "generic_p2p",
+            "taker_fee_percent": 0.22,
+            "fees": {
+                "default": {
+                    "taker": 0.22,
+                    "maker": 0.18,
+                    "slippage_bps": 18.0,
+                }
+            },
+            "trade_links": {
+                "default": "https://onebit.com/p2p?asset={base}&fiat={quote}",
+            },
+            "p2p": {
+                "enabled": True,
+                "endpoint": "https://api.onebit.com/v2/p2p/rates",
+                "method": "GET",
+                "data_path": ["quotes"],
+                "bid_path": ["{asset}", "{fiat}", "sell"],
+                "ask_path": ["{asset}", "{fiat}", "buy"],
+                "invert_sides": True,
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 568.0, "ask": 582.0},
+                    },
+                    "USDT/USD": {
+                        "asset": "USDT",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.996, "ask": 1.004},
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 16280000.0, "ask": 16780000.0},
+                    },
+                    "BTC/USD": {
+                        "asset": "BTC",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 30150.0, "ask": 30520.0},
+                    },
+                    "ETH/ARS": {
+                        "asset": "ETH",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 1029000.0, "ask": 1068000.0},
+                    },
+                    "ETH/USD": {
+                        "asset": "ETH",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 1822.0, "ask": 1852.0},
+                    },
+                    "XRP/ARS": {
+                        "asset": "XRP",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 286.0, "ask": 298.0},
+                    },
+                    "XRP/USD": {
+                        "asset": "XRP",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.531, "ask": 0.548},
+                    },
+                    "SOL/ARS": {
+                        "asset": "SOL",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 12560.0, "ask": 13150.0},
+                    },
+                    "SOL/USD": {
+                        "asset": "SOL",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 22.7, "ask": 23.15},
+                    },
+                },
+            },
+            "transfers": {
+                "USDT": {
+                    "withdraw_fee": 1.2,
+                    "withdraw_minutes": 30,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 25,
+                },
+                "USD": {
+                    "withdraw_fee": 6.0,
+                    "withdraw_minutes": 65,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 40,
+                },
+            },
+        },
+        "ripio": {
+            "enabled": True,
+            "adapter": "generic_p2p",
+            "taker_fee_percent": 0.28,
+            "fees": {
+                "default": {
+                    "taker": 0.28,
+                    "maker": 0.22,
+                    "slippage_bps": 22.0,
+                }
+            },
+            "trade_links": {
+                "default": "https://app.ripio.com/otc?asset={base}&fiat={quote}",
+            },
+            "p2p": {
+                "enabled": True,
+                "endpoint": "https://api.ripio.com/v1/rates",
+                "method": "GET",
+                "data_path": ["data"],
+                "bid_path": ["{asset}", "{fiat}", "bid"],
+                "ask_path": ["{asset}", "{fiat}", "ask"],
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 558.0, "ask": 579.0},
+                    },
+                    "USDT/USD": {
+                        "asset": "USDT",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.993, "ask": 1.007},
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 16080000.0, "ask": 16800000.0},
+                    },
+                    "BTC/USD": {
+                        "asset": "BTC",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 29980.0, "ask": 30580.0},
+                    },
+                    "ETH/ARS": {
+                        "asset": "ETH",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 1012000.0, "ask": 1069000.0},
+                    },
+                    "ETH/USD": {
+                        "asset": "ETH",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 1810.0, "ask": 1855.0},
+                    },
+                    "XRP/ARS": {
+                        "asset": "XRP",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 280.0, "ask": 300.0},
+                    },
+                    "XRP/USD": {
+                        "asset": "XRP",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.52, "ask": 0.552},
+                    },
+                    "SOL/ARS": {
+                        "asset": "SOL",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 12380.0, "ask": 13200.0},
+                    },
+                    "SOL/USD": {
+                        "asset": "SOL",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 22.4, "ask": 23.2},
+                    },
+                },
+            },
+            "transfers": {
+                "USDT": {
+                    "withdraw_fee": 1.8,
+                    "withdraw_minutes": 40,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 30,
+                },
+                "USD": {
+                    "withdraw_fee": 8.0,
+                    "withdraw_minutes": 80,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 50,
+                },
+            },
+        },
+        "facebank": {
+            "enabled": True,
+            "adapter": "generic_p2p",
+            "taker_fee_percent": 0.30,
+            "fees": {
+                "default": {
+                    "taker": 0.30,
+                    "maker": 0.25,
+                    "slippage_bps": 25.0,
+                }
+            },
+            "trade_links": {
+                "default": "https://facebank.com/forex?asset={base}&fiat={quote}",
+            },
+            "p2p": {
+                "enabled": True,
+                "endpoint": "https://api.facebank.com/v1/rates",
+                "method": "GET",
+                "data_path": ["data"],
+                "bid_path": ["{asset}", "{fiat}", "bid"],
+                "ask_path": ["{asset}", "{fiat}", "ask"],
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 480.0, "ask": 498.0},
+                    },
+                    "USDT/USD": {
+                        "asset": "USDT",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.996, "ask": 1.002},
+                    },
+                    "USD/ARS": {
+                        "asset": "USD",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 485.0, "ask": 500.0},
+                    },
+                    "USD/EUR": {
+                        "asset": "USD",
+                        "fiat": "EUR",
+                        "static_quote": {"bid": 0.90, "ask": 0.92},
+                    },
+                },
+            },
+            "transfers": {
+                "USDT": {
+                    "withdraw_fee": 1.0,
+                    "withdraw_minutes": 45,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 40,
+                },
+                "USD": {
+                    "withdraw_fee": 4.5,
+                    "withdraw_minutes": 50,
+                    "deposit_fee": 0.0,
+                    "deposit_minutes": 35,
                 },
             },
         },
@@ -510,11 +1024,13 @@ CONFIG = {
             "BTC/USDT": {"min_notional": 10.0, "min_qty": 0.0001, "step_size": 0.000001},
             "ETH/USDT": {"min_notional": 10.0, "min_qty": 0.001, "step_size": 0.0001},
             "XRP/USDT": {"min_notional": 5.0, "min_qty": 1.0, "step_size": 0.1},
+            "SOL/USDT": {"min_notional": 10.0, "min_qty": 0.01, "step_size": 0.0001},
         },
         "bybit": {
             "BTC/USDT": {"min_notional": 10.0, "min_qty": 0.0001, "step_size": 0.000001},
             "ETH/USDT": {"min_notional": 10.0, "min_qty": 0.001, "step_size": 0.0001},
             "XRP/USDT": {"min_notional": 5.0, "min_qty": 1.0, "step_size": 0.1},
+            "SOL/USDT": {"min_notional": 10.0, "min_qty": 0.01, "step_size": 0.0001},
         },
     },
 }
@@ -1338,6 +1854,7 @@ def http_get_json(
     retries: int = 3,
     integrity_key: Optional[str] = None,
     fallback_endpoints: Optional[List[Tuple[str, Optional[dict]]]] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> HttpJsonResponse:
     last_exc: Optional[Exception] = None
     endpoints: List[Tuple[str, Optional[dict]]] = [(url, params)]
@@ -1347,7 +1864,12 @@ def http_get_json(
     for endpoint_url, endpoint_params in endpoints:
         for attempt in range(retries):
             try:
-                r = requests.get(endpoint_url, params=endpoint_params, timeout=timeout)
+                r = requests.get(
+                    endpoint_url,
+                    params=endpoint_params,
+                    timeout=timeout,
+                    headers=headers,
+                )
                 if r.status_code != 200:
                     raise HttpError(
                         f"HTTP {r.status_code} {endpoint_url} params={endpoint_params}",
@@ -1445,6 +1967,67 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _format_with_context(value: Any, context: Dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        try:
+            return value.format(**context)
+        except Exception:
+            return value
+    if isinstance(value, list):
+        return [_format_with_context(item, context) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_format_with_context(item, context) for item in value)
+    if isinstance(value, dict):
+        return {key: _format_with_context(val, context) for key, val in value.items()}
+    return value
+
+
+def _normalize_json_path(
+    path: Any,
+    context: Dict[str, Any],
+) -> List[Union[str, int]]:
+    if path is None:
+        return []
+    if isinstance(path, (str, int)):
+        path_items: List[Any] = [path]
+    else:
+        path_items = list(path)
+    normalized: List[Union[str, int]] = []
+    for item in path_items:
+        formatted = _format_with_context(item, context)
+        if isinstance(formatted, str) and "." in formatted and not formatted.strip().isdigit():
+            parts = [part for part in formatted.split(".") if part]
+            normalized.extend(parts)
+        else:
+            normalized.append(formatted)
+    result: List[Union[str, int]] = []
+    for item in normalized:
+        if isinstance(item, int):
+            result.append(item)
+        else:
+            try:
+                result.append(int(item))
+            except Exception:
+                result.append(str(item))
+    return result
+
+
+def _extract_json_path(data: Any, path: List[Union[str, int]]) -> Any:
+    current = data
+    for segment in path:
+        if isinstance(segment, int):
+            if isinstance(current, list) and 0 <= segment < len(current):
+                current = current[segment]
+            else:
+                return None
+        else:
+            if isinstance(current, dict):
+                current = current.get(segment)
+            else:
+                return None
+    return current
 
 
 @dataclass
@@ -2220,6 +2803,15 @@ def split_pair(pair: str) -> Tuple[str, str]:
 
 def build_trade_link(venue: str, pair: str) -> Optional[str]:
     base, quote = split_pair(pair)
+    venue_cfg = CONFIG.get("venues", {}).get(venue.lower())
+    if venue_cfg:
+        trade_links = venue_cfg.get("trade_links") or {}
+        template = trade_links.get(pair.upper()) or trade_links.get("default")
+        if template:
+            try:
+                return template.format(pair=pair.upper(), base=base, quote=quote)
+            except Exception:
+                pass
     venue = venue.lower()
     if venue == "binance":
         return f"https://www.binance.com/en/trade/{base}_{quote}?type=spot"
@@ -2861,6 +3453,236 @@ class Bybit(ExchangeAdapter):
         }
         return Quote(symbol, bid_price, ask_price, current_millis(), source="p2p", metadata=metadata)
 
+
+class GenericP2PMarketplace(ExchangeAdapter):
+    depth_supported = False
+
+    def __init__(self, venue_name: str):
+        self.name = venue_name
+
+    def normalize_symbol(self, pair: str) -> str:
+        return pair.replace("/", "_")
+
+    def fetch_quote(self, pair: str) -> Optional[Quote]:
+        test_quote = self._test_mode_quote(pair)
+        if test_quote is not None:
+            return test_quote
+        if self._is_test_mode_enabled() and self._test_mode_paused():
+            return self._offline_quote(pair, reason="test_mode_paused")
+
+        cfg = self._p2p_pair_config(pair)
+        if not cfg:
+            return None
+        quote = self._fetch_gateway_quote(pair, cfg)
+        if quote and quote.bid >= quote.ask:
+            return None
+        return quote
+
+    def _fetch_gateway_quote(self, pair: str, cfg: Dict[str, Any]) -> Optional[Quote]:
+        base_asset, quote_asset = split_pair(pair)
+        asset = str(cfg.get("asset") or base_asset).upper()
+        fiat = str(cfg.get("fiat") or quote_asset).upper()
+        context = {
+            "pair": pair.upper(),
+            "base": base_asset,
+            "quote": quote_asset,
+            "asset": asset,
+            "fiat": fiat,
+        }
+
+        p2p_cfg = self._p2p_config()
+        method = str(cfg.get("method") or p2p_cfg.get("method") or "GET").upper()
+        endpoint = _format_with_context(
+            cfg.get("endpoint") or p2p_cfg.get("endpoint"),
+            context,
+        )
+        headers_cfg: Dict[str, str] = {}
+        headers_cfg.update(_format_with_context(p2p_cfg.get("headers") or {}, context))
+        headers_cfg.update(_format_with_context(cfg.get("headers") or {}, context))
+        params: Dict[str, Any] = {}
+        params.update(_format_with_context(p2p_cfg.get("params") or {}, context))
+        params.update(_format_with_context(cfg.get("params") or {}, context))
+        payload: Dict[str, Any] = {}
+        payload.update(_format_with_context(p2p_cfg.get("payload") or {}, context))
+        payload.update(_format_with_context(cfg.get("payload") or {}, context))
+        fallbacks_cfg = cfg.get("fallbacks") or p2p_cfg.get("fallbacks") or []
+        timeout = int(cfg.get("timeout", p2p_cfg.get("timeout", 8)))
+        retries = int(cfg.get("retries", p2p_cfg.get("retries", 3)))
+
+        response: Optional[HttpJsonResponse] = None
+        symbol = self.normalize_symbol(pair)
+        integrity_key = self._integrity_key(symbol, "p2p_gateway")
+
+        def _format_fallbacks() -> List[Tuple[str, Optional[dict]]]:
+            formatted: List[Tuple[str, Optional[dict]]] = []
+            for fb in fallbacks_cfg:
+                if isinstance(fb, str):
+                    formatted.append((
+                        _format_with_context(fb, context),
+                        params if method == "GET" else payload,
+                    ))
+                    continue
+                if isinstance(fb, dict):
+                    fb_url = _format_with_context(fb.get("url"), context)
+                    if not fb_url:
+                        continue
+                    if method == "GET":
+                        fb_params = dict(params)
+                        fb_params.update(
+                            _format_with_context(fb.get("params") or {}, context)
+                        )
+                        formatted.append((fb_url, fb_params))
+                    else:
+                        fb_payload = dict(payload)
+                        fb_payload.update(
+                            _format_with_context(fb.get("payload") or {}, context)
+                        )
+                        formatted.append((fb_url, fb_payload))
+            return formatted
+
+        try:
+            if endpoint:
+                if method == "GET":
+                    response = http_get_json(
+                        endpoint,
+                        params=params or None,
+                        timeout=timeout,
+                        retries=retries,
+                        integrity_key=integrity_key,
+                        fallback_endpoints=_format_fallbacks(),
+                        headers=headers_cfg or None,
+                    )
+                else:
+                    response = http_post_json(
+                        endpoint,
+                        payload=payload or None,
+                        timeout=timeout,
+                        retries=retries,
+                        headers=headers_cfg or None,
+                        fallback_endpoints=_format_fallbacks(),
+                    )
+        except Exception as exc:
+            print(f"[{self.name}] p2p {pair} error: {exc}")
+            response = None
+
+        data = response.data if response else None
+        base_path = _normalize_json_path(
+            cfg.get("data_path") or p2p_cfg.get("data_path"),
+            context,
+        )
+        if base_path and data is not None:
+            data = _extract_json_path(data, base_path)
+
+        invert_sides = bool(cfg.get("invert_sides") or p2p_cfg.get("invert_sides", False))
+
+        raw_bid = None
+        raw_ask = None
+        if data is not None:
+            raw_bid = _extract_json_path(
+                data,
+                _normalize_json_path(
+                    cfg.get("bid_path") or p2p_cfg.get("bid_path"),
+                    context,
+                ),
+            )
+            raw_ask = _extract_json_path(
+                data,
+                _normalize_json_path(
+                    cfg.get("ask_path") or p2p_cfg.get("ask_path"),
+                    context,
+                ),
+            )
+
+        if invert_sides:
+            raw_bid, raw_ask = raw_ask, raw_bid
+
+        bid = safe_float(raw_bid)
+        ask = safe_float(raw_ask)
+
+        static_quote = cfg.get("static_quote") or {}
+        if bid <= 0:
+            bid = safe_float(static_quote.get("bid"))
+        if ask <= 0:
+            ask = safe_float(static_quote.get("ask"))
+
+        if bid <= 0 or ask <= 0:
+            return None
+
+        invert_price = bool(cfg.get("invert_price") or p2p_cfg.get("invert_price", False))
+        if invert_price:
+            bid = (1.0 / bid) if bid > 0 else 0.0
+            ask = (1.0 / ask) if ask > 0 else 0.0
+
+        scale = safe_float(cfg.get("price_scale") or p2p_cfg.get("price_scale") or 1.0, 1.0)
+        if scale != 1.0:
+            bid *= scale
+            ask *= scale
+
+        if bid <= 0 or ask <= 0:
+            return None
+
+        if bid >= ask:
+            spread_bps = safe_float(cfg.get("spread_adjust_bps") or p2p_cfg.get("spread_adjust_bps"))
+            if spread_bps > 0:
+                spread_factor = spread_bps / 10_000.0
+                ask = ask * (1.0 + spread_factor)
+                bid = bid * (1.0 - spread_factor)
+            if bid >= ask:
+                return None
+
+        ts_path = _normalize_json_path(
+            cfg.get("timestamp_path") or p2p_cfg.get("timestamp_path"),
+            context,
+        )
+        ts_value = 0.0
+        if ts_path and response is not None:
+            ts_value = safe_float(_extract_json_path(response.data, ts_path))
+        timestamp_ms = current_millis()
+        if ts_value > 0:
+            if ts_value > 1_000_000_000_000:
+                timestamp_ms = int(ts_value)
+            else:
+                timestamp_ms = int(ts_value * 1000)
+
+        offers_meta: Dict[str, Any] = {}
+        offers_cfg = cfg.get("offers_path") or p2p_cfg.get("offers_path")
+        if isinstance(offers_cfg, dict) and data is not None:
+            buy_path = _normalize_json_path(offers_cfg.get("buy"), context)
+            sell_path = _normalize_json_path(offers_cfg.get("sell"), context)
+            if buy_path:
+                buy_val = _extract_json_path(data, buy_path)
+                try:
+                    offers_meta["BUY"] = int(buy_val)
+                except Exception:
+                    pass
+            if sell_path:
+                sell_val = _extract_json_path(data, sell_path)
+                try:
+                    offers_meta["SELL"] = int(sell_val)
+                except Exception:
+                    pass
+
+        metadata = {
+            "asset": asset,
+            "fiat": fiat,
+            "offers": offers_meta,
+            "source_pair": pair.upper(),
+        }
+        extra_meta = cfg.get("metadata") or {}
+        extra_meta = _format_with_context(extra_meta, context)
+        if isinstance(extra_meta, dict):
+            metadata.update(extra_meta)
+
+        return Quote(
+            self.normalize_symbol(pair),
+            bid,
+            ask,
+            timestamp_ms,
+            source="p2p",
+            metadata=metadata,
+        )
+
+
 class KuCoin(ExchangeAdapter):
     name = "kucoin"
     depth_supported = True
@@ -3020,17 +3842,31 @@ class OKX(ExchangeAdapter):
             print(f"[okx] depth error {pair}: {exc}")
             return None
 
+
+ADAPTER_REGISTRY: Dict[str, Type[ExchangeAdapter]] = {
+    "binance": Binance,
+    "bybit": Bybit,
+    "kucoin": KuCoin,
+    "okx": OKX,
+    "generic_p2p": GenericP2PMarketplace,
+}
+
+
 def build_adapters() -> Dict[str, ExchangeAdapter]:
     adapters: Dict[str, ExchangeAdapter] = {}
-    vcfg = CONFIG["venues"]
-    if vcfg.get("binance", {}).get("enabled", False):
-        adapters["binance"] = Binance()
-    if vcfg.get("bybit", {}).get("enabled", False):
-        adapters["bybit"] = Bybit()
-    if vcfg.get("kucoin", {}).get("enabled", False):
-        adapters["kucoin"] = KuCoin()
-    if vcfg.get("okx", {}).get("enabled", False):
-        adapters["okx"] = OKX()
+    for venue_name, cfg in CONFIG.get("venues", {}).items():
+        if not cfg or not cfg.get("enabled", False):
+            continue
+        adapter_key = str(cfg.get("adapter") or venue_name).lower()
+        adapter_cls = ADAPTER_REGISTRY.get(adapter_key)
+        if adapter_cls is None:
+            adapter_cls = ADAPTER_REGISTRY.get(venue_name.lower())
+        if adapter_cls is None:
+            continue
+        if adapter_cls is GenericP2PMarketplace:
+            adapters[venue_name] = adapter_cls(venue_name)
+        else:
+            adapters[venue_name] = adapter_cls()
     return adapters
 
 
@@ -3039,6 +3875,7 @@ def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) 
     if not pairs or not adapters:
         return pair_quotes
 
+    p2p_pairs_cfg = configured_p2p_pairs()
     futures_map: Dict[Any, Tuple[str, str]] = {}
 
     def _task(adapter: ExchangeAdapter, pair: str, venue: str) -> Optional[Quote]:
@@ -3074,7 +3911,10 @@ def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) 
                 if is_circuit_open(venue):
                     record_exchange_skip(venue, "circuit_open", pair)
                     continue
-                if venue == "bybit" and pair.upper().endswith("/ARS"):
+                venue_p2p_pairs = p2p_pairs_cfg.get(venue, {})
+                pair_key = pair.upper()
+                is_p2p_pair = pair_key in venue_p2p_pairs
+                if venue == "bybit" and pair_key.endswith("/ARS") and not is_p2p_pair:
                     print("[bybit] ARS no está en spot; usar Convert/P2P (no implementado).")
                     record_exchange_skip(venue, "ars_not_spot", pair)
                     continue
