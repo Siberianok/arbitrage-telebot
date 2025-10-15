@@ -967,6 +967,345 @@ CONFIG = {
                 },
             },
         },
+        "buenbit": {
+            "enabled": True,
+            "adapter": "generic_p2p",
+            "taker_fee_percent": 0.40,
+            "fees": {
+                "default": {
+                    "taker": 0.40,
+                    "maker": 0.35,
+                    "slippage_bps": 30.0,
+                }
+            },
+            "p2p": {
+                "enabled": True,
+                "method": "GET",
+                "endpoint": "https://criptoya.com/api/buenbit/{asset_lower}/{fiat_lower}/1",
+                "bid_path": ["bid"],
+                "ask_path": ["ask"],
+                "timestamp_path": ["time"],
+                "source": "criptoya",
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 565.0, "ask": 585.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                    "USDT/USD": {
+                        "asset": "USDT",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.995, "ask": 1.010},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 16250000.0, "ask": 16850000.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                    "BTC/USD": {
+                        "asset": "BTC",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 30050.0, "ask": 30680.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                    "ETH/ARS": {
+                        "asset": "ETH",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 1030000.0, "ask": 1085000.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                    "ETH/USD": {
+                        "asset": "ETH",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 1828.0, "ask": 1875.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                    "SOL/ARS": {
+                        "asset": "SOL",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 12600.0, "ask": 13350.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                    "SOL/USD": {
+                        "asset": "SOL",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 22.7, "ask": 23.5},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                    "XRP/ARS": {
+                        "asset": "XRP",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 286.0, "ask": 301.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                    "XRP/USD": {
+                        "asset": "XRP",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.53, "ask": 0.56},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Buenbit",
+                        },
+                    },
+                },
+            },
+        },
+        "lemoncash": {
+            "enabled": True,
+            "adapter": "generic_p2p",
+            "taker_fee_percent": 0.45,
+            "fees": {
+                "default": {
+                    "taker": 0.45,
+                    "maker": 0.40,
+                    "slippage_bps": 35.0,
+                }
+            },
+            "p2p": {
+                "enabled": True,
+                "method": "GET",
+                "endpoint": "https://criptoya.com/api/lemoncash/{asset_lower}/{fiat_lower}/1",
+                "bid_path": ["bid"],
+                "ask_path": ["ask"],
+                "timestamp_path": ["time"],
+                "source": "criptoya",
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 560.0, "ask": 582.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                    "USDT/USD": {
+                        "asset": "USDT",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.990, "ask": 1.015},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 16180000.0, "ask": 16900000.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                    "BTC/USD": {
+                        "asset": "BTC",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 29980.0, "ask": 30720.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                    "ETH/ARS": {
+                        "asset": "ETH",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 1027000.0, "ask": 1092000.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                    "ETH/USD": {
+                        "asset": "ETH",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 1825.0, "ask": 1882.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                    "SOL/ARS": {
+                        "asset": "SOL",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 12500.0, "ask": 13400.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                    "SOL/USD": {
+                        "asset": "SOL",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 22.6, "ask": 23.7},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                    "XRP/ARS": {
+                        "asset": "XRP",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 283.0, "ask": 302.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                    "XRP/USD": {
+                        "asset": "XRP",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.52, "ask": 0.565},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Lemon Cash",
+                        },
+                    },
+                },
+            },
+        },
+        "belo": {
+            "enabled": True,
+            "adapter": "generic_p2p",
+            "taker_fee_percent": 0.42,
+            "fees": {
+                "default": {
+                    "taker": 0.42,
+                    "maker": 0.38,
+                    "slippage_bps": 32.0,
+                }
+            },
+            "p2p": {
+                "enabled": True,
+                "method": "GET",
+                "endpoint": "https://criptoya.com/api/belo/{asset_lower}/{fiat_lower}/1",
+                "bid_path": ["bid"],
+                "ask_path": ["ask"],
+                "timestamp_path": ["time"],
+                "source": "criptoya",
+                "pairs": {
+                    "USDT/ARS": {
+                        "asset": "USDT",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 563.0, "ask": 584.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                    "USDT/USD": {
+                        "asset": "USDT",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.992, "ask": 1.008},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                    "BTC/ARS": {
+                        "asset": "BTC",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 16190000.0, "ask": 16880000.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                    "BTC/USD": {
+                        "asset": "BTC",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 30010.0, "ask": 30610.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                    "ETH/ARS": {
+                        "asset": "ETH",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 1029000.0, "ask": 1089000.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                    "ETH/USD": {
+                        "asset": "ETH",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 1826.0, "ask": 1878.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                    "SOL/ARS": {
+                        "asset": "SOL",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 12580.0, "ask": 13320.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                    "SOL/USD": {
+                        "asset": "SOL",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 22.65, "ask": 23.55},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                    "XRP/ARS": {
+                        "asset": "XRP",
+                        "fiat": "ARS",
+                        "static_quote": {"bid": 284.0, "ask": 303.0},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                    "XRP/USD": {
+                        "asset": "XRP",
+                        "fiat": "USD",
+                        "static_quote": {"bid": 0.525, "ask": 0.562},
+                        "metadata": {
+                            "aggregator": "CriptoYa",
+                            "provider": "Belo",
+                        },
+                    },
+                },
+            },
+        },
         "kucoin": {
             "enabled": False,
         },
@@ -3508,6 +3847,13 @@ class GenericP2PMarketplace(ExchangeAdapter):
             "quote": quote_asset,
             "asset": asset,
             "fiat": fiat,
+            "pair_lower": pair.lower(),
+            "base_lower": base_asset.lower(),
+            "quote_lower": quote_asset.lower(),
+            "asset_lower": asset.lower(),
+            "fiat_lower": fiat.lower(),
+            "venue": getattr(self, "name", ""),
+            "venue_lower": str(getattr(self, "name", "")).lower(),
         }
 
         p2p_cfg = self._p2p_config()
