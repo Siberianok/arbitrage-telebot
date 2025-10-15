@@ -545,7 +545,7 @@ CONFIG = {
                 },
             },
         },
-        "feewin": {
+        "fiwind": {
             "enabled": True,
             "adapter": "generic_p2p",
             "taker_fee_percent": 0.20,
@@ -557,16 +557,17 @@ CONFIG = {
                 }
             },
             "trade_links": {
-                "default": "https://feewin.com/otc?asset={base}&fiat={quote}",
+                "default": "https://fiwind.com/otc?asset={base}&fiat={quote}",
             },
             "p2p": {
                 "enabled": True,
-                "endpoint": "https://api.feewin.com/v1/otc/rates",
+                "endpoint": "https://api.fiwind.com/v1/otc/rates",
                 "method": "GET",
                 "data_path": ["data"],
                 "bid_path": ["{asset}", "{fiat}", "sell"],
                 "ask_path": ["{asset}", "{fiat}", "buy"],
                 "invert_sides": True,
+                "source": "otc",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -656,6 +657,7 @@ CONFIG = {
                 "data_path": ["rates"],
                 "bid_path": ["{asset}", "{fiat}", "bid"],
                 "ask_path": ["{asset}", "{fiat}", "ask"],
+                "source": "otc",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -746,6 +748,7 @@ CONFIG = {
                 "bid_path": ["{asset}", "{fiat}", "sell"],
                 "ask_path": ["{asset}", "{fiat}", "buy"],
                 "invert_sides": True,
+                "source": "otc",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -835,6 +838,7 @@ CONFIG = {
                 "data_path": ["data"],
                 "bid_path": ["{asset}", "{fiat}", "bid"],
                 "ask_path": ["{asset}", "{fiat}", "ask"],
+                "source": "otc",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -924,6 +928,7 @@ CONFIG = {
                 "data_path": ["data"],
                 "bid_path": ["{asset}", "{fiat}", "bid"],
                 "ask_path": ["{asset}", "{fiat}", "ask"],
+                "source": "otc",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -3688,12 +3693,14 @@ class GenericP2PMarketplace(ExchangeAdapter):
         if isinstance(extra_meta, dict):
             metadata.update(extra_meta)
 
+        quote_source = str(cfg.get("source") or p2p_cfg.get("source") or "p2p")
+
         return Quote(
             self.normalize_symbol(pair),
             bid,
             ask,
             timestamp_ms,
-            source="p2p",
+            source=quote_source,
             metadata=metadata,
         )
 
