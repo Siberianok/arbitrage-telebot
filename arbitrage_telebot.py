@@ -1331,6 +1331,9 @@ LAST_CHECKSUMS: Dict[str, Tuple[str, int]] = {}
 MAX_CHECKSUM_STALENESS_MS = 60_000
 
 
+NON_RETRYABLE_STATUS_CODES = {401, 403, 451}
+
+
 def http_get_json(
     url: str,
     params: Optional[dict] = None,
@@ -1345,6 +1348,7 @@ def http_get_json(
         endpoints.extend(fallback_endpoints)
 
     for endpoint_url, endpoint_params in endpoints:
+        non_retryable_error = False
         for attempt in range(retries):
             try:
                 r = requests.get(endpoint_url, params=endpoint_params, timeout=timeout)
@@ -1371,9 +1375,14 @@ def http_get_json(
                 return HttpJsonResponse(payload, checksum, received_ts)
             except Exception as e:
                 last_exc = e
+                if isinstance(e, HttpError) and e.status_code in NON_RETRYABLE_STATUS_CODES:
+                    non_retryable_error = True
+                    break
                 backoff = min(0.5 * (2 ** attempt), 5.0)
                 time.sleep(backoff + random.uniform(0, 0.25))
-        if fallback_endpoints:
+        if non_retryable_error:
+            break
+        if fallback_endpoints and last_exc is not None:
             print(f"[http] cambiando a endpoint alternativo {endpoint_url}: {last_exc}")
 
     raise last_exc or HttpError("GET failed")
@@ -1399,6 +1408,7 @@ def http_post_json(
         endpoints.extend(fallback_endpoints)
 
     for endpoint_url, endpoint_payload in endpoints:
+        non_retryable_error = False
         for attempt in range(retries):
             try:
                 r = requests.post(
@@ -1422,9 +1432,14 @@ def http_post_json(
                 return HttpJsonResponse(payload_json, checksum, received_ts)
             except Exception as exc:
                 last_exc = exc
+                if isinstance(exc, HttpError) and exc.status_code in NON_RETRYABLE_STATUS_CODES:
+                    non_retryable_error = True
+                    break
                 backoff = min(0.5 * (2 ** attempt), 5.0)
                 time.sleep(backoff + random.uniform(0, 0.25))
-        if fallback_endpoints:
+        if non_retryable_error:
+            break
+        if fallback_endpoints and last_exc is not None:
             print(f"[http] cambiando a endpoint alternativo {endpoint_url}: {last_exc}")
 
     raise last_exc or HttpError("POST failed")
