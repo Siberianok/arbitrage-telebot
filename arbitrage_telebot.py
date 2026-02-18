@@ -18,9 +18,15 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from statistics import StatisticsError, mean, pstdev
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
 
 import requests
+
+from config_store import (
+    build_runtime_payload,
+    load_config_with_runtime,
+    write_runtime_config,
+)
 
 try:
     from prometheus_client import (
@@ -102,12 +108,14 @@ from observability import (
     register_degradation_alert,
     reset_metrics,
 )
+from runtime_state import RuntimeState
 
 
 LOG_BASE_DIR = os.getenv("LOG_BASE_DIR", "logs")
 LOG_BACKUP_DIR = os.getenv("LOG_BACKUP_DIR", "log_backups")
 DEFAULT_QUOTE_WORKERS = int(os.getenv("QUOTE_WORKERS", "16"))
 DEFAULT_QUOTE_ASSET = os.getenv("DEFAULT_QUOTE_ASSET", "USDT").strip().upper() or "USDT"
+PROCESS_ROLE = (os.getenv("PROCESS_ROLE", "all") or "all").strip().lower()
 
 PROM_REGISTRY = CollectorRegistry()
 PROM_LAST_RUN_TS = Gauge(
@@ -159,7 +167,7 @@ def emit_pair_coverage(pair: str, venues: Iterable[str]) -> None:
 # =========================
 # CONFIG
 # =========================
-CONFIG = {
+BASE_CONFIG = {
     "threshold_percent": 0.30,      # alerta si neto >= 0.30%
     "pairs": [
         # En modo de prueba solo consideramos los activos solicitados
@@ -170,6 +178,18 @@ CONFIG = {
     ],
     "simulation_capital_quote": 10_000,  # capital (USDT) para estimar PnL en alerta
     "max_quote_age_seconds": 12,  # descarta cotizaciones más viejas que este límite
+    "quote_quality": {
+        "max_age_seconds_by_venue": {
+            "default": 12,
+        },
+        "max_timestamp_skew_ms_by_source": {
+            "default": 20_000,
+            "p2p": 45_000,
+            "p2p_effective": 45_000,
+        },
+        "max_mid_deviation_percent": 3.5,
+        "max_spread_percent": 1.5,
+    },
     "capital_weights": {
         "pairs": {
             "default": 1.0,
@@ -186,7 +206,12 @@ CONFIG = {
         "spot_spot": True,
         "spot_p2p": True,
         "p2p_p2p": True,
+        "ars_usdt_roundtrip": False,
         "triangular_intra_venue": True,
+    },
+    "p2p_execution": {
+        "allowed_payment_methods": ["BANK_TRANSFER"],
+        "min_advertiser_reputation": 0.80,
     },
     "offline_quotes": {
         # Valores de respaldo en caso de faltar la configuración de pruebas
@@ -1387,11 +1412,23 @@ CONFIG = {
     },
 }
 
+RUNTIME_CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", "data/runtime_config.json"))
+
+CONFIG, _RUNTIME_LOADED = load_config_with_runtime(BASE_CONFIG, RUNTIME_CONFIG_PATH)
+
+
+def persist_runtime_config() -> None:
+    runtime_payload = build_runtime_payload(CONFIG)
+    write_runtime_config(RUNTIME_CONFIG_PATH, runtime_payload)
+    CONFIG["config_version"] = runtime_payload["config_version"]
+    CONFIG["updated_at"] = runtime_payload["updated_at"]
+
 DYNAMIC_THRESHOLD_PERCENT: float = float(CONFIG.get("threshold_percent", 0.0))
 
 TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
 TELEGRAM_POLLING_THREAD: Optional[threading.Thread] = None
+SCANNER_LOOP_THREAD: Optional[threading.Thread] = None
 KEEPALIVE_THREAD: Optional[threading.Thread] = None
 TELEGRAM_ADMIN_IDS: Set[str] = set()
 TELEGRAM_POLL_BACKOFF_UNTIL = 0.0
@@ -1408,9 +1445,10 @@ DASHBOARD_STATE: Dict[str, Any] = {
     "config_snapshot": {},
     "exchange_metrics": {},
     "analysis": None,
+    "quote_discards": [],
 }
+RUNTIME_STATE = RuntimeState()
 
-MAX_ALERT_HISTORY = 20
 
 WEB_AUTH_USER = os.getenv("WEB_AUTH_USER", "").strip()
 WEB_AUTH_PASS = os.getenv("WEB_AUTH_PASS", "").strip()
@@ -1438,6 +1476,10 @@ LOG_HEADER = [
     "volatility_score",
     "priority_score",
     "confidence",
+    "buy_vwap",
+    "sell_vwap",
+    "effective_slippage_bps",
+    "executable_qty",
 ]
 
 
@@ -1476,25 +1518,28 @@ EXECUTION_RESULTS_HEADER = [
 SIGNAL_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 def snapshot_public_config() -> Dict[str, Any]:
-    venues = {
-        name: {
-            "enabled": bool(data.get("enabled", False)),
-            "taker_fee_percent": float(data.get("taker_fee_percent", 0.0)),
+    with CONFIG_LOCK:
+        venues = {
+            name: {
+                "enabled": bool(data.get("enabled", False)),
+                "taker_fee_percent": float(data.get("taker_fee_percent", 0.0)),
+            }
+            for name, data in CONFIG.get("venues", {}).items()
         }
-        for name, data in CONFIG.get("venues", {}).items()
-    }
-    return {
-        "threshold_percent": float(CONFIG.get("threshold_percent", 0.0)),
-        "pairs": normalize_pair_list(CONFIG.get("pairs", [])),
-        "simulation_capital_quote": float(CONFIG.get("simulation_capital_quote", 0.0)),
-        "venues": venues,
-        "telegram_enabled": bool(CONFIG.get("telegram", {}).get("enabled", False)),
-    }
+        return {
+            "config_version": int(CONFIG.get("config_version", 1)),
+            "updated_at": str(CONFIG.get("updated_at", "")),
+            "threshold_percent": float(CONFIG.get("threshold_percent", 0.0)),
+            "pairs": normalize_pair_list(CONFIG.get("pairs", [])),
+            "simulation_capital_quote": float(CONFIG.get("simulation_capital_quote", 0.0)),
+            "strategies": dict(CONFIG.get("strategies", {})),
+            "venues": venues,
+            "telegram_enabled": bool(CONFIG.get("telegram", {}).get("enabled", False)),
+        }
 
 
 def refresh_config_snapshot() -> None:
-    with STATE_LOCK:
-        DASHBOARD_STATE["config_snapshot"] = snapshot_public_config()
+    RUNTIME_STATE.set_config_snapshot(snapshot_public_config())
 
 def _ensure_csv_header(path: str, header: List[str]) -> None:
     if not path:
@@ -1635,19 +1680,21 @@ def apply_adaptive_tuning_from_results() -> None:
         exec_costs["slippage_bps"] = round(max(0.0, float(exec_costs.get("slippage_bps", 0.0)) - slippage_step), 4)
 
 def update_analysis_state(capital_quote: float, log_path: str) -> None:
-    """Refresh cached analysis metrics and dynamic threshold from CSV history."""
-
     global LATEST_ANALYSIS, DYNAMIC_THRESHOLD_PERCENT
 
     if not log_path:
         return
 
-    base_threshold = float(CONFIG.get("threshold_percent", 0.0))
-    analysis_cfg = CONFIG.get("analysis") or {}
+    with CONFIG_LOCK:
+        base_threshold = float(CONFIG.get("threshold_percent", 0.0))
+        analysis_cfg = dict(CONFIG.get("analysis") or {})
     if not analysis_cfg.get("enabled", True):
-        DYNAMIC_THRESHOLD_PERCENT = base_threshold
+        with CONFIG_LOCK:
+            DYNAMIC_THRESHOLD_PERCENT = base_threshold
+        LATEST_ANALYSIS = None
         with STATE_LOCK:
             DASHBOARD_STATE["analysis"] = None
+        RUNTIME_STATE.set_analysis(None)
         return
 
     try:
@@ -1661,20 +1708,19 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
         recommended = base_threshold
 
     LATEST_ANALYSIS = analysis
-    DYNAMIC_THRESHOLD_PERCENT = recommended
+    with CONFIG_LOCK:
+        DYNAMIC_THRESHOLD_PERCENT = recommended
 
-    rankings = compute_reliability_rankings(limit=5)
-    apply_adaptive_tuning_from_results()
-
+    analysis_payload = {
+        "rows_considered": analysis.rows_considered,
+        "success_rate": analysis.success_rate,
+        "average_net_percent": analysis.average_net_percent,
+        "average_effective_percent": analysis.average_effective_percent,
+        "recommended_threshold": recommended,
+    }
     with STATE_LOCK:
-        DASHBOARD_STATE["analysis"] = {
-            "rows_considered": analysis.rows_considered,
-            "success_rate": analysis.success_rate,
-            "average_net_percent": analysis.average_net_percent,
-            "average_effective_percent": analysis.average_effective_percent,
-            "recommended_threshold": recommended,
-            "reliability_ranking": rankings,
-        }
+        DASHBOARD_STATE["analysis"] = dict(analysis_payload)
+    RUNTIME_STATE.set_analysis(analysis_payload)
 
     log_event(
         "analysis.updated",
@@ -1687,24 +1733,25 @@ FEE_REGISTRY: Dict[Tuple[str, str], float] = {}
 
 
 COMMANDS_HELP: List[Tuple[str, str]] = [
+    ("/start", "Registrar chat y mostrar ayuda"),
     ("/ping", "Ping"),
     ("/status", "Estado"),
+    ("/threshold", "Ver/actualizar threshold"),
     ("/capital", "Capital"),
-    ("/listapares", "Lista de pares"),
-    ("/adherirpar", "Adherir par"),
-    ("/eliminarpar", "Eliminar par"),
-    ("/senalprueba", "Señal de prueba"),
-    ("/settle", "Marcar resultado manual"),
-    ("/ranking", "Ranking de confiabilidad"),
+    ("/pairs", "Listar pares"),
+    ("/addpair", "Agregar par"),
+    ("/delpair", "Eliminar par"),
+    ("/test", "Señal de prueba"),
 ]
 
 
 def format_command_help() -> str:
-    return (
-        "📟 Para ver los comandos disponibles, tocá el botón "
-        '"Menú" que aparece junto a la carita de emoticones en Telegram.\n'
-        "Desde allí vas a encontrar accesos directos a todas las acciones del bot."
+    command_lines = [f"- {command}: {description}" for command, description in COMMANDS_HELP]
+    aliases = (
+        "Aliases: /listapares → /pairs, /adherirpar → /addpair, "
+        "/eliminarpar → /delpair, /senalprueba → /test"
     )
+    return "📟 Comandos disponibles:\n" + "\n".join(command_lines) + f"\n{aliases}"
 
 
 def get_bot_token() -> str:
@@ -1929,11 +1976,44 @@ def build_health_payload() -> Dict[str, Any]:
         latest_alerts = list(DASHBOARD_STATE.get("latest_alerts", []))[:5]
         latest_quotes = DASHBOARD_STATE.get("latest_quotes", {})
         quote_latency = DASHBOARD_STATE.get("last_quote_latency_ms")
+        quote_discards = list(DASHBOARD_STATE.get("quote_discards", []))[:50]
 
     status = "ok"
+    scanner_loop_alive = SCANNER_LOOP_THREAD is not None and SCANNER_LOOP_THREAD.is_alive()
+    telegram_polling_alive = TELEGRAM_POLLING_THREAD is not None and TELEGRAM_POLLING_THREAD.is_alive()
+    scanner_interval = float(os.getenv("INTERVAL_SECONDS", "30") or 30)
+    scanner_stale_seconds = None
+    if summary.get("ts"):
+        scanner_stale_seconds = max(0.0, now - float(summary["ts"]))
+
+    checks = {
+        "scanner_loop": {
+            "required": PROCESS_ROLE in ("all", "scanner"),
+            "alive": scanner_loop_alive,
+            "stale_seconds": scanner_stale_seconds,
+        },
+        "telegram_polling": {
+            "required": PROCESS_ROLE in ("all", "telegram-worker"),
+            "alive": telegram_polling_alive,
+        },
+        "api": {
+            "required": PROCESS_ROLE in ("all", "api"),
+            "alive": True,
+        },
+    }
+
     if not summary:
         status = "booting"
     elif any(stats.get("errors") for stats in metrics.values()):
+        status = "degraded"
+
+    if checks["scanner_loop"]["required"]:
+        stale_threshold = max(90.0, scanner_interval * 3)
+        if not scanner_loop_alive:
+            status = "degraded"
+        elif scanner_stale_seconds is not None and scanner_stale_seconds > stale_threshold:
+            status = "degraded"
+    if checks["telegram_polling"]["required"] and not telegram_polling_alive:
         status = "degraded"
 
     telegram_enabled = bool(CONFIG.get("telegram", {}).get("enabled", False))
@@ -1954,11 +2034,16 @@ def build_health_payload() -> Dict[str, Any]:
         "metrics": metrics,
         "latest_alerts": latest_alerts,
         "latest_quotes": latest_quotes,
+        "quote_discards": quote_discards,
         "telegram": {
             "enabled": telegram_enabled,
             "last_send_ts": LAST_TELEGRAM_SEND_TS or None,
             "seconds_since_last_send": seconds_since_last_send,
             "registered_chats": len(get_registered_chat_ids()),
+        },
+        "process": {
+            "role": PROCESS_ROLE,
+            "checks": checks,
         },
     }
     return payload
@@ -2025,6 +2110,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <th>Spread Neto</th>
             <th>PnL estimado</th>
             <th>Confianza</th>
+            <th>Calidad</th>
             <th>Liquidez</th>
             <th>Links</th>
           </tr>
@@ -2037,6 +2123,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <section>
       <h2>Últimas alertas</h2>
       <div id=\"alerts\"></div>
+    </section>
+    <section>
+      <h2>Descartes de cotizaciones</h2>
+      <div id="quoteDiscards" class="timestamp">Sin descartes recientes.</div>
     </section>
     <section>
       <h2>Configuración</h2>
@@ -2088,7 +2178,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!opps.length) {
         const row = document.createElement('tr');
         const cell = document.createElement('td');
-        cell.colSpan = 6;
+        cell.colSpan = 9;
         cell.textContent = 'Sin oportunidades en la última corrida.';
         row.appendChild(cell);
         tbody.appendChild(row);
@@ -2105,6 +2195,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <td>${formatNumber(opp.net_percent, 3)} %</td>
             <td>${formatNumber(opp.est_profit_quote, 2)} USDT</td>
             <td>${(opp.confidence || '').toUpperCase()}</td>
+            <td>${formatNumber(opp.quality_score ?? 0, 2)}</td>
             <td>${formatNumber(opp.liquidity_score ?? 0, 2)}</td>
             <td>${renderLinks(opp.links)}</td>`;
           tbody.appendChild(row);
@@ -2121,10 +2212,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <p>${alert.buy_venue} ➜ ${alert.sell_venue}</p>
           <p>PnL estimado: ${formatNumber(alert.est_profit_quote, 2)} USDT (${formatNumber(alert.est_percent, 3)} %)</p>
           <p>${renderLinks(alert.links)}</p>
-          <p>Confianza: ${(alert.confidence || '').toUpperCase()} · Liquidez: ${formatNumber(alert.liquidity_score ?? 0, 2)}</p>
+          <p>Confianza: ${(alert.confidence || '').toUpperCase()} · Calidad: ${formatNumber(alert.quality_score ?? 0, 2)} · Liquidez: ${formatNumber(alert.liquidity_score ?? 0, 2)}</p>
           <p class='timestamp'>${alert.ts_str}</p>`;
         alertsRoot.appendChild(card);
       });
+
+      const discardRoot = document.getElementById('quoteDiscards');
+      const discards = (data.quote_discards || []);
+      if (!discards.length) {
+        discardRoot.textContent = 'Sin descartes recientes.';
+      } else {
+        discardRoot.innerHTML = discards.slice(0, 12).map((item) =>
+          `<div>• <strong>${item.pair}</strong> @ ${item.venue}: <code>${item.reason}</code></div>`
+        ).join('');
+      }
 
       const form = document.getElementById('configForm');
       form.threshold_percent.value = cfg.threshold_percent ?? '';
@@ -2279,6 +2380,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "config_snapshot": DASHBOARD_STATE.get("config_snapshot", {}),
                     "exchange_metrics": DASHBOARD_STATE.get("exchange_metrics", {}),
                     "analysis": DASHBOARD_STATE.get("analysis"),
+                    "quote_discards": DASHBOARD_STATE.get("quote_discards", []),
                 }
             self._send_json(payload)
             return
@@ -2316,6 +2418,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             updated = {}
             errors: List[str] = []
+            should_persist = False
             with CONFIG_LOCK:
                 if "threshold_percent" in data:
                     try:
@@ -2323,6 +2426,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         CONFIG["threshold_percent"] = value
                         DYNAMIC_THRESHOLD_PERCENT = value
                         updated["threshold_percent"] = value
+                        should_persist = True
                     except (TypeError, ValueError):
                         errors.append("threshold_percent inválido")
                 if "simulation_capital_quote" in data:
@@ -2332,25 +2436,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             raise ValueError
                         CONFIG["simulation_capital_quote"] = value
                         updated["simulation_capital_quote"] = value
+                        should_persist = True
                     except (TypeError, ValueError):
                         errors.append("simulation_capital_quote inválido")
                 if "pairs" in data:
                     if isinstance(data["pairs"], list):
-                        pairs = [str(p).upper() for p in data["pairs"] if str(p).strip()]
+                        pairs = normalize_pair_list(data["pairs"])
                         if pairs:
                             CONFIG["pairs"] = pairs
                             updated["pairs"] = pairs
+                            should_persist = True
                         else:
                             errors.append("pairs no puede quedar vacío")
                     else:
                         errors.append("pairs debe ser lista")
+                if "strategies" in data:
+                    if isinstance(data["strategies"], dict):
+                        CONFIG["strategies"] = {k: bool(v) for k, v in data["strategies"].items()}
+                        updated["strategies"] = dict(CONFIG["strategies"])
+                        should_persist = True
+                    else:
+                        errors.append("strategies debe ser objeto")
+                if "p2p" in data:
+                    if isinstance(data["p2p"], dict):
+                        for venue, p2p_cfg in data["p2p"].items():
+                            if not isinstance(p2p_cfg, dict):
+                                errors.append(f"p2p.{venue} debe ser objeto")
+                                continue
+                            CONFIG.setdefault("venues", {}).setdefault(venue, {})["p2p"] = p2p_cfg
+                        if not any(err.startswith("p2p.") for err in errors):
+                            updated["p2p"] = data["p2p"]
+                            should_persist = True
+                    else:
+                        errors.append("p2p debe ser objeto")
+                if should_persist and not errors:
+                    persist_runtime_config()
             refresh_config_snapshot()
             if not errors:
-                capital = float(CONFIG.get("simulation_capital_quote", 0.0))
-                log_path = str(CONFIG.get("log_csv_path", ""))
+                with CONFIG_LOCK:
+                    capital = float(CONFIG.get("simulation_capital_quote", 0.0))
+                    log_path = str(CONFIG.get("log_csv_path", ""))
                 update_analysis_state(capital, log_path)
             status = 200 if not errors else 400
-            self._send_json({"updated": updated, "errors": errors, "config": DASHBOARD_STATE["config_snapshot"]}, status=status)
+            self._send_json({"updated": updated, "errors": errors, "config": RUNTIME_STATE.dashboard_snapshot().get("config_snapshot", {})}, status=status)
             return
         self.send_response(404)
         self.end_headers()
@@ -2604,6 +2732,23 @@ class DepthInfo:
     levels: int
     ts: int
     checksum: str
+    bid_levels: List[Tuple[float, float]] = field(default_factory=list)
+    ask_levels: List[Tuple[float, float]] = field(default_factory=list)
+
+
+def _parse_orderbook_levels(entries: Any, max_levels: int = 20) -> List[Tuple[float, float]]:
+    parsed: List[Tuple[float, float]] = []
+    if not isinstance(entries, list):
+        return parsed
+    for entry in entries[:max(1, int(max_levels))]:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        price = safe_float(entry[0])
+        qty = safe_float(entry[1])
+        if price <= 0 or qty <= 0:
+            continue
+        parsed.append((price, qty))
+    return parsed
 
 
 @dataclass
@@ -2770,6 +2915,7 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
             return True
         with CONFIG_LOCK:
             CONFIG["pairs"].append(pair)
+            persist_runtime_config()
         refresh_config_snapshot()
         set_pending_action(chat_id, None)
         tg_send_message(
@@ -2799,6 +2945,7 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
             return True
         with CONFIG_LOCK:
             CONFIG["pairs"] = [p for p in CONFIG["pairs"] if p != target]
+            persist_runtime_config()
         refresh_config_snapshot()
         set_pending_action(chat_id, None)
         tg_send_message(
@@ -2973,6 +3120,79 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         tg_send_message(response, enabled=enabled, chat_id=chat_id)
         return
 
+    if command == "/threshold":
+        if not ensure_admin(chat_id, enabled):
+            return
+
+        analysis_cfg = CONFIG.get("analysis") or {}
+        min_threshold = float(analysis_cfg.get("min_threshold_percent", 0.1))
+        max_threshold = float(analysis_cfg.get("max_threshold_percent", 5.0))
+
+        current_threshold = float(CONFIG.get("threshold_percent", 0.0))
+        if not argument:
+            tg_send_message(
+                (
+                    "Threshold actual: "
+                    f"{format_decimal_comma(current_threshold, decimals=3)}% "
+                    f"(mín {format_decimal_comma(min_threshold, decimals=3)}% "
+                    f"/ máx {format_decimal_comma(max_threshold, decimals=3)}%)."
+                ),
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return
+
+        cleaned = argument.strip().replace("%", "")
+        cleaned = cleaned.replace(" ", "")
+        if "," in cleaned and "." in cleaned:
+            cleaned = cleaned.replace(",", "")
+        elif cleaned.count(",") == 1 and cleaned.count(".") == 0:
+            cleaned = cleaned.replace(",", ".")
+
+        try:
+            new_threshold = float(cleaned)
+        except ValueError:
+            tg_send_message(
+                "Valor inválido. Ej: /threshold 0.45",
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return
+
+        if new_threshold < min_threshold or new_threshold > max_threshold:
+            tg_send_message(
+                (
+                    "Threshold fuera de rango. "
+                    f"Permitido: {format_decimal_comma(min_threshold, decimals=3)}% "
+                    f"a {format_decimal_comma(max_threshold, decimals=3)}%."
+                ),
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return
+
+        with CONFIG_LOCK:
+            previous_threshold = float(CONFIG.get("threshold_percent", 0.0))
+            CONFIG["threshold_percent"] = new_threshold
+
+        refresh_config_snapshot()
+        log_event(
+            "telegram.threshold.updated",
+            chat_id=chat_id,
+            previous_threshold=previous_threshold,
+            new_threshold=new_threshold,
+        )
+        tg_send_message(
+            (
+                "Threshold actualizado: "
+                f"{format_decimal_comma(previous_threshold, decimals=3)}% → "
+                f"{format_decimal_comma(new_threshold, decimals=3)}%"
+            ),
+            enabled=enabled,
+            chat_id=chat_id,
+        )
+        return
+
     if command == "/capital":
         if not argument:
             capital = float(CONFIG.get("simulation_capital_quote", 0.0))
@@ -3008,6 +3228,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             return
         with CONFIG_LOCK:
             CONFIG["simulation_capital_quote"] = value
+            persist_runtime_config()
         refresh_config_snapshot()
         tg_send_message(
             (
@@ -3436,6 +3657,165 @@ class TransferEstimate:
     quote_asset_loss: float = 0.0
 
 
+@dataclass
+class AccountLimitProfile:
+    monthly_fiat_limit: float = 0.0
+    daily_payment_method_volume: Dict[str, float] = field(default_factory=dict)
+    cooldown_seconds: float = 0.0
+
+
+def _utc_day(ts: Optional[float] = None) -> str:
+    ref = float(ts if ts is not None else time.time())
+    return time.strftime("%Y-%m-%d", time.gmtime(ref))
+
+
+def _utc_month(ts: Optional[float] = None) -> str:
+    ref = float(ts if ts is not None else time.time())
+    return time.strftime("%Y-%m", time.gmtime(ref))
+
+
+def normalize_account_venue(venue: str) -> str:
+    return str(venue or "").strip().lower().replace("_p2p", "")
+
+
+def get_account_limit_profile(venue: str, account: str = "default") -> Optional[AccountLimitProfile]:
+    limits_cfg = CONFIG.get("account_limits", {}) or {}
+    venues_cfg = limits_cfg.get("venues", {}) or {}
+    venue_cfg = venues_cfg.get(normalize_account_venue(venue), {}) or {}
+    account_cfg = venue_cfg.get(account) or venue_cfg.get("default")
+    if not account_cfg:
+        return None
+    return AccountLimitProfile(
+        monthly_fiat_limit=float(account_cfg.get("monthly_fiat_limit", 0.0) or 0.0),
+        daily_payment_method_volume={
+            str(method).upper(): float(value)
+            for method, value in (account_cfg.get("daily_payment_method_volume", {}) or {}).items()
+        },
+        cooldown_seconds=float(account_cfg.get("cooldown_seconds", 0.0) or 0.0),
+    )
+
+
+def _account_ledger_path() -> Path:
+    limits_cfg = CONFIG.get("account_limits", {}) or {}
+    path = str(limits_cfg.get("ledger_path", "data/account_limits_ledger.json"))
+    return Path(path)
+
+
+def load_account_limit_ledger() -> Dict[str, Any]:
+    ledger_path = _account_ledger_path()
+    if not ledger_path.exists():
+        return {"accounts": {}}
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"accounts": {}}
+    if not isinstance(data, dict):
+        return {"accounts": {}}
+    data.setdefault("accounts", {})
+    return data
+
+
+def save_account_limit_ledger(ledger: Dict[str, Any]) -> None:
+    ledger_path = _account_ledger_path()
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def check_account_limit(
+    venue: str,
+    fiat_amount: float,
+    payment_method: str,
+    account: str = "default",
+    now_ts: Optional[float] = None,
+    consume: bool = False,
+) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    profile = get_account_limit_profile(venue, account=account)
+    if not profile or fiat_amount <= 0:
+        return True, None, {}
+
+    now = float(now_ts if now_ts is not None else time.time())
+    month_key = _utc_month(now)
+    day_key = _utc_day(now)
+    method_key = str(payment_method or "SPOT").upper()
+
+    ledger = load_account_limit_ledger()
+    account_key = f"{normalize_account_venue(venue)}::{account}"
+    account_state = ledger.setdefault("accounts", {}).setdefault(account_key, {})
+
+    current_month = str(account_state.get("monthly_period", ""))
+    if current_month != month_key:
+        account_state["monthly_period"] = month_key
+        account_state["monthly_consumed"] = 0.0
+
+    current_day = str(account_state.get("daily_period", ""))
+    if current_day != day_key:
+        account_state["daily_period"] = day_key
+        account_state["daily_consumed"] = {}
+
+    monthly_consumed = float(account_state.get("monthly_consumed", 0.0) or 0.0)
+    daily_consumed_map = account_state.setdefault("daily_consumed", {})
+    daily_consumed = float(daily_consumed_map.get(method_key, 0.0) or 0.0)
+    last_operation_ts = float(account_state.get("last_operation_ts", 0.0) or 0.0)
+
+    if profile.monthly_fiat_limit > 0 and monthly_consumed + fiat_amount > profile.monthly_fiat_limit:
+        return False, "account_limit", {
+            "scope": "monthly",
+            "monthly_fiat_limit": profile.monthly_fiat_limit,
+            "monthly_consumed": monthly_consumed,
+            "fiat_amount": fiat_amount,
+            "venue": normalize_account_venue(venue),
+            "account": account,
+        }
+
+    daily_limit = float(profile.daily_payment_method_volume.get(method_key, 0.0) or 0.0)
+    if daily_limit > 0 and daily_consumed + fiat_amount > daily_limit:
+        return False, "account_limit", {
+            "scope": "daily_payment_method",
+            "payment_method": method_key,
+            "daily_limit": daily_limit,
+            "daily_consumed": daily_consumed,
+            "fiat_amount": fiat_amount,
+            "venue": normalize_account_venue(venue),
+            "account": account,
+        }
+
+    if profile.cooldown_seconds > 0 and last_operation_ts > 0:
+        elapsed = now - last_operation_ts
+        if elapsed < profile.cooldown_seconds:
+            return False, "account_limit", {
+                "scope": "cooldown",
+                "cooldown_seconds": profile.cooldown_seconds,
+                "elapsed_seconds": elapsed,
+                "venue": normalize_account_venue(venue),
+                "account": account,
+            }
+
+    if consume:
+        account_state["monthly_consumed"] = monthly_consumed + fiat_amount
+        daily_consumed_map[method_key] = daily_consumed + fiat_amount
+        account_state["last_operation_ts"] = now
+        save_account_limit_ledger(ledger)
+
+    return True, None, {
+        "monthly_consumed": monthly_consumed,
+        "daily_consumed": daily_consumed,
+        "payment_method": method_key,
+    }
+
+
+def check_transfer_window(total_minutes: float) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    limits_cfg = CONFIG.get("account_limits", {}) or {}
+    max_minutes = float(limits_cfg.get("transfer_window_minutes", 0.0) or 0.0)
+    if max_minutes <= 0 or total_minutes <= 0:
+        return True, None, {}
+    if total_minutes <= max_minutes:
+        return True, None, {}
+    return False, "transfer_window", {
+        "transfer_window_minutes": max_minutes,
+        "transfer_minutes": total_minutes,
+    }
+
+
 def apply_slippage(price: float, slippage_bps: float, side: str) -> float:
     if price <= 0:
         return 0.0
@@ -3446,6 +3826,49 @@ def apply_slippage(price: float, slippage_bps: float, side: str) -> float:
     if side == "buy":
         return price * (1.0 + factor)
     return max(price * (1.0 - factor), 0.0)
+
+
+def compute_executable_price(
+    depth: Optional[DepthInfo], side: str, target_qty: float
+) -> Optional[Tuple[float, float, float]]:
+    if not depth or target_qty <= 0:
+        return None
+
+    normalized_side = side.lower()
+    if normalized_side == "buy":
+        levels = depth.ask_levels
+        reference_price = float(depth.best_ask)
+    elif normalized_side == "sell":
+        levels = depth.bid_levels
+        reference_price = float(depth.best_bid)
+    else:
+        return None
+
+    if reference_price <= 0 or not levels:
+        return None
+
+    remaining = float(target_qty)
+    executed_qty = 0.0
+    executed_notional = 0.0
+    for price, qty in levels:
+        if remaining <= 0:
+            break
+        take_qty = min(remaining, qty)
+        if take_qty <= 0:
+            continue
+        executed_qty += take_qty
+        executed_notional += take_qty * price
+        remaining -= take_qty
+
+    if executed_qty <= 0:
+        return None
+
+    vwap = executed_notional / executed_qty
+    if normalized_side == "buy":
+        slippage_bps = ((vwap / reference_price) - 1.0) * 10_000.0
+    else:
+        slippage_bps = (1.0 - (vwap / reference_price)) * 10_000.0
+    return vwap, slippage_bps, executed_qty
 
 
 def compute_base_quantity(capital_quote: float, buy_price: float, buy_slippage_bps: float) -> float:
@@ -3707,6 +4130,75 @@ def validate_p2p_notional(venue: str, asset: str, quote_amount: float) -> Tuple[
     if min_notional > 0 and quote_amount < min_notional:
         return False, "min_notional"
     return True, ""
+
+
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _p2p_execution_meta(quote: Quote) -> Dict[str, Any]:
+    metadata = quote.metadata if isinstance(quote.metadata, dict) else {}
+    return {
+        "bank": metadata.get("bank") or metadata.get("bank_name") or "",
+        "payment_method": metadata.get("payment_method") or metadata.get("pay_type") or "",
+        "amount_min": _safe_float_or_none(metadata.get("amount_min") or metadata.get("min_amount")),
+        "amount_max": _safe_float_or_none(metadata.get("amount_max") or metadata.get("max_amount")),
+        "min_notional": _safe_float_or_none(metadata.get("min_notional") or metadata.get("ad_min_notional")),
+        "max_notional": _safe_float_or_none(metadata.get("max_notional") or metadata.get("ad_max_notional")),
+        "reputation": _safe_float_or_none(metadata.get("advertiser_reputation") or metadata.get("reputation")),
+        "available_qty": _safe_float_or_none(metadata.get("available_qty") or metadata.get("quantity")),
+        "available_notional": _safe_float_or_none(metadata.get("available_notional") or metadata.get("amount_available")),
+    }
+
+
+def _p2p_quote_passes_filters(venue: str, quote: Quote, required_notional: float) -> Tuple[bool, Dict[str, Any], str]:
+    meta = _p2p_execution_meta(quote)
+    exec_cfg = CONFIG.get("p2p_execution") or {}
+    allowed_methods = set(get_p2p_payment_filters(venue))
+    allowed_methods.update(exec_cfg.get("allowed_payment_methods") or [])
+    method = str(meta.get("payment_method") or "").upper()
+    if allowed_methods and method and method not in {m.upper() for m in allowed_methods}:
+        return False, meta, "payment_method"
+
+    amount_min = meta.get("amount_min")
+    amount_max = meta.get("amount_max")
+    if amount_min is not None and required_notional < amount_min:
+        return False, meta, "amount_range"
+    if amount_max is not None and amount_max > 0 and required_notional > amount_max:
+        return False, meta, "amount_range"
+
+    min_notional = meta.get("min_notional")
+    max_notional = meta.get("max_notional")
+    if min_notional is not None and required_notional < min_notional:
+        return False, meta, "min_notional"
+    if max_notional is not None and max_notional > 0 and required_notional > max_notional:
+        return False, meta, "max_notional"
+
+    reputation_min = float(exec_cfg.get("min_advertiser_reputation", 0.0) or 0.0)
+    reputation = meta.get("reputation")
+    if reputation is not None and reputation < reputation_min:
+        return False, meta, "reputation"
+
+    return True, meta, ""
+
+
+def _effective_notional_capacity(meta: Dict[str, Any], fallback: float) -> float:
+    cap_values = [fallback]
+    available_notional = _safe_float_or_none(meta.get("available_notional"))
+    if available_notional is not None and available_notional > 0:
+        cap_values.append(available_notional)
+    amount_max = _safe_float_or_none(meta.get("amount_max"))
+    if amount_max is not None and amount_max > 0:
+        cap_values.append(amount_max)
+    max_notional = _safe_float_or_none(meta.get("max_notional"))
+    if max_notional is not None and max_notional > 0:
+        cap_values.append(max_notional)
+    return min(cap_values) if cap_values else fallback
 
 
 def emit_p2p_log(
@@ -3990,17 +4482,27 @@ class Binance(ExchangeAdapter):
                 integrity_key=self._integrity_key(sym, "depth"),
                 fallback_endpoints=[(fallback, {"symbol": sym, "limit": 20}) for fallback in fallbacks],
             )
-            bids = response.data.get("bids") or []
-            asks = response.data.get("asks") or []
+            bids = _parse_orderbook_levels(response.data.get("bids") or [])
+            asks = _parse_orderbook_levels(response.data.get("asks") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(b[1]) for b in bids)
-            ask_volume = sum(safe_float(a[1]) for a in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, ts_val, response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                ts_val,
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[binance] depth error {pair}: {exc}")
             return None
@@ -4153,21 +4655,31 @@ class Bybit(ExchangeAdapter):
                 ],
             )
             result = response.data.get("result") or {}
-            bids = result.get("b") or []
-            asks = result.get("a") or []
+            bids = _parse_orderbook_levels(result.get("b") or [])
+            asks = _parse_orderbook_levels(result.get("a") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(entry[1]) for entry in bids)
-            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_field = safe_float(result.get("ts") or response.data.get("time"))
             if ts_field > 0:
                 ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "bybit:depth")
             else:
                 ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                int(ts_val),
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[bybit] depth error {pair}: {exc}")
             return None
@@ -4528,21 +5040,31 @@ class KuCoin(ExchangeAdapter):
                 fallback_endpoints=[(fallback, {"symbol": sym}) for fallback in fallbacks],
             )
             data = response.data.get("data") or {}
-            bids = data.get("bids") or []
-            asks = data.get("asks") or []
+            bids = _parse_orderbook_levels(data.get("bids") or [])
+            asks = _parse_orderbook_levels(data.get("asks") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(entry[1]) for entry in bids)
-            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_field = safe_float(data.get("time"))
             if ts_field > 0:
                 ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "kucoin:depth")
             else:
                 ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                int(ts_val),
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[kucoin] depth error {pair}: {exc}")
             return None
@@ -4611,21 +5133,31 @@ class OKX(ExchangeAdapter):
             if not items:
                 raise HttpError("Depth vacío")
             item = items[0]
-            bids = item.get("bids") or []
-            asks = item.get("asks") or []
+            bids = _parse_orderbook_levels(item.get("bids") or [])
+            asks = _parse_orderbook_levels(item.get("asks") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(entry[1]) for entry in bids)
-            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_field = safe_float(item.get("ts") or response.data.get("ts"))
             if ts_field > 0:
                 ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "okx:depth")
             else:
                 ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                int(ts_val),
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[okx] depth error {pair}: {exc}")
             return None
@@ -4658,10 +5190,123 @@ def build_adapters() -> Dict[str, ExchangeAdapter]:
     return adapters
 
 
-def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) -> Dict[str, Dict[str, Quote]]:
+def _normalize_discard_reason(reason: str) -> str:
+    token = str(reason or "unknown").strip().lower()
+    safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in token)
+    while "__" in safe:
+        safe = safe.replace("__", "_")
+    safe = safe.strip("_")
+    return safe or "unknown"
+
+
+def _quote_quality_config() -> Dict[str, Any]:
+    cfg = CONFIG.get("quote_quality")
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return cfg
+
+
+def validate_quote_quality(
+    pair: str,
+    venue: str,
+    quote: Quote,
+    pair_quotes: Dict[str, Quote],
+    now_ms: Optional[int] = None,
+) -> Tuple[bool, List[str], float]:
+    now = int(now_ms if now_ms is not None else current_millis())
+    reasons: List[str] = []
+
+    quality_cfg = _quote_quality_config()
+    max_age_cfg = quality_cfg.get("max_age_seconds_by_venue") or {}
+    default_max_age = float(
+        max_age_cfg.get("default", CONFIG.get("max_quote_age_seconds", 0.0)) or 0.0
+    )
+    max_age_seconds = float(max_age_cfg.get(venue, default_max_age) or default_max_age)
+
+    source_key = str(getattr(quote, "source", "") or "").lower() or "default"
+    skew_cfg = quality_cfg.get("max_timestamp_skew_ms_by_source") or {}
+    max_skew_ms = int(skew_cfg.get(source_key, skew_cfg.get("default", 20_000)) or 20_000)
+
+    max_mid_deviation_percent = float(quality_cfg.get("max_mid_deviation_percent", 0.0) or 0.0)
+    max_spread_percent = float(quality_cfg.get("max_spread_percent", 0.0) or 0.0)
+
+    try:
+        bid = float(quote.bid)
+        ask = float(quote.ask)
+    except (TypeError, ValueError):
+        bid = math.nan
+        ask = math.nan
+
+    try:
+        ts_value = int(quote.ts)
+    except (TypeError, ValueError):
+        ts_value = 0
+
+    if not math.isfinite(bid) or not math.isfinite(ask) or bid <= 0 or ask <= 0:
+        reasons.append("invalid_prices")
+    if math.isfinite(bid) and math.isfinite(ask) and bid >= ask:
+        reasons.append("inverted_spread")
+
+    age_ms = max(0, now - ts_value) if ts_value > 0 else None
+    if max_age_seconds > 0 and (age_ms is None or age_ms > max_age_seconds * 1000.0):
+        reasons.append("stale_quote")
+
+    if max_skew_ms > 0 and (ts_value <= 0 or abs(now - ts_value) > max_skew_ms):
+        reasons.append("timestamp_skew")
+
+    spread_pct = 0.0
+    if bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+        if mid > 0:
+            spread_pct = ((ask - bid) / mid) * 100.0
+    if max_spread_percent > 0 and spread_pct > max_spread_percent:
+        reasons.append("anomalous_spread")
+
+    mids: List[float] = []
+    for pair_quote in pair_quotes.values():
+        try:
+            q_bid = float(pair_quote.bid)
+            q_ask = float(pair_quote.ask)
+        except (TypeError, ValueError):
+            continue
+        if q_bid <= 0 or q_ask <= 0 or q_bid >= q_ask:
+            continue
+        mids.append((q_bid + q_ask) / 2.0)
+
+    if max_mid_deviation_percent > 0 and len(mids) >= 3 and bid > 0 and ask > 0 and bid < ask:
+        sorted_mids = sorted(mids)
+        mid_idx = len(sorted_mids) // 2
+        if len(sorted_mids) % 2 == 1:
+            median_mid = sorted_mids[mid_idx]
+        else:
+            median_mid = (sorted_mids[mid_idx - 1] + sorted_mids[mid_idx]) / 2.0
+        quote_mid = (bid + ask) / 2.0
+        if median_mid > 0:
+            deviation_pct = abs((quote_mid - median_mid) / median_mid) * 100.0
+            if deviation_pct > max_mid_deviation_percent:
+                reasons.append("intervenue_outlier")
+
+    unique_reasons = sorted({_normalize_discard_reason(reason) for reason in reasons})
+    penalties = {
+        "invalid_prices": 1.0,
+        "inverted_spread": 1.0,
+        "stale_quote": 0.35,
+        "timestamp_skew": 0.30,
+        "intervenue_outlier": 0.45,
+        "anomalous_spread": 0.30,
+    }
+    quality_score = 1.0
+    for reason in unique_reasons:
+        quality_score -= penalties.get(reason, 0.25)
+    quality_score = max(0.0, min(1.0, quality_score))
+    return (len(unique_reasons) == 0), unique_reasons, quality_score
+
+
+def fetch_all_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) -> Tuple[Dict[str, Dict[str, Quote]], List[Dict[str, Any]]]:
     pair_quotes: Dict[str, Dict[str, Quote]] = {pair: {} for pair in pairs}
+    quote_discards: List[Dict[str, Any]] = []
     if not pairs or not adapters:
-        return pair_quotes
+        return pair_quotes, quote_discards
 
     p2p_pairs_cfg = configured_p2p_pairs()
     futures_map: Dict[Any, Tuple[str, str]] = {}
@@ -4727,25 +5372,50 @@ def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) 
                     record_exchange_no_data(venue, pair)
                     continue
 
-                max_age_seconds = float(CONFIG.get("max_quote_age_seconds", 0.0))
-                if max_age_seconds > 0:
-                    try:
-                        age_ms = max(0, current_millis() - int(quote.ts))
-                    except Exception:
-                        age_ms = None
-                    if age_ms is None or age_ms > max_age_seconds * 1000:
-                        log_event(
-                            "exchange.quote.skip",
-                            exchange=venue,
-                            pair=pair,
-                            reason="stale_quote",
-                            age_ms=age_ms,
-                        )
-                        record_exchange_no_data(venue, pair)
-                        continue
-
                 pair_quotes[pair][venue] = quote
 
+    now_ms = current_millis()
+    validated_quotes: Dict[str, Dict[str, Quote]] = {pair: {} for pair in pairs}
+    for pair, venues in pair_quotes.items():
+        for venue, quote in venues.items():
+            is_valid, reasons, quality_score = validate_quote_quality(
+                pair=pair,
+                venue=venue,
+                quote=quote,
+                pair_quotes=venues,
+                now_ms=now_ms,
+            )
+            quote.metadata["quality_score"] = quality_score
+            if is_valid:
+                validated_quotes[pair][venue] = quote
+                continue
+
+            reason = "|".join(reasons)
+            discard_entry = {
+                "pair": pair,
+                "venue": venue,
+                "reason": reason,
+                "reasons": reasons,
+                "source": str(getattr(quote, "source", "")),
+                "quality_score": quality_score,
+            }
+            quote_discards.append(discard_entry)
+            log_event(
+                "exchange.quote.skip",
+                exchange=venue,
+                pair=pair,
+                reason=reason,
+                reasons=reasons,
+                source=discard_entry["source"],
+                quality_score=quality_score,
+            )
+            record_exchange_no_data(venue, pair)
+
+    return validated_quotes, quote_discards
+
+
+def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) -> Dict[str, Dict[str, Quote]]:
+    pair_quotes, _ = fetch_all_quotes(pairs, adapters)
     return pair_quotes
 
 
@@ -4903,8 +5573,13 @@ class Opportunity:
     volatility_score: float = 0.0
     priority_score: float = 0.0
     confidence_label: str = "media"
+    quality_score: float = 1.0
     strategy: str = "spot_spot"
     notes: Dict[str, Any] = field(default_factory=dict)
+    buy_vwap: float = 0.0
+    sell_vwap: float = 0.0
+    effective_slippage_bps: float = 0.0
+    executable_qty: float = 0.0
 
 
 @dataclass
@@ -5152,6 +5827,7 @@ def compute_opportunities_for_pair(
     pair: str,
     quotes: Dict[str, Quote],
     fees: Dict[str, VenueFees],
+    account_limit_checker: Optional[Callable[[Opportunity], Tuple[bool, Optional[str], Dict[str, Any]]]] = None,
 ) -> List[Opportunity]:
     venues = list(quotes.keys())
     opportunities: List[Opportunity] = []
@@ -5187,8 +5863,7 @@ def compute_opportunities_for_pair(
         total_fee = buy_schedule.taker_fee_percent + sell_schedule.taker_fee_percent
         net_percent = gross_percent - total_fee
 
-        opportunities.append(
-            Opportunity(
+        candidate = Opportunity(
                 pair=pair,
                 buy_venue=buy_v,
                 sell_venue=sell_v,
@@ -5198,9 +5873,26 @@ def compute_opportunities_for_pair(
                 net_percent=net_percent,
                 buy_depth=getattr(buy_quote, "depth", None),
                 sell_depth=getattr(sell_quote, "depth", None),
+                quality_score=min(
+                    float(getattr(buy_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                    float(getattr(sell_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                ),
                 strategy="spot_spot",
             )
-        )
+        if account_limit_checker:
+            allowed, reason, details = account_limit_checker(candidate)
+            if not allowed:
+                log_event(
+                    "opportunity.discard",
+                    reason=reason or "account_limit",
+                    pair=candidate.pair,
+                    buy_venue=candidate.buy_venue,
+                    sell_venue=candidate.sell_venue,
+                    strategy=candidate.strategy,
+                    **(details or {}),
+                )
+                continue
+        opportunities.append(candidate)
 
     return sorted(opportunities, key=lambda o: o.net_percent, reverse=True)
 
@@ -5210,10 +5902,12 @@ def compute_spot_p2p_opportunities(
     spot_quotes: Dict[str, Quote],
     p2p_quotes: Dict[str, Quote],
     fees: Dict[str, VenueFees],
+    account_limit_checker: Optional[Callable[[Opportunity], Tuple[bool, Optional[str], Dict[str, Any]]]] = None,
 ) -> List[Opportunity]:
     opportunities: List[Opportunity] = []
     base, _ = split_pair(pair)
     asset = base.upper()
+    target_notional = float(CONFIG.get("simulation_capital_quote", 0.0) or 0.0)
     for spot_venue, spot_quote in spot_quotes.items():
         fee_cfg = fees.get(spot_venue)
         if not fee_cfg:
@@ -5225,15 +5919,20 @@ def compute_spot_p2p_opportunities(
         if spot_buy <= 0 or spot_sell <= 0:
             continue
         for p2p_venue, p2p_quote in p2p_quotes.items():
+            passes_filters, execution_meta, _ = _p2p_quote_passes_filters(p2p_venue, p2p_quote, target_notional)
+            if not passes_filters:
+                continue
+            candidates: List[Opportunity] = []
             buy_fee = buy_schedule.taker_fee_percent
             sell_fee = sell_schedule.taker_fee_percent
             p2p_fee = get_p2p_fee_percent(p2p_venue, asset)
             p2p_bid = p2p_quote.bid
             p2p_ask = p2p_quote.ask
+            executable_notional = _effective_notional_capacity(execution_meta, target_notional)
             if p2p_bid > 0:
                 gross = (p2p_bid - spot_buy) / spot_buy * 100.0
                 net = gross - buy_fee - p2p_fee
-                opportunities.append(
+                candidates.append(
                     Opportunity(
                         pair=pair,
                         buy_venue=spot_venue,
@@ -5244,19 +5943,32 @@ def compute_spot_p2p_opportunities(
                         net_percent=net,
                         buy_depth=getattr(spot_quote, "depth", None),
                         sell_depth=None,
+                        quality_score=min(
+                            float(getattr(spot_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                            float(getattr(p2p_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                        ),
                         strategy="spot_p2p",
                         notes={
                             "side": "spot_to_p2p",
                             "p2p_fee_percent": p2p_fee,
                             "p2p_venue": p2p_venue,
                             "fiat": p2p_quote.metadata.get("fiat"),
+                            "bank": execution_meta.get("bank"),
+                            "payment_method": execution_meta.get("payment_method"),
+                            "ad_limits": {
+                                "amount_min": execution_meta.get("amount_min"),
+                                "amount_max": execution_meta.get("amount_max"),
+                                "min_notional": execution_meta.get("min_notional"),
+                                "max_notional": execution_meta.get("max_notional"),
+                            },
+                            "executable_qty_real": executable_notional / spot_buy if spot_buy > 0 else 0.0,
                         },
                     )
                 )
             if p2p_ask > 0:
                 gross = (spot_sell - p2p_ask) / p2p_ask * 100.0
                 net = gross - sell_fee - p2p_fee
-                opportunities.append(
+                candidates.append(
                     Opportunity(
                         pair=pair,
                         buy_venue=f"{p2p_venue}_p2p",
@@ -5267,29 +5979,63 @@ def compute_spot_p2p_opportunities(
                         net_percent=net,
                         buy_depth=None,
                         sell_depth=getattr(spot_quote, "depth", None),
+                        quality_score=min(
+                            float(getattr(spot_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                            float(getattr(p2p_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                        ),
                         strategy="spot_p2p",
                         notes={
                             "side": "p2p_to_spot",
                             "p2p_fee_percent": p2p_fee,
                             "p2p_venue": p2p_venue,
                             "fiat": p2p_quote.metadata.get("fiat"),
+                            "bank": execution_meta.get("bank"),
+                            "payment_method": execution_meta.get("payment_method"),
+                            "ad_limits": {
+                                "amount_min": execution_meta.get("amount_min"),
+                                "amount_max": execution_meta.get("amount_max"),
+                                "min_notional": execution_meta.get("min_notional"),
+                                "max_notional": execution_meta.get("max_notional"),
+                            },
+                            "executable_qty_real": executable_notional / p2p_ask if p2p_ask > 0 else 0.0,
                         },
                     )
                 )
+            for candidate in candidates:
+                if account_limit_checker:
+                    allowed, reason, details = account_limit_checker(candidate)
+                    if not allowed:
+                        log_event(
+                            "opportunity.discard",
+                            reason=reason or "account_limit",
+                            pair=candidate.pair,
+                            buy_venue=candidate.buy_venue,
+                            sell_venue=candidate.sell_venue,
+                            strategy=candidate.strategy,
+                            **(details or {}),
+                        )
+                        continue
+                opportunities.append(candidate)
     return sorted(opportunities, key=lambda o: o.net_percent, reverse=True)
 
 
 def compute_p2p_cross_opportunities(
     pair: str,
     quotes: Dict[str, Quote],
+    account_limit_checker: Optional[Callable[[Opportunity], Tuple[bool, Optional[str], Dict[str, Any]]]] = None,
 ) -> List[Opportunity]:
     base, _ = split_pair(pair)
     opportunities: List[Opportunity] = []
+    target_notional = float(CONFIG.get("simulation_capital_quote", 0.0) or 0.0)
     venues = list(quotes.keys())
     for buy_v, sell_v in itertools.permutations(venues, 2):
         buy_quote = quotes.get(buy_v)
         sell_quote = quotes.get(sell_v)
         if not buy_quote or not sell_quote:
+            continue
+        buy_ok, buy_meta, _ = _p2p_quote_passes_filters(buy_v, buy_quote, target_notional)
+        sell_ok, sell_meta, _ = _p2p_quote_passes_filters(sell_v, sell_quote, target_notional)
+        if not buy_ok or not sell_ok:
             continue
         buy_price = buy_quote.ask
         sell_price = sell_quote.bid
@@ -5299,8 +6045,11 @@ def compute_p2p_cross_opportunities(
         sell_fee = get_p2p_fee_percent(sell_v, base)
         gross_percent = (sell_price - buy_price) / buy_price * 100.0
         net_percent = gross_percent - buy_fee - sell_fee
-        opportunities.append(
-            Opportunity(
+        executable_notional = min(
+            _effective_notional_capacity(buy_meta, target_notional),
+            _effective_notional_capacity(sell_meta, target_notional),
+        )
+        candidate = Opportunity(
                 pair=pair,
                 buy_venue=f"{buy_v}_p2p",
                 sell_venue=f"{sell_v}_p2p",
@@ -5308,13 +6057,49 @@ def compute_p2p_cross_opportunities(
                 sell_price=sell_price,
                 gross_percent=gross_percent,
                 net_percent=net_percent,
+                quality_score=min(
+                    float(getattr(buy_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                    float(getattr(sell_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                ),
                 strategy="p2p_p2p",
                 notes={
                     "p2p_buy_fee_percent": buy_fee,
                     "p2p_sell_fee_percent": sell_fee,
+                    "buy_bank": buy_meta.get("bank"),
+                    "buy_payment_method": buy_meta.get("payment_method"),
+                    "sell_bank": sell_meta.get("bank"),
+                    "sell_payment_method": sell_meta.get("payment_method"),
+                    "ad_limits": {
+                        "buy": {
+                            "amount_min": buy_meta.get("amount_min"),
+                            "amount_max": buy_meta.get("amount_max"),
+                            "min_notional": buy_meta.get("min_notional"),
+                            "max_notional": buy_meta.get("max_notional"),
+                        },
+                        "sell": {
+                            "amount_min": sell_meta.get("amount_min"),
+                            "amount_max": sell_meta.get("amount_max"),
+                            "min_notional": sell_meta.get("min_notional"),
+                            "max_notional": sell_meta.get("max_notional"),
+                        },
+                    },
+                    "executable_qty_real": executable_notional / buy_price if buy_price > 0 else 0.0,
                 },
             )
-        )
+        if account_limit_checker:
+            allowed, reason, details = account_limit_checker(candidate)
+            if not allowed:
+                log_event(
+                    "opportunity.discard",
+                    reason=reason or "account_limit",
+                    pair=candidate.pair,
+                    buy_venue=candidate.buy_venue,
+                    sell_venue=candidate.sell_venue,
+                    strategy=candidate.strategy,
+                    **(details or {}),
+                )
+                continue
+        opportunities.append(candidate)
     return sorted(opportunities, key=lambda o: o.net_percent, reverse=True)
 
 
@@ -5532,6 +6317,10 @@ def append_csv(
                 f"{opp.volatility_score:.4f}",
                 f"{opp.priority_score:.6f}",
                 opp.confidence_label,
+                f"{opp.buy_vwap:.8f}",
+                f"{opp.sell_vwap:.8f}",
+                f"{opp.effective_slippage_bps:.4f}",
+                f"{opp.executable_qty:.8f}",
             ]
         )
 
@@ -5649,6 +6438,7 @@ def fmt_alert(
             f"(`{format_percent_comma(est_percent)}`) sobre {format_decimal_comma(capital_quote, decimals=2)} USDT"
         ),
         f"*Cantidad base:* `{base_qty:.6f}` ({format_decimal_comma(capital_used, decimals=2)} USDT usados)",
+        f"*Calidad de señal:* `{opp.quality_score:.2f}`",
     ]
     fiat = opp.notes.get("fiat") if isinstance(opp.notes, dict) else None
     if fiat:
@@ -5724,35 +6514,92 @@ def run_once() -> None:
         log_event("run.skip", reason="no_venues")
         return
 
+    with CONFIG_LOCK:
+        telegram_cfg = dict(CONFIG.get("telegram", {}))
+        configured_pairs = list(CONFIG.get("pairs", []))
+        base_threshold = float(CONFIG.get("threshold_percent", 0.0))
+        capital = float(CONFIG.get("simulation_capital_quote", 0.0))
+        log_csv = str(CONFIG.get("log_csv_path", ""))
+        tri_log_csv = CONFIG.get("triangular_log_csv_path")
+        pair_weight_cfg = dict((CONFIG.get("capital_weights", {}) or {}).get("pairs", {}))
+        triangle_weight_cfg = dict((CONFIG.get("capital_weights", {}) or {}).get("triangles", {}))
+
     run_start = time.time()
     reset_metrics(adapters.keys())
-    tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
+    tg_enabled = bool(telegram_cfg.get("enabled", False))
     polling_active = TELEGRAM_POLLING_THREAD and TELEGRAM_POLLING_THREAD.is_alive()
     if tg_enabled and not polling_active:
         tg_process_updates(enabled=tg_enabled)
 
     routes = load_triangular_routes()
-    pairs = normalize_pair_list(CONFIG["pairs"])
+    pairs = normalize_pair_list(configured_pairs)
     extra_pairs = {leg.pair for route in routes for leg in route.legs}
     p2p_pairs_cfg = configured_p2p_pairs()
     p2p_pairs = sorted({pair for venue_pairs in p2p_pairs_cfg.values() for pair in venue_pairs})
     all_pairs = sorted(set(pairs) | extra_pairs | set(p2p_pairs))
-    base_threshold = float(CONFIG.get("threshold_percent", 0.0))
-    capital = float(CONFIG["simulation_capital_quote"])
-    log_csv = CONFIG["log_csv_path"]
-    tri_log_csv = CONFIG.get("triangular_log_csv_path")
     update_analysis_state(capital, log_csv)
-    threshold = float(DYNAMIC_THRESHOLD_PERCENT or base_threshold)
-    pair_weight_cfg = CONFIG.get("capital_weights", {}).get("pairs", {})
-    triangle_weight_cfg = CONFIG.get("capital_weights", {}).get("triangles", {})
+    with CONFIG_LOCK:
+        dynamic_threshold = float(DYNAMIC_THRESHOLD_PERCENT or base_threshold)
+    threshold = dynamic_threshold
     fee_map = build_fee_map(all_pairs)
     transfers = build_transfer_profiles()
     summary_opps: List[Dict[str, Any]] = []
     alert_records: List[Dict[str, Any]] = []
     run_ts = int(time.time())
 
+    def _route_payment_method(venue_label: str) -> str:
+        return "BANK_TRANSFER" if str(venue_label).lower().endswith("_p2p") else "SPOT"
+
+    def _precheck_opportunity_account_limits(opp: Opportunity) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        capital_hint = get_weighted_capital(capital, pair_weight_cfg, opp.pair)
+        if capital_hint <= 0:
+            return True, None, {}
+        buy_method = _route_payment_method(opp.buy_venue)
+        sell_method = _route_payment_method(opp.sell_venue)
+        buy_allowed, buy_reason, buy_details = check_account_limit(
+            opp.buy_venue,
+            fiat_amount=capital_hint,
+            payment_method=buy_method,
+            now_ts=run_ts,
+            consume=False,
+        )
+        if not buy_allowed:
+            details = dict(buy_details or {})
+            details["leg"] = "buy"
+            return False, buy_reason or "account_limit", details
+        sell_allowed, sell_reason, sell_details = check_account_limit(
+            opp.sell_venue,
+            fiat_amount=capital_hint,
+            payment_method=sell_method,
+            now_ts=run_ts,
+            consume=False,
+        )
+        if not sell_allowed:
+            details = dict(sell_details or {})
+            details["leg"] = "sell"
+            return False, sell_reason or "account_limit", details
+        return True, None, {}
+
+    def _consume_opportunity_account_limits(opp: Opportunity, amount_quote: float) -> None:
+        if amount_quote <= 0:
+            return
+        check_account_limit(
+            opp.buy_venue,
+            fiat_amount=amount_quote,
+            payment_method=_route_payment_method(opp.buy_venue),
+            now_ts=time.time(),
+            consume=True,
+        )
+        check_account_limit(
+            opp.sell_venue,
+            fiat_amount=amount_quote,
+            payment_method=_route_payment_method(opp.sell_venue),
+            now_ts=time.time(),
+            consume=True,
+        )
+
     fetch_started = time.time()
-    pair_quotes = collect_pair_quotes(all_pairs, adapters)
+    pair_quotes, quote_discards = fetch_all_quotes(all_pairs, adapters)
     quote_latency_ms = int((time.time() - fetch_started) * 1000)
     log_event(
         "run.quotes_collected",
@@ -5765,6 +6612,7 @@ def run_once() -> None:
         DASHBOARD_STATE["last_quote_latency_ms"] = quote_latency_ms
         DASHBOARD_STATE["last_quote_count"] = sum(len(v) for v in pair_quotes.values())
         DASHBOARD_STATE["latest_quotes"] = build_quote_snapshot(pair_quotes)
+        DASHBOARD_STATE["quote_discards"] = quote_discards[:200]
 
     for pair in all_pairs:
         venues_available = sorted(pair_quotes.get(pair, {}).keys())
@@ -5790,7 +6638,7 @@ def run_once() -> None:
             capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
             if capital_for_pair <= 0:
                 continue
-            opps = compute_opportunities_for_pair(pair, quotes, fee_map)
+            opps = compute_opportunities_for_pair(pair, quotes, fee_map, account_limit_checker=_precheck_opportunity_account_limits)
             for opp in opps[:5]:
                 fee_buy = fee_map.get(opp.buy_venue)
                 fee_sell = fee_map.get(opp.sell_venue)
@@ -5817,6 +6665,55 @@ def run_once() -> None:
                 )
                 if base_qty <= 0 or capital_used <= 0:
                     continue
+
+                buy_vwap = opp.buy_price
+                sell_vwap = opp.sell_price
+                executable_qty = base_qty
+                effective_slippage_bps = 0.0
+                buy_exec = compute_executable_price(opp.buy_depth, "buy", base_qty)
+                sell_exec = compute_executable_price(opp.sell_depth, "sell", base_qty)
+                if buy_exec or sell_exec:
+                    if not buy_exec or not sell_exec:
+                        print(
+                            f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} depth_insufficient"
+                        )
+                        continue
+                    buy_vwap, buy_slippage_bps, buy_executed_qty = buy_exec
+                    sell_vwap, sell_slippage_bps, sell_executed_qty = sell_exec
+                    if buy_executed_qty + 1e-12 < base_qty or sell_executed_qty + 1e-12 < base_qty:
+                        print(
+                            f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} depth_insufficient"
+                        )
+                        continue
+                    executable_qty = min(base_qty, buy_executed_qty, sell_executed_qty)
+                    effective_slippage_bps = buy_slippage_bps + sell_slippage_bps
+                    est_profit, est_percent, base_qty, capital_used = estimate_profit(
+                        capital_for_pair,
+                        buy_vwap,
+                        sell_vwap,
+                        total_fee_pct,
+                        max_base_qty=executable_qty,
+                    )
+                    if base_qty <= 0 or capital_used <= 0:
+                        continue
+                    if est_percent < threshold:
+                        print(
+                            f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} slippage_threshold"
+                        )
+                        continue
+
+                opp.buy_price = buy_vwap
+                opp.sell_price = sell_vwap
+                opp.executable_qty = base_qty
+                opp.buy_vwap = buy_vwap
+                opp.sell_vwap = sell_vwap
+                opp.effective_slippage_bps = effective_slippage_bps
+                opp.gross_percent = (
+                    ((opp.sell_price - opp.buy_price) / opp.buy_price) * 100.0
+                    if opp.buy_price > 0
+                    else 0.0
+                )
+                opp.net_percent = opp.gross_percent - total_fee_pct
                 valid_buy, reason_buy = validate_market_trade(
                     opp.buy_venue, opp.pair, base_qty, opp.buy_price
                 )
@@ -5841,6 +6738,19 @@ def run_once() -> None:
                     opp.sell_price,
                     transfers,
                 )
+                transfer_ok, transfer_reason, transfer_details = check_transfer_window(transfer_est.total_minutes)
+                if not transfer_ok:
+                    log_event(
+                        "opportunity.discard",
+                        reason=transfer_reason or "transfer_window",
+                        pair=opp.pair,
+                        buy_venue=opp.buy_venue,
+                        sell_venue=opp.sell_venue,
+                        strategy=opp.strategy,
+                        **(transfer_details or {}),
+                    )
+                    print(f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} transfer_window")
+                    continue
                 est_profit_net = est_profit - transfer_est.total_cost_quote
                 if est_profit_net <= 0:
                     print(
@@ -5901,6 +6811,7 @@ def run_once() -> None:
                 "volatility_score": volatility_score,
                 "priority_score": priority_score,
                 "confidence": confidence_label,
+                "quality_score": opp.quality_score,
                 "threshold_hit": est_percent >= threshold,
                 "transfer_cost_quote": transfer_est.total_cost_quote,
                 "transfer_minutes": transfer_est.total_minutes,
@@ -5960,6 +6871,7 @@ def run_once() -> None:
                     net_percent=opp.net_percent,
                     est_profit=est_profit,
                 )
+                _consume_opportunity_account_limits(opp, capital_used)
                 spot_alerts += 1
                 alert_entry = dict(entry)
                 alert_entry["ts"] = int(time.time())
@@ -5984,7 +6896,7 @@ def run_once() -> None:
             capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
             if capital_for_pair <= 0:
                 continue
-            opps = compute_spot_p2p_opportunities(pair, spot_quotes, p2p_asset_quotes, fee_map)
+            opps = compute_spot_p2p_opportunities(pair, spot_quotes, p2p_asset_quotes, fee_map, account_limit_checker=_precheck_opportunity_account_limits)
             for opp in opps[:5]:
                 side = opp.notes.get("side")
                 p2p_venue = str(opp.notes.get("p2p_venue") or "")
@@ -6040,6 +6952,18 @@ def run_once() -> None:
                         continue
                 if est_percent < threshold:
                     continue
+                allowed_route, reason_route, details_route = _precheck_opportunity_account_limits(opp)
+                if not allowed_route:
+                    log_event(
+                        "opportunity.discard",
+                        reason=reason_route or "account_limit",
+                        pair=opp.pair,
+                        buy_venue=opp.buy_venue,
+                        sell_venue=opp.sell_venue,
+                        strategy=opp.strategy,
+                        **(details_route or {}),
+                    )
+                    continue
                 opp.net_percent = est_percent
                 opp.notes.setdefault("fiat", fiat)
                 liquidity_score = compute_liquidity_score(opp, base_qty)
@@ -6070,6 +6994,7 @@ def run_once() -> None:
                     "volatility_score": volatility_score,
                     "priority_score": priority_score,
                     "confidence": confidence_label,
+                "quality_score": opp.quality_score,
                     "threshold_hit": True,
                     "strategy": opp.strategy,
                     "notes": opp.notes,
@@ -6126,6 +7051,7 @@ def run_once() -> None:
                     net_percent=est_percent,
                     est_profit=est_profit,
                 )
+                _consume_opportunity_account_limits(opp, capital_used)
                 spot_p2p_alerts += 1
                 alert_entry = dict(entry)
                 alert_entry["ts"] = int(time.time())
@@ -6146,7 +7072,7 @@ def run_once() -> None:
             capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
             if capital_for_pair <= 0:
                 continue
-            opps = compute_p2p_cross_opportunities(pair, quotes)
+            opps = compute_p2p_cross_opportunities(pair, quotes, account_limit_checker=_precheck_opportunity_account_limits)
             asset, _ = split_pair(pair)
             for opp in opps[:5]:
                 buy_fee = float(opp.notes.get("p2p_buy_fee_percent", 0.0) or 0.0)
@@ -6172,6 +7098,18 @@ def run_once() -> None:
                     print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason_sell}")
                     continue
                 if est_percent < threshold:
+                    continue
+                allowed_route, reason_route, details_route = _precheck_opportunity_account_limits(opp)
+                if not allowed_route:
+                    log_event(
+                        "opportunity.discard",
+                        reason=reason_route or "account_limit",
+                        pair=opp.pair,
+                        buy_venue=opp.buy_venue,
+                        sell_venue=opp.sell_venue,
+                        strategy=opp.strategy,
+                        **(details_route or {}),
+                    )
                     continue
                 opp.net_percent = est_percent
                 liquidity_score = 0.0
@@ -6202,6 +7140,7 @@ def run_once() -> None:
                     "volatility_score": volatility_score,
                     "priority_score": priority_score,
                     "confidence": confidence_label,
+                "quality_score": opp.quality_score,
                     "threshold_hit": True,
                     "strategy": opp.strategy,
                     "notes": opp.notes,
@@ -6258,6 +7197,7 @@ def run_once() -> None:
                     net_percent=est_percent,
                     est_profit=est_profit,
                 )
+                _consume_opportunity_account_limits(opp, capital_used)
                 p2p_cross_alerts += 1
                 alert_entry = dict(entry)
                 alert_entry["ts"] = int(time.time())
@@ -6295,7 +7235,7 @@ def run_once() -> None:
         "ts_str": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(run_ts)),
         "threshold": threshold,
         "base_threshold": base_threshold,
-        "dynamic_threshold": DYNAMIC_THRESHOLD_PERCENT,
+        "dynamic_threshold": dynamic_threshold,
         "capital": capital,
         "pairs": pairs,
         "opportunities": summary_opps,
@@ -6311,14 +7251,11 @@ def run_once() -> None:
     if alert_records:
         alert_records.sort(key=lambda item: item["ts"], reverse=True)
 
-    with STATE_LOCK:
-        DASHBOARD_STATE["last_run_summary"] = summary
-        DASHBOARD_STATE["exchange_metrics"] = metrics_data
-        if alert_records:
-            history = DASHBOARD_STATE.get("latest_alerts", [])
-            history.extend(alert_records)
-            history.sort(key=lambda item: item.get("ts", 0), reverse=True)
-            DASHBOARD_STATE["latest_alerts"] = history[:MAX_ALERT_HISTORY]
+    RUNTIME_STATE.update_run_state(
+        summary=summary,
+        exchange_health=metrics_data,
+        new_alerts=alert_records,
+    )
 
     degradation_alerts = build_degradation_alerts(metrics_data)
     for alert_msg in degradation_alerts:
@@ -6340,18 +7277,75 @@ def run_once() -> None:
 # =========================
 # CLI
 # =========================
+def _run_scanner_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
+    global SCANNER_LOOP_THREAD
+
+    if tg_enabled:
+        tg_sync_command_menu(enabled=True)
+        tg_send_message(
+            "🤖 Bot reiniciado.\n\n" + format_command_help(),
+            enabled=True,
+        )
+        ensure_telegram_polling_thread(enabled=True, interval=1.0)
+
+    ensure_keepalive_thread()
+
+    if args.web:
+        SCANNER_LOOP_THREAD = threading.Thread(
+            target=run_loop_forever,
+            args=(args.interval,),
+            daemon=True,
+            name="scanner-loop",
+        )
+        SCANNER_LOOP_THREAD.start()
+        serve_http(args.port)
+        return
+
+    if args.once and args.loop:
+        log_event("cli.invalid_args", once=args.once, loop=args.loop)
+        return
+
+    if args.once or not args.loop:
+        run_once()
+        return
+
+    run_loop_forever(args.interval)
+
+
+def _run_api_mode(args: argparse.Namespace) -> None:
+    serve_http(args.port)
+
+
+def _run_telegram_worker_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
+    if tg_enabled:
+        ensure_telegram_polling_thread(enabled=True, interval=1.0)
+    else:
+        log_event("telegram.poll.disabled", reason="telegram_not_enabled")
+
+    if args.web:
+        serve_http(args.port)
+        return
+
+    while True:
+        time.sleep(5)
+
+
 def main():
+    global PROCESS_ROLE
+
     ap = argparse.ArgumentParser(description="Arbitrage TeleBot (spot, inventario) - web-ready")
     ap.add_argument("--once", action="store_true", help="Ejecuta una vez y termina")
     ap.add_argument("--loop", action="store_true", help="Ejecuta en loop continuo")
     ap.add_argument("--interval", type=int, default=int(os.getenv("INTERVAL_SECONDS", "30")), help="Segundos entre corridas en modo loop")
-    ap.add_argument("--web", action="store_true", help="Expone /health y corre el loop en background")
+    ap.add_argument("--web", action="store_true", help="Expone /health y endpoints HTTP")
     ap.add_argument("--port", type=int, default=int(os.getenv("PORT", "10000")), help="Puerto HTTP para /health (Render usa $PORT)")
+    ap.add_argument("--role", choices=["all", "scanner", "api", "telegram-worker"], default=PROCESS_ROLE, help="Proceso lógico a ejecutar")
     ap.add_argument("--diagnose-exchanges", action="store_true", help="Verifica conectividad de cada exchange y par configurado")
     ap.add_argument("--diagnose-pair", action="append", dest="diagnose_pairs", help="Limita el diagnóstico a uno o más pares (puede repetirse)")
     ap.add_argument("--diagnose-venue", action="append", dest="diagnose_venues", help="Limita el diagnóstico a uno o más exchanges (puede repetirse)")
 
     args = ap.parse_args()
+    PROCESS_ROLE = args.role
 
     if args.diagnose_exchanges:
         selected_pairs = normalize_pair_list(args.diagnose_pairs or CONFIG["pairs"])
@@ -6400,38 +7394,13 @@ def main():
         return
 
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
-    if tg_enabled:
-        tg_sync_command_menu(enabled=True)
-        tg_send_message(
-            "🤖 Bot reiniciado.\n\n" + format_command_help(),
-            enabled=True,
-        )
-    if tg_enabled and (args.loop or args.web):
-        ensure_telegram_polling_thread(enabled=True, interval=1.0)
-
-    if args.loop or args.web:
-        ensure_keepalive_thread()
-
-    if args.web:
-        t = threading.Thread(target=run_loop_forever, args=(args.interval,), daemon=True)
-        t.start()
-        serve_http(args.port)
+    if args.role in ("all", "scanner"):
+        _run_scanner_mode(args, tg_enabled=tg_enabled)
         return
-
-    if args.once and args.loop:
-        log_event("cli.invalid_args", once=args.once, loop=args.loop)
+    if args.role == "api":
+        _run_api_mode(args)
         return
-
-    if args.once or not args.loop:
-        run_once()
-        return
-
-    while True:
-        try:
-            run_once()
-        except Exception as e:
-            log_event("loop.error", error=str(e))
-        time.sleep(max(5, args.interval))
+    _run_telegram_worker_mode(args, tg_enabled=tg_enabled)
 
 if __name__ == "__main__":
     main()

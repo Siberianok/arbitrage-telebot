@@ -16,7 +16,7 @@
 4. Registrar resultados en hoja de control compartida.
 
 ## 3. Automatización con bots de trading
-1. Ajustar el threshold mediante `/threshold` (solo administradores) y actualizar el capital simulado desde el dashboard para adecuarlos al algoritmo.
+1. Ajustar el threshold mediante `/threshold [valor]` (solo administradores, respeta min/máx configurados) y actualizar el capital simulado con `/capital [monto]` o desde dashboard para adecuarlos al algoritmo.
 2. Habilitar el bot de trading con API keys en modo "paper" y validar ejecución contra las alertas recibidas.
 3. Pasar a modo real cuando se verifiquen métricas de latencia y slippage.
 4. Mantener monitorización continua del dashboard y Telegram para detectar divergencias.
@@ -29,5 +29,14 @@
 ## 5. Checklist post-operación
 - Confirmar ejecución en ambos exchanges.
 - Reconciliar balances y fees cobrados.
-- Actualizar threshold y capital si el mercado cambió.
+- Actualizar threshold y capital con `/threshold` y `/capital` si el mercado cambió.
 - Archivar logs CSV y capturas relevantes en el repositorio de operaciones.
+
+
+## 6. Comandos operativos de referencia
+- `/start`: registro inicial del chat y ayuda contextual.
+- `/status`: estado del bot (threshold base/dinámico, histórico y pares).
+- `/threshold [valor]`: lectura/ajuste de threshold (solo admins).
+- `/capital [monto]`: lectura/ajuste de capital simulado (solo admins).
+- `/pairs`, `/addpair`, `/delpair`: gestión de universo de pares (`/listapares`, `/adherirpar`, `/eliminarpar` se mantienen como alias).
+- `/test`: validación de entrega de alertas (`/senalprueba` como alias).
