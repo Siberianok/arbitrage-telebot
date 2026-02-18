@@ -192,7 +192,12 @@ BASE_CONFIG = {
         "spot_spot": True,
         "spot_p2p": True,
         "p2p_p2p": True,
+        "ars_usdt_roundtrip": False,
         "triangular_intra_venue": True,
+    },
+    "p2p_execution": {
+        "allowed_payment_methods": ["BANK_TRANSFER"],
+        "min_advertiser_reputation": 0.80,
     },
     "offline_quotes": {
         # Valores de respaldo en caso de faltar la configuración de pruebas
@@ -3402,6 +3407,75 @@ def validate_p2p_notional(venue: str, asset: str, quote_amount: float) -> Tuple[
     return True, ""
 
 
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _p2p_execution_meta(quote: Quote) -> Dict[str, Any]:
+    metadata = quote.metadata if isinstance(quote.metadata, dict) else {}
+    return {
+        "bank": metadata.get("bank") or metadata.get("bank_name") or "",
+        "payment_method": metadata.get("payment_method") or metadata.get("pay_type") or "",
+        "amount_min": _safe_float_or_none(metadata.get("amount_min") or metadata.get("min_amount")),
+        "amount_max": _safe_float_or_none(metadata.get("amount_max") or metadata.get("max_amount")),
+        "min_notional": _safe_float_or_none(metadata.get("min_notional") or metadata.get("ad_min_notional")),
+        "max_notional": _safe_float_or_none(metadata.get("max_notional") or metadata.get("ad_max_notional")),
+        "reputation": _safe_float_or_none(metadata.get("advertiser_reputation") or metadata.get("reputation")),
+        "available_qty": _safe_float_or_none(metadata.get("available_qty") or metadata.get("quantity")),
+        "available_notional": _safe_float_or_none(metadata.get("available_notional") or metadata.get("amount_available")),
+    }
+
+
+def _p2p_quote_passes_filters(venue: str, quote: Quote, required_notional: float) -> Tuple[bool, Dict[str, Any], str]:
+    meta = _p2p_execution_meta(quote)
+    exec_cfg = CONFIG.get("p2p_execution") or {}
+    allowed_methods = set(get_p2p_payment_filters(venue))
+    allowed_methods.update(exec_cfg.get("allowed_payment_methods") or [])
+    method = str(meta.get("payment_method") or "").upper()
+    if allowed_methods and method and method not in {m.upper() for m in allowed_methods}:
+        return False, meta, "payment_method"
+
+    amount_min = meta.get("amount_min")
+    amount_max = meta.get("amount_max")
+    if amount_min is not None and required_notional < amount_min:
+        return False, meta, "amount_range"
+    if amount_max is not None and amount_max > 0 and required_notional > amount_max:
+        return False, meta, "amount_range"
+
+    min_notional = meta.get("min_notional")
+    max_notional = meta.get("max_notional")
+    if min_notional is not None and required_notional < min_notional:
+        return False, meta, "min_notional"
+    if max_notional is not None and max_notional > 0 and required_notional > max_notional:
+        return False, meta, "max_notional"
+
+    reputation_min = float(exec_cfg.get("min_advertiser_reputation", 0.0) or 0.0)
+    reputation = meta.get("reputation")
+    if reputation is not None and reputation < reputation_min:
+        return False, meta, "reputation"
+
+    return True, meta, ""
+
+
+def _effective_notional_capacity(meta: Dict[str, Any], fallback: float) -> float:
+    cap_values = [fallback]
+    available_notional = _safe_float_or_none(meta.get("available_notional"))
+    if available_notional is not None and available_notional > 0:
+        cap_values.append(available_notional)
+    amount_max = _safe_float_or_none(meta.get("amount_max"))
+    if amount_max is not None and amount_max > 0:
+        cap_values.append(amount_max)
+    max_notional = _safe_float_or_none(meta.get("max_notional"))
+    if max_notional is not None and max_notional > 0:
+        cap_values.append(max_notional)
+    return min(cap_values) if cap_values else fallback
+
+
 def emit_p2p_log(
     venue: str,
     asset: str,
@@ -4907,6 +4981,7 @@ def compute_spot_p2p_opportunities(
     opportunities: List[Opportunity] = []
     base, _ = split_pair(pair)
     asset = base.upper()
+    target_notional = float(CONFIG.get("simulation_capital_quote", 0.0) or 0.0)
     for spot_venue, spot_quote in spot_quotes.items():
         fee_cfg = fees.get(spot_venue)
         if not fee_cfg:
@@ -4918,11 +4993,15 @@ def compute_spot_p2p_opportunities(
         if spot_buy <= 0 or spot_sell <= 0:
             continue
         for p2p_venue, p2p_quote in p2p_quotes.items():
+            passes_filters, execution_meta, _ = _p2p_quote_passes_filters(p2p_venue, p2p_quote, target_notional)
+            if not passes_filters:
+                continue
             buy_fee = buy_schedule.taker_fee_percent
             sell_fee = sell_schedule.taker_fee_percent
             p2p_fee = get_p2p_fee_percent(p2p_venue, asset)
             p2p_bid = p2p_quote.bid
             p2p_ask = p2p_quote.ask
+            executable_notional = _effective_notional_capacity(execution_meta, target_notional)
             if p2p_bid > 0:
                 gross = (p2p_bid - spot_buy) / spot_buy * 100.0
                 net = gross - buy_fee - p2p_fee
@@ -4943,6 +5022,15 @@ def compute_spot_p2p_opportunities(
                             "p2p_fee_percent": p2p_fee,
                             "p2p_venue": p2p_venue,
                             "fiat": p2p_quote.metadata.get("fiat"),
+                            "bank": execution_meta.get("bank"),
+                            "payment_method": execution_meta.get("payment_method"),
+                            "ad_limits": {
+                                "amount_min": execution_meta.get("amount_min"),
+                                "amount_max": execution_meta.get("amount_max"),
+                                "min_notional": execution_meta.get("min_notional"),
+                                "max_notional": execution_meta.get("max_notional"),
+                            },
+                            "executable_qty_real": executable_notional / spot_buy if spot_buy > 0 else 0.0,
                         },
                     )
                 )
@@ -4966,6 +5054,15 @@ def compute_spot_p2p_opportunities(
                             "p2p_fee_percent": p2p_fee,
                             "p2p_venue": p2p_venue,
                             "fiat": p2p_quote.metadata.get("fiat"),
+                            "bank": execution_meta.get("bank"),
+                            "payment_method": execution_meta.get("payment_method"),
+                            "ad_limits": {
+                                "amount_min": execution_meta.get("amount_min"),
+                                "amount_max": execution_meta.get("amount_max"),
+                                "min_notional": execution_meta.get("min_notional"),
+                                "max_notional": execution_meta.get("max_notional"),
+                            },
+                            "executable_qty_real": executable_notional / p2p_ask if p2p_ask > 0 else 0.0,
                         },
                     )
                 )
@@ -4978,11 +5075,16 @@ def compute_p2p_cross_opportunities(
 ) -> List[Opportunity]:
     base, _ = split_pair(pair)
     opportunities: List[Opportunity] = []
+    target_notional = float(CONFIG.get("simulation_capital_quote", 0.0) or 0.0)
     venues = list(quotes.keys())
     for buy_v, sell_v in itertools.permutations(venues, 2):
         buy_quote = quotes.get(buy_v)
         sell_quote = quotes.get(sell_v)
         if not buy_quote or not sell_quote:
+            continue
+        buy_ok, buy_meta, _ = _p2p_quote_passes_filters(buy_v, buy_quote, target_notional)
+        sell_ok, sell_meta, _ = _p2p_quote_passes_filters(sell_v, sell_quote, target_notional)
+        if not buy_ok or not sell_ok:
             continue
         buy_price = buy_quote.ask
         sell_price = sell_quote.bid
@@ -4992,6 +5094,10 @@ def compute_p2p_cross_opportunities(
         sell_fee = get_p2p_fee_percent(sell_v, base)
         gross_percent = (sell_price - buy_price) / buy_price * 100.0
         net_percent = gross_percent - buy_fee - sell_fee
+        executable_notional = min(
+            _effective_notional_capacity(buy_meta, target_notional),
+            _effective_notional_capacity(sell_meta, target_notional),
+        )
         opportunities.append(
             Opportunity(
                 pair=pair,
@@ -5005,6 +5111,25 @@ def compute_p2p_cross_opportunities(
                 notes={
                     "p2p_buy_fee_percent": buy_fee,
                     "p2p_sell_fee_percent": sell_fee,
+                    "buy_bank": buy_meta.get("bank"),
+                    "buy_payment_method": buy_meta.get("payment_method"),
+                    "sell_bank": sell_meta.get("bank"),
+                    "sell_payment_method": sell_meta.get("payment_method"),
+                    "ad_limits": {
+                        "buy": {
+                            "amount_min": buy_meta.get("amount_min"),
+                            "amount_max": buy_meta.get("amount_max"),
+                            "min_notional": buy_meta.get("min_notional"),
+                            "max_notional": buy_meta.get("max_notional"),
+                        },
+                        "sell": {
+                            "amount_min": sell_meta.get("amount_min"),
+                            "amount_max": sell_meta.get("amount_max"),
+                            "min_notional": sell_meta.get("min_notional"),
+                            "max_notional": sell_meta.get("max_notional"),
+                        },
+                    },
+                    "executable_qty_real": executable_notional / buy_price if buy_price > 0 else 0.0,
                 },
             )
         )
