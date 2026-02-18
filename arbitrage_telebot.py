@@ -1388,6 +1388,14 @@ BASE_CONFIG = {
     },
     "log_csv_path": str(Path(LOG_BASE_DIR) / "opportunities.csv"),
     "triangular_log_csv_path": str(Path(LOG_BASE_DIR) / "triangular_opportunities.csv"),
+    "signal_lifecycle_csv_path": str(Path(LOG_BASE_DIR) / "signal_lifecycle.csv"),
+    "execution_results_csv_path": str(Path(LOG_BASE_DIR) / "execution_results.csv"),
+    "adaptive_tuning": {
+        "enabled": True,
+        "min_samples": 8,
+        "threshold_step_percent": 0.03,
+        "slippage_step_bps": 0.5,
+    },
     "market_rules": {
         "binance": {
             "BTC/USDT": {"min_notional": 10.0, "min_qty": 0.0001, "step_size": 0.000001},
@@ -1475,6 +1483,40 @@ LOG_HEADER = [
 ]
 
 
+SIGNAL_LIFECYCLE_HEADER = [
+    "ts",
+    "signal_id",
+    "state",
+    "pair",
+    "strategy",
+    "buy_venue",
+    "sell_venue",
+    "est_pnl_quote",
+    "pnl_real_quote",
+    "pnl_delta_quote",
+    "outcome",
+    "reason",
+]
+
+EXECUTION_RESULTS_HEADER = [
+    "ts",
+    "signal_id",
+    "pair",
+    "strategy",
+    "buy_venue",
+    "sell_venue",
+    "est_pnl_quote",
+    "pnl_real_quote",
+    "pnl_estimado_percent",
+    "pnl_real_percent",
+    "delta_quote",
+    "delta_percent",
+    "outcome",
+    "reason",
+]
+
+SIGNAL_REGISTRY: Dict[str, Dict[str, Any]] = {}
+
 def snapshot_public_config() -> Dict[str, Any]:
     with CONFIG_LOCK:
         venues = {
@@ -1498,6 +1540,144 @@ def snapshot_public_config() -> Dict[str, Any]:
 
 def refresh_config_snapshot() -> None:
     RUNTIME_STATE.set_config_snapshot(snapshot_public_config())
+
+def _ensure_csv_header(path: str, header: List[str]) -> None:
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(header)
+
+
+def _append_csv_row(path: str, header: List[str], row: List[Any]) -> None:
+    if not path:
+        return
+    _ensure_csv_header(path, header)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(row)
+
+
+def make_signal_id(opp: "Opportunity", ts: Optional[int] = None) -> str:
+    event_ts = int(ts or time.time())
+    raw = f"{event_ts}|{opp.strategy}|{opp.pair}|{opp.buy_venue}|{opp.sell_venue}|{opp.buy_price:.8f}|{opp.sell_price:.8f}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def record_signal_lifecycle_event(
+    signal_id: str,
+    state: str,
+    *,
+    pair: str,
+    strategy: str,
+    buy_venue: str,
+    sell_venue: str,
+    est_pnl_quote: float = 0.0,
+    pnl_real_quote: float = 0.0,
+    outcome: str = "",
+    reason: str = "",
+) -> None:
+    pnl_delta = pnl_real_quote - est_pnl_quote
+    _append_csv_row(
+        str(CONFIG.get("signal_lifecycle_csv_path", "")),
+        SIGNAL_LIFECYCLE_HEADER,
+        [
+            int(time.time()),
+            signal_id,
+            state,
+            pair,
+            strategy,
+            buy_venue,
+            sell_venue,
+            f"{est_pnl_quote:.6f}",
+            f"{pnl_real_quote:.6f}",
+            f"{pnl_delta:.6f}",
+            outcome,
+            reason,
+        ],
+    )
+
+
+def compute_reliability_rankings(limit: int = 10) -> Dict[str, List[Dict[str, Any]]]:
+    path = str(CONFIG.get("execution_results_csv_path", ""))
+    if not path or not os.path.exists(path):
+        return {"strategy": [], "pair": [], "venue": []}
+
+    buckets: Dict[str, Dict[str, Dict[str, float]]] = {
+        "strategy": {},
+        "pair": {},
+        "venue": {},
+    }
+
+    def _accumulate(kind: str, key: str, won: bool, delta_percent: float) -> None:
+        stats = buckets[kind].setdefault(key, {"trades": 0.0, "wins": 0.0, "delta_sum": 0.0})
+        stats["trades"] += 1
+        if won:
+            stats["wins"] += 1
+        stats["delta_sum"] += delta_percent
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            outcome = str(row.get("outcome", "")).strip().lower()
+            won = outcome in {"gano", "ganó", "win", "won"}
+            delta_percent = safe_float(row.get("delta_percent"), 0.0)
+            strategy = str(row.get("strategy", "")).strip() or "unknown"
+            pair = str(row.get("pair", "")).strip() or "unknown"
+            venue = f"{row.get('buy_venue', '')}->{row.get('sell_venue', '')}".strip("->") or "unknown"
+            _accumulate("strategy", strategy, won, delta_percent)
+            _accumulate("pair", pair, won, delta_percent)
+            _accumulate("venue", venue, won, delta_percent)
+
+    rankings: Dict[str, List[Dict[str, Any]]] = {}
+    for kind, values in buckets.items():
+        rows: List[Dict[str, Any]] = []
+        for key, stats in values.items():
+            trades = int(stats["trades"])
+            if trades <= 0:
+                continue
+            win_rate = stats["wins"] / trades
+            avg_delta = stats["delta_sum"] / trades
+            score = (win_rate * 100.0) + avg_delta
+            rows.append({
+                "key": key,
+                "trades": trades,
+                "win_rate": win_rate,
+                "avg_delta_percent": avg_delta,
+                "score": score,
+            })
+        rows.sort(key=lambda item: item["score"], reverse=True)
+        rankings[kind] = rows[:limit]
+    return rankings
+
+
+def apply_adaptive_tuning_from_results() -> None:
+    tuning_cfg = CONFIG.get("adaptive_tuning", {}) or {}
+    if not tuning_cfg.get("enabled", True):
+        return
+
+    rankings = compute_reliability_rankings(limit=1)
+    pair_rank = rankings.get("pair", [])
+    if not pair_rank:
+        return
+
+    best = pair_rank[0]
+    min_samples = int(tuning_cfg.get("min_samples", 8))
+    if best.get("trades", 0) < min_samples:
+        return
+
+    threshold_step = float(tuning_cfg.get("threshold_step_percent", 0.03))
+    slippage_step = float(tuning_cfg.get("slippage_step_bps", 0.5))
+    win_rate = float(best.get("win_rate", 0.0))
+
+    if win_rate < 0.5:
+        CONFIG["threshold_percent"] = round(float(CONFIG.get("threshold_percent", 0.0)) + threshold_step, 4)
+        for venue_cfg in CONFIG.get("venues", {}).values():
+            venue_cfg["taker_fee_percent"] = round(float(venue_cfg.get("taker_fee_percent", 0.0)) + 0.005, 4)
+    elif win_rate > 0.7:
+        CONFIG["threshold_percent"] = round(max(0.05, float(CONFIG.get("threshold_percent", 0.0)) - threshold_step), 4)
+        exec_costs = CONFIG.setdefault("execution_costs", {})
+        exec_costs["slippage_bps"] = round(max(0.0, float(exec_costs.get("slippage_bps", 0.0)) - slippage_step), 4)
 
 def update_analysis_state(capital_quote: float, log_path: str) -> None:
     global LATEST_ANALYSIS, DYNAMIC_THRESHOLD_PERCENT
@@ -2208,6 +2388,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if self.path == "/api/signals/manual":
+            if not self._require_authentication():
+                return
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            data = self._parse_json(raw)
+            if data is None:
+                return
+            ok, message = settle_signal_result(data, settled_by="api")
+            status = 200 if ok else 400
+            self._send_json({"ok": ok, "message": message}, status=status)
+            return
+
+        if self.path == "/api/rankings":
+            if not self._require_authentication():
+                return
+            self._send_json({"rankings": compute_reliability_rankings(limit=10)})
+            return
+
         if self.path == "/api/config":
             global DYNAMIC_THRESHOLD_PERCENT
             if not self._require_authentication():
@@ -2760,6 +2959,125 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
     return False
 
 
+def parse_manual_settlement(argument: str) -> Optional[Dict[str, Any]]:
+    if not argument:
+        return None
+    parts = argument.strip().split()
+    if len(parts) < 3:
+        return None
+    signal_id = parts[0].strip()
+    outcome = parts[1].strip().lower()
+    if outcome in {"gano", "ganó", "win", "won"}:
+        normalized_outcome = "win"
+    elif outcome in {"perdio", "perdió", "lose", "lost"}:
+        normalized_outcome = "loss"
+    else:
+        return None
+    try:
+        pnl_real = float(parts[2].replace(",", "."))
+    except ValueError:
+        return None
+    reason = " ".join(parts[3:]).strip()
+    return {
+        "signal_id": signal_id,
+        "outcome": normalized_outcome,
+        "pnl_real_quote": pnl_real,
+        "reason": reason,
+    }
+
+
+def settle_signal_result(payload: Dict[str, Any], settled_by: str = "manual") -> Tuple[bool, str]:
+    signal_id = str(payload.get("signal_id", "")).strip()
+    if not signal_id:
+        return False, "signal_id requerido"
+
+    signal = SIGNAL_REGISTRY.get(signal_id)
+    if not signal:
+        return False, "signal_id no encontrado"
+
+    pnl_real = float(payload.get("pnl_real_quote", 0.0))
+    outcome = str(payload.get("outcome", "")).strip().lower() or ("win" if pnl_real >= 0 else "loss")
+    reason = str(payload.get("reason", "")).strip()
+
+    signal["state"] = "executed"
+    record_signal_lifecycle_event(
+        signal_id,
+        "executed",
+        pair=signal["pair"],
+        strategy=signal["strategy"],
+        buy_venue=signal["buy_venue"],
+        sell_venue=signal["sell_venue"],
+        est_pnl_quote=float(signal.get("est_profit_quote", 0.0)),
+        pnl_real_quote=pnl_real,
+        outcome=outcome,
+        reason=reason,
+    )
+
+    signal["state"] = "settled"
+    signal["pnl_real_quote"] = pnl_real
+    signal["outcome"] = outcome
+    signal["reason"] = reason
+    signal["settled_by"] = settled_by
+
+    est_pnl = float(signal.get("est_profit_quote", 0.0))
+    capital_used = max(1e-9, float(signal.get("capital_used_quote", 0.0)))
+    est_pct = (est_pnl / capital_used) * 100.0
+    real_pct = (pnl_real / capital_used) * 100.0
+    delta_quote = pnl_real - est_pnl
+    delta_pct = real_pct - est_pct
+
+    record_signal_lifecycle_event(
+        signal_id,
+        "settled",
+        pair=signal["pair"],
+        strategy=signal["strategy"],
+        buy_venue=signal["buy_venue"],
+        sell_venue=signal["sell_venue"],
+        est_pnl_quote=est_pnl,
+        pnl_real_quote=pnl_real,
+        outcome=outcome,
+        reason=reason,
+    )
+
+    _append_csv_row(
+        str(CONFIG.get("execution_results_csv_path", "")),
+        EXECUTION_RESULTS_HEADER,
+        [
+            int(time.time()),
+            signal_id,
+            signal["pair"],
+            signal["strategy"],
+            signal["buy_venue"],
+            signal["sell_venue"],
+            f"{est_pnl:.6f}",
+            f"{pnl_real:.6f}",
+            f"{est_pct:.6f}",
+            f"{real_pct:.6f}",
+            f"{delta_quote:.6f}",
+            f"{delta_pct:.6f}",
+            outcome,
+            reason,
+        ],
+    )
+
+    with STATE_LOCK:
+        analysis_state = DASHBOARD_STATE.setdefault("analysis", {}) or {}
+        analysis_state["last_manual_settlement"] = {
+            "signal_id": signal_id,
+            "outcome": outcome,
+            "pnl_real_quote": pnl_real,
+            "delta_quote": delta_quote,
+            "delta_percent": delta_pct,
+        }
+        analysis_state["reliability_ranking"] = compute_reliability_rankings(limit=5)
+        DASHBOARD_STATE["analysis"] = analysis_state
+
+    return True, (
+        f"Resultado guardado para {signal_id}: {outcome.upper()} | "
+        f"real={pnl_real:.2f} USDT | Δ={delta_quote:.2f} USDT"
+    )
+
+
 def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) -> None:
     global DYNAMIC_THRESHOLD_PERCENT
     command = command.lower()
@@ -2965,6 +3283,37 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
 
     if command in ("/test", "/senalprueba"):
         tg_send_message(build_test_signal_message(), enabled=enabled, chat_id=chat_id)
+        return
+
+    if command == "/settle":
+        if not ensure_admin(chat_id, enabled):
+            return
+        parsed = parse_manual_settlement(argument)
+        if not parsed:
+            tg_send_message(
+                "Uso: /settle <signal_id> <gano|perdio> <pnl_real> [motivo]",
+                enabled=enabled,
+                chat_id=chat_id,
+            )
+            return
+        ok, message = settle_signal_result(parsed, settled_by=f"telegram:{chat_id}")
+        tg_send_message(message, enabled=enabled, chat_id=chat_id)
+        return
+
+    if command == "/ranking":
+        rankings = compute_reliability_rankings(limit=3)
+        lines = ["🏆 Ranking de confiabilidad"]
+        for kind, title in (("strategy", "Estrategia"), ("pair", "Par"), ("venue", "Venue")):
+            lines.append(f"\n*{title}:*")
+            entries = rankings.get(kind, [])
+            if not entries:
+                lines.append("- Sin datos")
+                continue
+            for item in entries:
+                lines.append(
+                    f"- `{item['key']}` | win={item['win_rate']*100:.1f}% | n={item['trades']} | Δ%={item['avg_delta_percent']:.2f}"
+                )
+        tg_send_message("\n".join(lines), enabled=enabled, chat_id=chat_id)
         return
 
     tg_send_message(
@@ -6489,7 +6838,31 @@ def run_once() -> None:
                     capital_used,
                     link_items,
                 )
+                signal_id = make_signal_id(opp)
+                entry["signal_id"] = signal_id
+                SIGNAL_REGISTRY[signal_id] = dict(entry)
+                SIGNAL_REGISTRY[signal_id]["state"] = "detected"
+                record_signal_lifecycle_event(
+                    signal_id,
+                    "detected",
+                    pair=opp.pair,
+                    strategy=opp.strategy,
+                    buy_venue=opp.buy_venue,
+                    sell_venue=opp.sell_venue,
+                    est_pnl_quote=est_profit,
+                )
+                msg = f"{msg}\n*Signal ID:* `{signal_id}`"
                 tg_send_message(msg, enabled=tg_enabled)
+                SIGNAL_REGISTRY[signal_id]["state"] = "sent"
+                record_signal_lifecycle_event(
+                    signal_id,
+                    "sent",
+                    pair=opp.pair,
+                    strategy=opp.strategy,
+                    buy_venue=opp.buy_venue,
+                    sell_venue=opp.sell_venue,
+                    est_pnl_quote=est_profit,
+                )
                 log_event(
                     "opportunity.alert",
                     pair=opp.pair,
@@ -6645,7 +7018,31 @@ def run_once() -> None:
                     capital_used,
                     link_items,
                 )
+                signal_id = make_signal_id(opp)
+                entry["signal_id"] = signal_id
+                SIGNAL_REGISTRY[signal_id] = dict(entry)
+                SIGNAL_REGISTRY[signal_id]["state"] = "detected"
+                record_signal_lifecycle_event(
+                    signal_id,
+                    "detected",
+                    pair=opp.pair,
+                    strategy=opp.strategy,
+                    buy_venue=opp.buy_venue,
+                    sell_venue=opp.sell_venue,
+                    est_pnl_quote=est_profit,
+                )
+                msg = f"{msg}\n*Signal ID:* `{signal_id}`"
                 tg_send_message(msg, enabled=tg_enabled)
+                SIGNAL_REGISTRY[signal_id]["state"] = "sent"
+                record_signal_lifecycle_event(
+                    signal_id,
+                    "sent",
+                    pair=opp.pair,
+                    strategy=opp.strategy,
+                    buy_venue=opp.buy_venue,
+                    sell_venue=opp.sell_venue,
+                    est_pnl_quote=est_profit,
+                )
                 log_event(
                     "opportunity.alert",
                     pair=opp.pair,
@@ -6767,7 +7164,31 @@ def run_once() -> None:
                     capital_used,
                     link_items,
                 )
+                signal_id = make_signal_id(opp)
+                entry["signal_id"] = signal_id
+                SIGNAL_REGISTRY[signal_id] = dict(entry)
+                SIGNAL_REGISTRY[signal_id]["state"] = "detected"
+                record_signal_lifecycle_event(
+                    signal_id,
+                    "detected",
+                    pair=opp.pair,
+                    strategy=opp.strategy,
+                    buy_venue=opp.buy_venue,
+                    sell_venue=opp.sell_venue,
+                    est_pnl_quote=est_profit,
+                )
+                msg = f"{msg}\n*Signal ID:* `{signal_id}`"
                 tg_send_message(msg, enabled=tg_enabled)
+                SIGNAL_REGISTRY[signal_id]["state"] = "sent"
+                record_signal_lifecycle_event(
+                    signal_id,
+                    "sent",
+                    pair=opp.pair,
+                    strategy=opp.strategy,
+                    buy_venue=opp.buy_venue,
+                    sell_venue=opp.sell_venue,
+                    est_pnl_quote=est_profit,
+                )
                 log_event(
                     "opportunity.alert",
                     pair=opp.pair,
