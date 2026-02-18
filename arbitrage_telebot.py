@@ -22,6 +22,12 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
 
 import requests
 
+from config_store import (
+    build_runtime_payload,
+    load_config_with_runtime,
+    write_runtime_config,
+)
+
 try:
     from prometheus_client import (
         CONTENT_TYPE_LATEST,
@@ -159,7 +165,7 @@ def emit_pair_coverage(pair: str, venues: Iterable[str]) -> None:
 # =========================
 # CONFIG
 # =========================
-CONFIG = {
+BASE_CONFIG = {
     "threshold_percent": 0.30,      # alerta si neto >= 0.30%
     "pairs": [
         # En modo de prueba solo consideramos los activos solicitados
@@ -198,7 +204,12 @@ CONFIG = {
         "spot_spot": True,
         "spot_p2p": True,
         "p2p_p2p": True,
+        "ars_usdt_roundtrip": False,
         "triangular_intra_venue": True,
+    },
+    "p2p_execution": {
+        "allowed_payment_methods": ["BANK_TRANSFER"],
+        "min_advertiser_reputation": 0.80,
     },
     "offline_quotes": {
         # Valores de respaldo en caso de faltar la configuración de pruebas
@@ -1391,6 +1402,17 @@ CONFIG = {
     },
 }
 
+RUNTIME_CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", "data/runtime_config.json"))
+
+CONFIG, _RUNTIME_LOADED = load_config_with_runtime(BASE_CONFIG, RUNTIME_CONFIG_PATH)
+
+
+def persist_runtime_config() -> None:
+    runtime_payload = build_runtime_payload(CONFIG)
+    write_runtime_config(RUNTIME_CONFIG_PATH, runtime_payload)
+    CONFIG["config_version"] = runtime_payload["config_version"]
+    CONFIG["updated_at"] = runtime_payload["updated_at"]
+
 DYNAMIC_THRESHOLD_PERCENT: float = float(CONFIG.get("threshold_percent", 0.0))
 
 TELEGRAM_CHAT_IDS: Set[str] = set()
@@ -1443,7 +1465,10 @@ LOG_HEADER = [
     "volatility_score",
     "priority_score",
     "confidence",
-    "quality_score",
+    "buy_vwap",
+    "sell_vwap",
+    "effective_slippage_bps",
+    "executable_qty",
 ]
 
 
@@ -1456,9 +1481,12 @@ def snapshot_public_config() -> Dict[str, Any]:
         for name, data in CONFIG.get("venues", {}).items()
     }
     return {
+        "config_version": int(CONFIG.get("config_version", 1)),
+        "updated_at": str(CONFIG.get("updated_at", "")),
         "threshold_percent": float(CONFIG.get("threshold_percent", 0.0)),
         "pairs": normalize_pair_list(CONFIG.get("pairs", [])),
         "simulation_capital_quote": float(CONFIG.get("simulation_capital_quote", 0.0)),
+        "strategies": dict(CONFIG.get("strategies", {})),
         "venues": venues,
         "telegram_enabled": bool(CONFIG.get("telegram", {}).get("enabled", False)),
     }
@@ -2144,6 +2172,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             updated = {}
             errors: List[str] = []
+            should_persist = False
             with CONFIG_LOCK:
                 if "threshold_percent" in data:
                     try:
@@ -2151,6 +2180,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         CONFIG["threshold_percent"] = value
                         DYNAMIC_THRESHOLD_PERCENT = value
                         updated["threshold_percent"] = value
+                        should_persist = True
                     except (TypeError, ValueError):
                         errors.append("threshold_percent inválido")
                 if "simulation_capital_quote" in data:
@@ -2160,18 +2190,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             raise ValueError
                         CONFIG["simulation_capital_quote"] = value
                         updated["simulation_capital_quote"] = value
+                        should_persist = True
                     except (TypeError, ValueError):
                         errors.append("simulation_capital_quote inválido")
                 if "pairs" in data:
                     if isinstance(data["pairs"], list):
-                        pairs = [str(p).upper() for p in data["pairs"] if str(p).strip()]
+                        pairs = normalize_pair_list(data["pairs"])
                         if pairs:
                             CONFIG["pairs"] = pairs
                             updated["pairs"] = pairs
+                            should_persist = True
                         else:
                             errors.append("pairs no puede quedar vacío")
                     else:
                         errors.append("pairs debe ser lista")
+                if "strategies" in data:
+                    if isinstance(data["strategies"], dict):
+                        CONFIG["strategies"] = {k: bool(v) for k, v in data["strategies"].items()}
+                        updated["strategies"] = dict(CONFIG["strategies"])
+                        should_persist = True
+                    else:
+                        errors.append("strategies debe ser objeto")
+                if "p2p" in data:
+                    if isinstance(data["p2p"], dict):
+                        for venue, p2p_cfg in data["p2p"].items():
+                            if not isinstance(p2p_cfg, dict):
+                                errors.append(f"p2p.{venue} debe ser objeto")
+                                continue
+                            CONFIG.setdefault("venues", {}).setdefault(venue, {})["p2p"] = p2p_cfg
+                        if not any(err.startswith("p2p.") for err in errors):
+                            updated["p2p"] = data["p2p"]
+                            should_persist = True
+                    else:
+                        errors.append("p2p debe ser objeto")
+                if should_persist and not errors:
+                    persist_runtime_config()
             refresh_config_snapshot()
             if not errors:
                 capital = float(CONFIG.get("simulation_capital_quote", 0.0))
@@ -2432,6 +2485,23 @@ class DepthInfo:
     levels: int
     ts: int
     checksum: str
+    bid_levels: List[Tuple[float, float]] = field(default_factory=list)
+    ask_levels: List[Tuple[float, float]] = field(default_factory=list)
+
+
+def _parse_orderbook_levels(entries: Any, max_levels: int = 20) -> List[Tuple[float, float]]:
+    parsed: List[Tuple[float, float]] = []
+    if not isinstance(entries, list):
+        return parsed
+    for entry in entries[:max(1, int(max_levels))]:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        price = safe_float(entry[0])
+        qty = safe_float(entry[1])
+        if price <= 0 or qty <= 0:
+            continue
+        parsed.append((price, qty))
+    return parsed
 
 
 @dataclass
@@ -2598,6 +2668,7 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
             return True
         with CONFIG_LOCK:
             CONFIG["pairs"].append(pair)
+            persist_runtime_config()
         refresh_config_snapshot()
         set_pending_action(chat_id, None)
         tg_send_message(
@@ -2627,6 +2698,7 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
             return True
         with CONFIG_LOCK:
             CONFIG["pairs"] = [p for p in CONFIG["pairs"] if p != target]
+            persist_runtime_config()
         refresh_config_snapshot()
         set_pending_action(chat_id, None)
         tg_send_message(
@@ -2717,6 +2789,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             return
         with CONFIG_LOCK:
             CONFIG["simulation_capital_quote"] = value
+            persist_runtime_config()
         refresh_config_snapshot()
         tg_send_message(
             (
@@ -3126,6 +3199,49 @@ def apply_slippage(price: float, slippage_bps: float, side: str) -> float:
     return max(price * (1.0 - factor), 0.0)
 
 
+def compute_executable_price(
+    depth: Optional[DepthInfo], side: str, target_qty: float
+) -> Optional[Tuple[float, float, float]]:
+    if not depth or target_qty <= 0:
+        return None
+
+    normalized_side = side.lower()
+    if normalized_side == "buy":
+        levels = depth.ask_levels
+        reference_price = float(depth.best_ask)
+    elif normalized_side == "sell":
+        levels = depth.bid_levels
+        reference_price = float(depth.best_bid)
+    else:
+        return None
+
+    if reference_price <= 0 or not levels:
+        return None
+
+    remaining = float(target_qty)
+    executed_qty = 0.0
+    executed_notional = 0.0
+    for price, qty in levels:
+        if remaining <= 0:
+            break
+        take_qty = min(remaining, qty)
+        if take_qty <= 0:
+            continue
+        executed_qty += take_qty
+        executed_notional += take_qty * price
+        remaining -= take_qty
+
+    if executed_qty <= 0:
+        return None
+
+    vwap = executed_notional / executed_qty
+    if normalized_side == "buy":
+        slippage_bps = ((vwap / reference_price) - 1.0) * 10_000.0
+    else:
+        slippage_bps = (1.0 - (vwap / reference_price)) * 10_000.0
+    return vwap, slippage_bps, executed_qty
+
+
 def compute_base_quantity(capital_quote: float, buy_price: float, buy_slippage_bps: float) -> float:
     adjusted_buy = apply_slippage(buy_price, buy_slippage_bps, "buy")
     if adjusted_buy <= 0 or capital_quote <= 0:
@@ -3385,6 +3501,75 @@ def validate_p2p_notional(venue: str, asset: str, quote_amount: float) -> Tuple[
     if min_notional > 0 and quote_amount < min_notional:
         return False, "min_notional"
     return True, ""
+
+
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _p2p_execution_meta(quote: Quote) -> Dict[str, Any]:
+    metadata = quote.metadata if isinstance(quote.metadata, dict) else {}
+    return {
+        "bank": metadata.get("bank") or metadata.get("bank_name") or "",
+        "payment_method": metadata.get("payment_method") or metadata.get("pay_type") or "",
+        "amount_min": _safe_float_or_none(metadata.get("amount_min") or metadata.get("min_amount")),
+        "amount_max": _safe_float_or_none(metadata.get("amount_max") or metadata.get("max_amount")),
+        "min_notional": _safe_float_or_none(metadata.get("min_notional") or metadata.get("ad_min_notional")),
+        "max_notional": _safe_float_or_none(metadata.get("max_notional") or metadata.get("ad_max_notional")),
+        "reputation": _safe_float_or_none(metadata.get("advertiser_reputation") or metadata.get("reputation")),
+        "available_qty": _safe_float_or_none(metadata.get("available_qty") or metadata.get("quantity")),
+        "available_notional": _safe_float_or_none(metadata.get("available_notional") or metadata.get("amount_available")),
+    }
+
+
+def _p2p_quote_passes_filters(venue: str, quote: Quote, required_notional: float) -> Tuple[bool, Dict[str, Any], str]:
+    meta = _p2p_execution_meta(quote)
+    exec_cfg = CONFIG.get("p2p_execution") or {}
+    allowed_methods = set(get_p2p_payment_filters(venue))
+    allowed_methods.update(exec_cfg.get("allowed_payment_methods") or [])
+    method = str(meta.get("payment_method") or "").upper()
+    if allowed_methods and method and method not in {m.upper() for m in allowed_methods}:
+        return False, meta, "payment_method"
+
+    amount_min = meta.get("amount_min")
+    amount_max = meta.get("amount_max")
+    if amount_min is not None and required_notional < amount_min:
+        return False, meta, "amount_range"
+    if amount_max is not None and amount_max > 0 and required_notional > amount_max:
+        return False, meta, "amount_range"
+
+    min_notional = meta.get("min_notional")
+    max_notional = meta.get("max_notional")
+    if min_notional is not None and required_notional < min_notional:
+        return False, meta, "min_notional"
+    if max_notional is not None and max_notional > 0 and required_notional > max_notional:
+        return False, meta, "max_notional"
+
+    reputation_min = float(exec_cfg.get("min_advertiser_reputation", 0.0) or 0.0)
+    reputation = meta.get("reputation")
+    if reputation is not None and reputation < reputation_min:
+        return False, meta, "reputation"
+
+    return True, meta, ""
+
+
+def _effective_notional_capacity(meta: Dict[str, Any], fallback: float) -> float:
+    cap_values = [fallback]
+    available_notional = _safe_float_or_none(meta.get("available_notional"))
+    if available_notional is not None and available_notional > 0:
+        cap_values.append(available_notional)
+    amount_max = _safe_float_or_none(meta.get("amount_max"))
+    if amount_max is not None and amount_max > 0:
+        cap_values.append(amount_max)
+    max_notional = _safe_float_or_none(meta.get("max_notional"))
+    if max_notional is not None and max_notional > 0:
+        cap_values.append(max_notional)
+    return min(cap_values) if cap_values else fallback
 
 
 def emit_p2p_log(
@@ -3668,17 +3853,27 @@ class Binance(ExchangeAdapter):
                 integrity_key=self._integrity_key(sym, "depth"),
                 fallback_endpoints=[(fallback, {"symbol": sym, "limit": 20}) for fallback in fallbacks],
             )
-            bids = response.data.get("bids") or []
-            asks = response.data.get("asks") or []
+            bids = _parse_orderbook_levels(response.data.get("bids") or [])
+            asks = _parse_orderbook_levels(response.data.get("asks") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(b[1]) for b in bids)
-            ask_volume = sum(safe_float(a[1]) for a in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, ts_val, response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                ts_val,
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[binance] depth error {pair}: {exc}")
             return None
@@ -3831,21 +4026,31 @@ class Bybit(ExchangeAdapter):
                 ],
             )
             result = response.data.get("result") or {}
-            bids = result.get("b") or []
-            asks = result.get("a") or []
+            bids = _parse_orderbook_levels(result.get("b") or [])
+            asks = _parse_orderbook_levels(result.get("a") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(entry[1]) for entry in bids)
-            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_field = safe_float(result.get("ts") or response.data.get("time"))
             if ts_field > 0:
                 ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "bybit:depth")
             else:
                 ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                int(ts_val),
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[bybit] depth error {pair}: {exc}")
             return None
@@ -4206,21 +4411,31 @@ class KuCoin(ExchangeAdapter):
                 fallback_endpoints=[(fallback, {"symbol": sym}) for fallback in fallbacks],
             )
             data = response.data.get("data") or {}
-            bids = data.get("bids") or []
-            asks = data.get("asks") or []
+            bids = _parse_orderbook_levels(data.get("bids") or [])
+            asks = _parse_orderbook_levels(data.get("asks") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(entry[1]) for entry in bids)
-            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_field = safe_float(data.get("time"))
             if ts_field > 0:
                 ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "kucoin:depth")
             else:
                 ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                int(ts_val),
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[kucoin] depth error {pair}: {exc}")
             return None
@@ -4289,21 +4504,31 @@ class OKX(ExchangeAdapter):
             if not items:
                 raise HttpError("Depth vacío")
             item = items[0]
-            bids = item.get("bids") or []
-            asks = item.get("asks") or []
+            bids = _parse_orderbook_levels(item.get("bids") or [])
+            asks = _parse_orderbook_levels(item.get("asks") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(entry[1]) for entry in bids)
-            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_field = safe_float(item.get("ts") or response.data.get("ts"))
             if ts_field > 0:
                 ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "okx:depth")
             else:
                 ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                int(ts_val),
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[okx] depth error {pair}: {exc}")
             return None
@@ -4722,6 +4947,10 @@ class Opportunity:
     quality_score: float = 1.0
     strategy: str = "spot_spot"
     notes: Dict[str, Any] = field(default_factory=dict)
+    buy_vwap: float = 0.0
+    sell_vwap: float = 0.0
+    effective_slippage_bps: float = 0.0
+    executable_qty: float = 0.0
 
 
 @dataclass
@@ -5035,6 +5264,7 @@ def compute_spot_p2p_opportunities(
     opportunities: List[Opportunity] = []
     base, _ = split_pair(pair)
     asset = base.upper()
+    target_notional = float(CONFIG.get("simulation_capital_quote", 0.0) or 0.0)
     for spot_venue, spot_quote in spot_quotes.items():
         fee_cfg = fees.get(spot_venue)
         if not fee_cfg:
@@ -5046,11 +5276,15 @@ def compute_spot_p2p_opportunities(
         if spot_buy <= 0 or spot_sell <= 0:
             continue
         for p2p_venue, p2p_quote in p2p_quotes.items():
+            passes_filters, execution_meta, _ = _p2p_quote_passes_filters(p2p_venue, p2p_quote, target_notional)
+            if not passes_filters:
+                continue
             buy_fee = buy_schedule.taker_fee_percent
             sell_fee = sell_schedule.taker_fee_percent
             p2p_fee = get_p2p_fee_percent(p2p_venue, asset)
             p2p_bid = p2p_quote.bid
             p2p_ask = p2p_quote.ask
+            executable_notional = _effective_notional_capacity(execution_meta, target_notional)
             if p2p_bid > 0:
                 gross = (p2p_bid - spot_buy) / spot_buy * 100.0
                 net = gross - buy_fee - p2p_fee
@@ -5075,6 +5309,15 @@ def compute_spot_p2p_opportunities(
                             "p2p_fee_percent": p2p_fee,
                             "p2p_venue": p2p_venue,
                             "fiat": p2p_quote.metadata.get("fiat"),
+                            "bank": execution_meta.get("bank"),
+                            "payment_method": execution_meta.get("payment_method"),
+                            "ad_limits": {
+                                "amount_min": execution_meta.get("amount_min"),
+                                "amount_max": execution_meta.get("amount_max"),
+                                "min_notional": execution_meta.get("min_notional"),
+                                "max_notional": execution_meta.get("max_notional"),
+                            },
+                            "executable_qty_real": executable_notional / spot_buy if spot_buy > 0 else 0.0,
                         },
                     )
                 )
@@ -5102,6 +5345,15 @@ def compute_spot_p2p_opportunities(
                             "p2p_fee_percent": p2p_fee,
                             "p2p_venue": p2p_venue,
                             "fiat": p2p_quote.metadata.get("fiat"),
+                            "bank": execution_meta.get("bank"),
+                            "payment_method": execution_meta.get("payment_method"),
+                            "ad_limits": {
+                                "amount_min": execution_meta.get("amount_min"),
+                                "amount_max": execution_meta.get("amount_max"),
+                                "min_notional": execution_meta.get("min_notional"),
+                                "max_notional": execution_meta.get("max_notional"),
+                            },
+                            "executable_qty_real": executable_notional / p2p_ask if p2p_ask > 0 else 0.0,
                         },
                     )
                 )
@@ -5114,11 +5366,16 @@ def compute_p2p_cross_opportunities(
 ) -> List[Opportunity]:
     base, _ = split_pair(pair)
     opportunities: List[Opportunity] = []
+    target_notional = float(CONFIG.get("simulation_capital_quote", 0.0) or 0.0)
     venues = list(quotes.keys())
     for buy_v, sell_v in itertools.permutations(venues, 2):
         buy_quote = quotes.get(buy_v)
         sell_quote = quotes.get(sell_v)
         if not buy_quote or not sell_quote:
+            continue
+        buy_ok, buy_meta, _ = _p2p_quote_passes_filters(buy_v, buy_quote, target_notional)
+        sell_ok, sell_meta, _ = _p2p_quote_passes_filters(sell_v, sell_quote, target_notional)
+        if not buy_ok or not sell_ok:
             continue
         buy_price = buy_quote.ask
         sell_price = sell_quote.bid
@@ -5128,6 +5385,10 @@ def compute_p2p_cross_opportunities(
         sell_fee = get_p2p_fee_percent(sell_v, base)
         gross_percent = (sell_price - buy_price) / buy_price * 100.0
         net_percent = gross_percent - buy_fee - sell_fee
+        executable_notional = min(
+            _effective_notional_capacity(buy_meta, target_notional),
+            _effective_notional_capacity(sell_meta, target_notional),
+        )
         opportunities.append(
             Opportunity(
                 pair=pair,
@@ -5145,6 +5406,25 @@ def compute_p2p_cross_opportunities(
                 notes={
                     "p2p_buy_fee_percent": buy_fee,
                     "p2p_sell_fee_percent": sell_fee,
+                    "buy_bank": buy_meta.get("bank"),
+                    "buy_payment_method": buy_meta.get("payment_method"),
+                    "sell_bank": sell_meta.get("bank"),
+                    "sell_payment_method": sell_meta.get("payment_method"),
+                    "ad_limits": {
+                        "buy": {
+                            "amount_min": buy_meta.get("amount_min"),
+                            "amount_max": buy_meta.get("amount_max"),
+                            "min_notional": buy_meta.get("min_notional"),
+                            "max_notional": buy_meta.get("max_notional"),
+                        },
+                        "sell": {
+                            "amount_min": sell_meta.get("amount_min"),
+                            "amount_max": sell_meta.get("amount_max"),
+                            "min_notional": sell_meta.get("min_notional"),
+                            "max_notional": sell_meta.get("max_notional"),
+                        },
+                    },
+                    "executable_qty_real": executable_notional / buy_price if buy_price > 0 else 0.0,
                 },
             )
         )
@@ -5365,7 +5645,10 @@ def append_csv(
                 f"{opp.volatility_score:.4f}",
                 f"{opp.priority_score:.6f}",
                 opp.confidence_label,
-                f"{opp.quality_score:.6f}",
+                f"{opp.buy_vwap:.8f}",
+                f"{opp.sell_vwap:.8f}",
+                f"{opp.effective_slippage_bps:.4f}",
+                f"{opp.executable_qty:.8f}",
             ]
         )
 
@@ -5653,6 +5936,55 @@ def run_once() -> None:
                 )
                 if base_qty <= 0 or capital_used <= 0:
                     continue
+
+                buy_vwap = opp.buy_price
+                sell_vwap = opp.sell_price
+                executable_qty = base_qty
+                effective_slippage_bps = 0.0
+                buy_exec = compute_executable_price(opp.buy_depth, "buy", base_qty)
+                sell_exec = compute_executable_price(opp.sell_depth, "sell", base_qty)
+                if buy_exec or sell_exec:
+                    if not buy_exec or not sell_exec:
+                        print(
+                            f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} depth_insufficient"
+                        )
+                        continue
+                    buy_vwap, buy_slippage_bps, buy_executed_qty = buy_exec
+                    sell_vwap, sell_slippage_bps, sell_executed_qty = sell_exec
+                    if buy_executed_qty + 1e-12 < base_qty or sell_executed_qty + 1e-12 < base_qty:
+                        print(
+                            f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} depth_insufficient"
+                        )
+                        continue
+                    executable_qty = min(base_qty, buy_executed_qty, sell_executed_qty)
+                    effective_slippage_bps = buy_slippage_bps + sell_slippage_bps
+                    est_profit, est_percent, base_qty, capital_used = estimate_profit(
+                        capital_for_pair,
+                        buy_vwap,
+                        sell_vwap,
+                        total_fee_pct,
+                        max_base_qty=executable_qty,
+                    )
+                    if base_qty <= 0 or capital_used <= 0:
+                        continue
+                    if est_percent < threshold:
+                        print(
+                            f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} slippage_threshold"
+                        )
+                        continue
+
+                opp.buy_price = buy_vwap
+                opp.sell_price = sell_vwap
+                opp.executable_qty = base_qty
+                opp.buy_vwap = buy_vwap
+                opp.sell_vwap = sell_vwap
+                opp.effective_slippage_bps = effective_slippage_bps
+                opp.gross_percent = (
+                    ((opp.sell_price - opp.buy_price) / opp.buy_price) * 100.0
+                    if opp.buy_price > 0
+                    else 0.0
+                )
+                opp.net_percent = opp.gross_percent - total_fee_pct
                 valid_buy, reason_buy = validate_market_trade(
                     opp.buy_venue, opp.pair, base_qty, opp.buy_price
                 )
