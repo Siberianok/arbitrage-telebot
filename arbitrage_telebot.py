@@ -1910,7 +1910,7 @@ def build_test_signal_message() -> str:
         sample_opportunity.buy_venue, sample_opportunity.sell_venue, sample_opportunity.pair
     )
 
-    alert_message = fmt_alert(
+    alert_message = fmt_test_alert_table(
         sample_opportunity,
         est_profit=est_profit,
         est_percent=sample_opportunity.net_percent,
@@ -1923,8 +1923,7 @@ def build_test_signal_message() -> str:
     intro_lines = [
         "🧪✨ *SEÑAL DE PRUEBA* ✨🧪",
         "━━━━━━━━━━━━━━━━━━━━",
-        "📢 *Demo profesional del formato de alerta*",
-        "⚠️ *No ejecutar* — mensaje solo para validación visual",
+        "⚠️ *Solo validación visual / no ejecutar*",
     ]
 
     return "\n".join(intro_lines) + "\n\n" + alert_message
@@ -6583,7 +6582,6 @@ def fmt_alert(
             f"(`{format_percent_comma(est_percent)}`) sobre {format_decimal_comma(capital_quote, decimals=2)} USDT"
         ),
         f"*Cantidad base:* `{base_qty:.6f}` ({format_decimal_comma(capital_used, decimals=2)} USDT usados)",
-        f"*Calidad de señal:* `{opp.quality_score:.2f}`",
     ]
     fiat = opp.notes.get("fiat") if isinstance(opp.notes, dict) else None
     if fiat:
@@ -6598,6 +6596,48 @@ def fmt_alert(
         )
     lines.append(time.strftime("%Y-%m-%d %H:%M:%S"))
     return "\n".join(lines)
+
+
+def fmt_test_alert_table(
+    opp: Opportunity,
+    est_profit: float,
+    est_percent: float,
+    base_qty: float,
+    capital_quote: float,
+    capital_used: float,
+    links: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    del links  # reservado para uso futuro en modo test
+
+    buy_label = format_venue_label(opp.buy_venue)
+    sell_label = format_venue_label(opp.sell_venue)
+    now_text = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = [
+        ("Par", opp.pair),
+        ("Ruta", f"{buy_label} → {sell_label}"),
+        (
+            "Spread bruto/neto",
+            f"{format_percent_comma(opp.gross_percent)} / {format_percent_comma(opp.net_percent)}",
+        ),
+        (
+            "PnL estimado",
+            f"~{format_decimal_comma(est_profit, decimals=2)} USDT ({format_percent_comma(est_percent)})",
+        ),
+        (
+            "Capital base",
+            (
+                f"{format_decimal_comma(capital_quote, decimals=2)} USDT | "
+                f"Qty {base_qty:.6f} ({format_decimal_comma(capital_used, decimals=2)} USDT usados)"
+            ),
+        ),
+        ("Fecha", now_text),
+    ]
+
+    key_width = max(len(key) for key, _ in rows)
+    table_lines = [f"{key:<{key_width}} | {value}" for key, value in rows]
+    table_block = "```\n" + "\n".join(table_lines) + "\n```"
+    return "🚨 *Formato de alerta (test)*\n" + table_block
 
 
 def fmt_triangular_alert(opp: TriangularOpportunity, fee_percent: float) -> str:
