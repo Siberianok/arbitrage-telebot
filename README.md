@@ -69,6 +69,10 @@ Luego iniciar con `python arbitrage_telebot.py --web --interval 30 --port 10000`
 - `LOG_BASE_DIR` / `LOG_BACKUP_DIR`: directorios para logs y respaldos persistentes (por defecto `logs/` y `log_backups/`).
 - `QUOTE_WORKERS`: máximo de workers concurrentes para la recolección de precios (default 16).
 - `DEFAULT_QUOTE_ASSET`: moneda estable por defecto para componer pares al adherir o eliminar desde Telegram (default `USDT`).
+- `KEEPALIVE_URL`: URL pública del servicio para auto-ping (ej. `https://arbitrage-telebot-web.onrender.com`).
+- `KEEPALIVE_ENABLED`: habilita/deshabilita el auto-ping (`true`/`false`, default activado si `KEEPALIVE_URL` está definido).
+- `KEEPALIVE_INTERVAL_SECONDS`: cada cuántos segundos ejecutar el ping (mínimo 60, default 240).
+- `KEEPALIVE_TIMEOUT_SECONDS`: timeout HTTP del ping (default 8).
 
 🔎 Playbooks operativos
 

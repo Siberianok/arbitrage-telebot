@@ -1384,6 +1384,7 @@ DYNAMIC_THRESHOLD_PERCENT: float = float(CONFIG.get("threshold_percent", 0.0))
 TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
 TELEGRAM_POLLING_THREAD: Optional[threading.Thread] = None
+KEEPALIVE_THREAD: Optional[threading.Thread] = None
 TELEGRAM_ADMIN_IDS: Set[str] = set()
 TELEGRAM_POLL_BACKOFF_UNTIL = 0.0
 
@@ -2859,6 +2860,70 @@ def ensure_telegram_polling_thread(enabled: bool, interval: float = 1.0) -> None
         daemon=True,
     )
     TELEGRAM_POLLING_THREAD.start()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_keepalive_url() -> str:
+    url = os.getenv("KEEPALIVE_URL", "").strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    if url.endswith("/"):
+        return f"{url}health"
+    if url.endswith("/health"):
+        return url
+    return f"{url}/health"
+
+
+def ensure_keepalive_thread() -> None:
+    global KEEPALIVE_THREAD
+
+    keepalive_url = resolve_keepalive_url()
+    enabled_by_env = _env_flag("KEEPALIVE_ENABLED", default=bool(keepalive_url))
+    if not enabled_by_env:
+        log_event("keepalive.skip", reason="disabled")
+        return
+    if not keepalive_url:
+        log_event("keepalive.skip", reason="missing_url")
+        return
+    if KEEPALIVE_THREAD and KEEPALIVE_THREAD.is_alive():
+        return
+
+    interval_seconds = max(60, int(os.getenv("KEEPALIVE_INTERVAL_SECONDS", "240") or "240"))
+    timeout_seconds = max(2, int(os.getenv("KEEPALIVE_TIMEOUT_SECONDS", "8") or "8"))
+
+    def _loop() -> None:
+        while True:
+            try:
+                response = requests.get(
+                    keepalive_url,
+                    timeout=timeout_seconds,
+                    headers={"User-Agent": "arbitrage-telebot-keepalive/1.0"},
+                )
+                log_event(
+                    "keepalive.ping",
+                    url=keepalive_url,
+                    status_code=response.status_code,
+                )
+            except Exception as exc:
+                log_event("keepalive.error", url=keepalive_url, error=str(exc))
+            time.sleep(interval_seconds)
+
+    KEEPALIVE_THREAD = threading.Thread(target=_loop, name="render-keepalive", daemon=True)
+    KEEPALIVE_THREAD.start()
+    log_event(
+        "keepalive.started",
+        url=keepalive_url,
+        interval_seconds=interval_seconds,
+        timeout_seconds=timeout_seconds,
+    )
 
 # =========================
 # Modelo y Fees
@@ -5916,6 +5981,9 @@ def main():
         )
     if tg_enabled and (args.loop or args.web):
         ensure_telegram_polling_thread(enabled=True, interval=1.0)
+
+    if args.loop or args.web:
+        ensure_keepalive_thread()
 
     if args.web:
         t = threading.Thread(target=run_loop_forever, args=(args.interval,), daemon=True)

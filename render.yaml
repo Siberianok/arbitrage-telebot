@@ -21,3 +21,9 @@ services:
         value: /var/lib/arbitrage-telebot/logs
       - key: LOG_BACKUP_DIR
         value: /var/lib/arbitrage-telebot/backups
+      - key: KEEPALIVE_ENABLED
+        value: "true"
+      - key: KEEPALIVE_URL
+        sync: false
+      - key: KEEPALIVE_INTERVAL_SECONDS
+        value: "240"
