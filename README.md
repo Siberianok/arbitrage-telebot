@@ -35,13 +35,17 @@ Ejecución v1 (inventario): ejecutás el spread con saldo en ambos exchanges (si
 
 | Comando | Descripción |
 | --- | --- |
+| `/start` | Registra el chat y muestra la ayuda operativa con accesos rápidos. |
 | `/ping` | Devuelve `pong` para verificar la conectividad del bot. |
-| `/status` | Resume el threshold configurado, pares monitoreados y chats registrados. |
-| `/capital <monto>` | Consulta o actualiza el capital simulado (USDT) _(solo admins pueden modificar)_. |
-| `/listapares` | Muestra la lista de pares configurados actualmente. |
-| `/adherirpar` | Solicita la cripto a adherir y la agrega como `BASE/USDT` _(solo admins)_. |
-| `/eliminarpar` | Despliega botones con los pares actuales para elegir cuál eliminar _(solo admins)_. |
-| `/senalprueba` | Envía una señal de prueba para confirmar entregas. |
+| `/status` | Resume threshold base/dinámico, historial, pares monitoreados y chats registrados. |
+| `/threshold [valor]` | Consulta o actualiza el threshold base dentro del rango configurado _(solo admins)_. |
+| `/capital [monto]` | Consulta o actualiza el capital simulado (USDT) _(solo admins pueden modificar)_. |
+| `/pairs` | Muestra la lista de pares configurados actualmente. |
+| `/addpair` | Solicita la cripto a adherir y la agrega como `BASE/USDT` _(solo admins)_. |
+| `/delpair` | Despliega botones con los pares actuales para elegir cuál eliminar _(solo admins)_. |
+| `/test` | Envía una señal de prueba para confirmar entregas. |
+
+Aliases soportados: `/listapares` → `/pairs`, `/adherirpar` → `/addpair`, `/eliminarpar` → `/delpair`, `/senalprueba` → `/test`.
 
 Para restringir quién puede modificar parámetros, definir `TG_ADMIN_IDS` (lista de chat IDs separados por coma). Si no se configura, cualquier chat registrado podrá editar la configuración.
 

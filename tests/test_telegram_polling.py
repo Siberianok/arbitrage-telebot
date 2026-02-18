@@ -92,3 +92,69 @@ def test_tg_handle_command_status_includes_dynamic_threshold(monkeypatch):
 
     assert messages
     assert any("0.550%" in msg for msg in messages)
+
+
+
+def test_tg_handle_command_threshold_read_and_update_valid(monkeypatch):
+    messages = []
+    events = []
+
+    monkeypatch.setattr(bot, "tg_enable_menu_button", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "tg_send_message", lambda text, **payload: messages.append(text))
+    monkeypatch.setattr(bot, "register_telegram_chat", lambda chat_id: str(chat_id))
+    monkeypatch.setattr(bot, "refresh_config_snapshot", lambda: None)
+    monkeypatch.setattr(bot, "log_event", lambda event, **payload: events.append((event, payload)))
+
+    monkeypatch.setitem(bot.CONFIG, "analysis", {"min_threshold_percent": 0.1, "max_threshold_percent": 1.0})
+    bot.CONFIG["threshold_percent"] = 0.3
+    bot.TELEGRAM_ADMIN_IDS = {"123"}
+
+    bot.tg_handle_command("/threshold", "", "123", enabled=True)
+    bot.tg_handle_command("/threshold", "0.45", "123", enabled=True)
+
+    assert any("Threshold actual" in msg for msg in messages)
+    assert any("0,300" in msg for msg in messages)
+    assert bot.CONFIG["threshold_percent"] == 0.45
+    threshold_events = [payload for event, payload in events if event == "telegram.threshold.updated"]
+    assert threshold_events
+    assert threshold_events[0]["chat_id"] == "123"
+    assert threshold_events[0]["previous_threshold"] == 0.3
+    assert threshold_events[0]["new_threshold"] == 0.45
+
+
+def test_tg_handle_command_threshold_rejects_invalid_value(monkeypatch):
+    messages = []
+
+    monkeypatch.setattr(bot, "tg_enable_menu_button", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "tg_send_message", lambda text, **payload: messages.append(text))
+    monkeypatch.setattr(bot, "register_telegram_chat", lambda chat_id: str(chat_id))
+    monkeypatch.setattr(bot, "refresh_config_snapshot", lambda: None)
+    monkeypatch.setattr(bot, "log_event", lambda *args, **kwargs: None)
+
+    monkeypatch.setitem(bot.CONFIG, "analysis", {"min_threshold_percent": 0.1, "max_threshold_percent": 1.0})
+    bot.CONFIG["threshold_percent"] = 0.3
+    bot.TELEGRAM_ADMIN_IDS = {"123"}
+
+    bot.tg_handle_command("/threshold", "9", "123", enabled=True)
+
+    assert bot.CONFIG["threshold_percent"] == 0.3
+    assert any("fuera de rango" in msg for msg in messages)
+
+
+def test_tg_handle_command_threshold_requires_admin(monkeypatch):
+    messages = []
+
+    monkeypatch.setattr(bot, "tg_enable_menu_button", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot, "tg_send_message", lambda text, **payload: messages.append(text))
+    monkeypatch.setattr(bot, "register_telegram_chat", lambda chat_id: str(chat_id))
+    monkeypatch.setattr(bot, "refresh_config_snapshot", lambda: None)
+    monkeypatch.setattr(bot, "log_event", lambda *args, **kwargs: None)
+
+    monkeypatch.setitem(bot.CONFIG, "analysis", {"min_threshold_percent": 0.1, "max_threshold_percent": 1.0})
+    bot.CONFIG["threshold_percent"] = 0.3
+    bot.TELEGRAM_ADMIN_IDS = {"999"}
+
+    bot.tg_handle_command("/threshold", "0.4", "123", enabled=True)
+
+    assert bot.CONFIG["threshold_percent"] == 0.3
+    assert any("requiere privilegios" in msg for msg in messages)
