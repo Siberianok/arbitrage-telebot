@@ -176,6 +176,18 @@ BASE_CONFIG = {
     ],
     "simulation_capital_quote": 10_000,  # capital (USDT) para estimar PnL en alerta
     "max_quote_age_seconds": 12,  # descarta cotizaciones más viejas que este límite
+    "quote_quality": {
+        "max_age_seconds_by_venue": {
+            "default": 12,
+        },
+        "max_timestamp_skew_ms_by_source": {
+            "default": 20_000,
+            "p2p": 45_000,
+            "p2p_effective": 45_000,
+        },
+        "max_mid_deviation_percent": 3.5,
+        "max_spread_percent": 1.5,
+    },
     "capital_weights": {
         "pairs": {
             "default": 1.0,
@@ -1422,6 +1434,7 @@ DASHBOARD_STATE: Dict[str, Any] = {
     "config_snapshot": {},
     "exchange_metrics": {},
     "analysis": None,
+    "quote_discards": [],
 }
 
 MAX_ALERT_HISTORY = 20
@@ -1772,6 +1785,7 @@ def build_health_payload() -> Dict[str, Any]:
         latest_alerts = list(DASHBOARD_STATE.get("latest_alerts", []))[:5]
         latest_quotes = DASHBOARD_STATE.get("latest_quotes", {})
         quote_latency = DASHBOARD_STATE.get("last_quote_latency_ms")
+        quote_discards = list(DASHBOARD_STATE.get("quote_discards", []))[:50]
 
     status = "ok"
     if not summary:
@@ -1797,6 +1811,7 @@ def build_health_payload() -> Dict[str, Any]:
         "metrics": metrics,
         "latest_alerts": latest_alerts,
         "latest_quotes": latest_quotes,
+        "quote_discards": quote_discards,
         "telegram": {
             "enabled": telegram_enabled,
             "last_send_ts": LAST_TELEGRAM_SEND_TS or None,
@@ -1868,6 +1883,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <th>Spread Neto</th>
             <th>PnL estimado</th>
             <th>Confianza</th>
+            <th>Calidad</th>
             <th>Liquidez</th>
             <th>Links</th>
           </tr>
@@ -1880,6 +1896,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <section>
       <h2>Últimas alertas</h2>
       <div id=\"alerts\"></div>
+    </section>
+    <section>
+      <h2>Descartes de cotizaciones</h2>
+      <div id="quoteDiscards" class="timestamp">Sin descartes recientes.</div>
     </section>
     <section>
       <h2>Configuración</h2>
@@ -1931,7 +1951,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!opps.length) {
         const row = document.createElement('tr');
         const cell = document.createElement('td');
-        cell.colSpan = 6;
+        cell.colSpan = 9;
         cell.textContent = 'Sin oportunidades en la última corrida.';
         row.appendChild(cell);
         tbody.appendChild(row);
@@ -1948,6 +1968,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <td>${formatNumber(opp.net_percent, 3)} %</td>
             <td>${formatNumber(opp.est_profit_quote, 2)} USDT</td>
             <td>${(opp.confidence || '').toUpperCase()}</td>
+            <td>${formatNumber(opp.quality_score ?? 0, 2)}</td>
             <td>${formatNumber(opp.liquidity_score ?? 0, 2)}</td>
             <td>${renderLinks(opp.links)}</td>`;
           tbody.appendChild(row);
@@ -1964,10 +1985,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <p>${alert.buy_venue} ➜ ${alert.sell_venue}</p>
           <p>PnL estimado: ${formatNumber(alert.est_profit_quote, 2)} USDT (${formatNumber(alert.est_percent, 3)} %)</p>
           <p>${renderLinks(alert.links)}</p>
-          <p>Confianza: ${(alert.confidence || '').toUpperCase()} · Liquidez: ${formatNumber(alert.liquidity_score ?? 0, 2)}</p>
+          <p>Confianza: ${(alert.confidence || '').toUpperCase()} · Calidad: ${formatNumber(alert.quality_score ?? 0, 2)} · Liquidez: ${formatNumber(alert.liquidity_score ?? 0, 2)}</p>
           <p class='timestamp'>${alert.ts_str}</p>`;
         alertsRoot.appendChild(card);
       });
+
+      const discardRoot = document.getElementById('quoteDiscards');
+      const discards = (data.quote_discards || []);
+      if (!discards.length) {
+        discardRoot.textContent = 'Sin descartes recientes.';
+      } else {
+        discardRoot.innerHTML = discards.slice(0, 12).map((item) =>
+          `<div>• <strong>${item.pair}</strong> @ ${item.venue}: <code>${item.reason}</code></div>`
+        ).join('');
+      }
 
       const form = document.getElementById('configForm');
       form.threshold_percent.value = cfg.threshold_percent ?? '';
@@ -2122,6 +2153,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "config_snapshot": DASHBOARD_STATE.get("config_snapshot", {}),
                     "exchange_metrics": DASHBOARD_STATE.get("exchange_metrics", {}),
                     "analysis": DASHBOARD_STATE.get("analysis"),
+                    "quote_discards": DASHBOARD_STATE.get("quote_discards", []),
                 }
             self._send_json(payload)
             return
@@ -4529,10 +4561,123 @@ def build_adapters() -> Dict[str, ExchangeAdapter]:
     return adapters
 
 
-def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) -> Dict[str, Dict[str, Quote]]:
+def _normalize_discard_reason(reason: str) -> str:
+    token = str(reason or "unknown").strip().lower()
+    safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in token)
+    while "__" in safe:
+        safe = safe.replace("__", "_")
+    safe = safe.strip("_")
+    return safe or "unknown"
+
+
+def _quote_quality_config() -> Dict[str, Any]:
+    cfg = CONFIG.get("quote_quality")
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return cfg
+
+
+def validate_quote_quality(
+    pair: str,
+    venue: str,
+    quote: Quote,
+    pair_quotes: Dict[str, Quote],
+    now_ms: Optional[int] = None,
+) -> Tuple[bool, List[str], float]:
+    now = int(now_ms if now_ms is not None else current_millis())
+    reasons: List[str] = []
+
+    quality_cfg = _quote_quality_config()
+    max_age_cfg = quality_cfg.get("max_age_seconds_by_venue") or {}
+    default_max_age = float(
+        max_age_cfg.get("default", CONFIG.get("max_quote_age_seconds", 0.0)) or 0.0
+    )
+    max_age_seconds = float(max_age_cfg.get(venue, default_max_age) or default_max_age)
+
+    source_key = str(getattr(quote, "source", "") or "").lower() or "default"
+    skew_cfg = quality_cfg.get("max_timestamp_skew_ms_by_source") or {}
+    max_skew_ms = int(skew_cfg.get(source_key, skew_cfg.get("default", 20_000)) or 20_000)
+
+    max_mid_deviation_percent = float(quality_cfg.get("max_mid_deviation_percent", 0.0) or 0.0)
+    max_spread_percent = float(quality_cfg.get("max_spread_percent", 0.0) or 0.0)
+
+    try:
+        bid = float(quote.bid)
+        ask = float(quote.ask)
+    except (TypeError, ValueError):
+        bid = math.nan
+        ask = math.nan
+
+    try:
+        ts_value = int(quote.ts)
+    except (TypeError, ValueError):
+        ts_value = 0
+
+    if not math.isfinite(bid) or not math.isfinite(ask) or bid <= 0 or ask <= 0:
+        reasons.append("invalid_prices")
+    if math.isfinite(bid) and math.isfinite(ask) and bid >= ask:
+        reasons.append("inverted_spread")
+
+    age_ms = max(0, now - ts_value) if ts_value > 0 else None
+    if max_age_seconds > 0 and (age_ms is None or age_ms > max_age_seconds * 1000.0):
+        reasons.append("stale_quote")
+
+    if max_skew_ms > 0 and (ts_value <= 0 or abs(now - ts_value) > max_skew_ms):
+        reasons.append("timestamp_skew")
+
+    spread_pct = 0.0
+    if bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+        if mid > 0:
+            spread_pct = ((ask - bid) / mid) * 100.0
+    if max_spread_percent > 0 and spread_pct > max_spread_percent:
+        reasons.append("anomalous_spread")
+
+    mids: List[float] = []
+    for pair_quote in pair_quotes.values():
+        try:
+            q_bid = float(pair_quote.bid)
+            q_ask = float(pair_quote.ask)
+        except (TypeError, ValueError):
+            continue
+        if q_bid <= 0 or q_ask <= 0 or q_bid >= q_ask:
+            continue
+        mids.append((q_bid + q_ask) / 2.0)
+
+    if max_mid_deviation_percent > 0 and len(mids) >= 3 and bid > 0 and ask > 0 and bid < ask:
+        sorted_mids = sorted(mids)
+        mid_idx = len(sorted_mids) // 2
+        if len(sorted_mids) % 2 == 1:
+            median_mid = sorted_mids[mid_idx]
+        else:
+            median_mid = (sorted_mids[mid_idx - 1] + sorted_mids[mid_idx]) / 2.0
+        quote_mid = (bid + ask) / 2.0
+        if median_mid > 0:
+            deviation_pct = abs((quote_mid - median_mid) / median_mid) * 100.0
+            if deviation_pct > max_mid_deviation_percent:
+                reasons.append("intervenue_outlier")
+
+    unique_reasons = sorted({_normalize_discard_reason(reason) for reason in reasons})
+    penalties = {
+        "invalid_prices": 1.0,
+        "inverted_spread": 1.0,
+        "stale_quote": 0.35,
+        "timestamp_skew": 0.30,
+        "intervenue_outlier": 0.45,
+        "anomalous_spread": 0.30,
+    }
+    quality_score = 1.0
+    for reason in unique_reasons:
+        quality_score -= penalties.get(reason, 0.25)
+    quality_score = max(0.0, min(1.0, quality_score))
+    return (len(unique_reasons) == 0), unique_reasons, quality_score
+
+
+def fetch_all_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) -> Tuple[Dict[str, Dict[str, Quote]], List[Dict[str, Any]]]:
     pair_quotes: Dict[str, Dict[str, Quote]] = {pair: {} for pair in pairs}
+    quote_discards: List[Dict[str, Any]] = []
     if not pairs or not adapters:
-        return pair_quotes
+        return pair_quotes, quote_discards
 
     p2p_pairs_cfg = configured_p2p_pairs()
     futures_map: Dict[Any, Tuple[str, str]] = {}
@@ -4598,25 +4743,50 @@ def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) 
                     record_exchange_no_data(venue, pair)
                     continue
 
-                max_age_seconds = float(CONFIG.get("max_quote_age_seconds", 0.0))
-                if max_age_seconds > 0:
-                    try:
-                        age_ms = max(0, current_millis() - int(quote.ts))
-                    except Exception:
-                        age_ms = None
-                    if age_ms is None or age_ms > max_age_seconds * 1000:
-                        log_event(
-                            "exchange.quote.skip",
-                            exchange=venue,
-                            pair=pair,
-                            reason="stale_quote",
-                            age_ms=age_ms,
-                        )
-                        record_exchange_no_data(venue, pair)
-                        continue
-
                 pair_quotes[pair][venue] = quote
 
+    now_ms = current_millis()
+    validated_quotes: Dict[str, Dict[str, Quote]] = {pair: {} for pair in pairs}
+    for pair, venues in pair_quotes.items():
+        for venue, quote in venues.items():
+            is_valid, reasons, quality_score = validate_quote_quality(
+                pair=pair,
+                venue=venue,
+                quote=quote,
+                pair_quotes=venues,
+                now_ms=now_ms,
+            )
+            quote.metadata["quality_score"] = quality_score
+            if is_valid:
+                validated_quotes[pair][venue] = quote
+                continue
+
+            reason = "|".join(reasons)
+            discard_entry = {
+                "pair": pair,
+                "venue": venue,
+                "reason": reason,
+                "reasons": reasons,
+                "source": str(getattr(quote, "source", "")),
+                "quality_score": quality_score,
+            }
+            quote_discards.append(discard_entry)
+            log_event(
+                "exchange.quote.skip",
+                exchange=venue,
+                pair=pair,
+                reason=reason,
+                reasons=reasons,
+                source=discard_entry["source"],
+                quality_score=quality_score,
+            )
+            record_exchange_no_data(venue, pair)
+
+    return validated_quotes, quote_discards
+
+
+def collect_pair_quotes(pairs: List[str], adapters: Dict[str, ExchangeAdapter]) -> Dict[str, Dict[str, Quote]]:
+    pair_quotes, _ = fetch_all_quotes(pairs, adapters)
     return pair_quotes
 
 
@@ -4774,6 +4944,7 @@ class Opportunity:
     volatility_score: float = 0.0
     priority_score: float = 0.0
     confidence_label: str = "media"
+    quality_score: float = 1.0
     strategy: str = "spot_spot"
     notes: Dict[str, Any] = field(default_factory=dict)
     buy_vwap: float = 0.0
@@ -5073,6 +5244,10 @@ def compute_opportunities_for_pair(
                 net_percent=net_percent,
                 buy_depth=getattr(buy_quote, "depth", None),
                 sell_depth=getattr(sell_quote, "depth", None),
+                quality_score=min(
+                    float(getattr(buy_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                    float(getattr(sell_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                ),
                 strategy="spot_spot",
             )
         )
@@ -5124,6 +5299,10 @@ def compute_spot_p2p_opportunities(
                         net_percent=net,
                         buy_depth=getattr(spot_quote, "depth", None),
                         sell_depth=None,
+                        quality_score=min(
+                            float(getattr(spot_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                            float(getattr(p2p_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                        ),
                         strategy="spot_p2p",
                         notes={
                             "side": "spot_to_p2p",
@@ -5156,6 +5335,10 @@ def compute_spot_p2p_opportunities(
                         net_percent=net,
                         buy_depth=None,
                         sell_depth=getattr(spot_quote, "depth", None),
+                        quality_score=min(
+                            float(getattr(spot_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                            float(getattr(p2p_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                        ),
                         strategy="spot_p2p",
                         notes={
                             "side": "p2p_to_spot",
@@ -5215,6 +5398,10 @@ def compute_p2p_cross_opportunities(
                 sell_price=sell_price,
                 gross_percent=gross_percent,
                 net_percent=net_percent,
+                quality_score=min(
+                    float(getattr(buy_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                    float(getattr(sell_quote, "metadata", {}).get("quality_score", 1.0) or 1.0),
+                ),
                 strategy="p2p_p2p",
                 notes={
                     "p2p_buy_fee_percent": buy_fee,
@@ -5579,6 +5766,7 @@ def fmt_alert(
             f"(`{format_percent_comma(est_percent)}`) sobre {format_decimal_comma(capital_quote, decimals=2)} USDT"
         ),
         f"*Cantidad base:* `{base_qty:.6f}` ({format_decimal_comma(capital_used, decimals=2)} USDT usados)",
+        f"*Calidad de señal:* `{opp.quality_score:.2f}`",
     ]
     fiat = opp.notes.get("fiat") if isinstance(opp.notes, dict) else None
     if fiat:
@@ -5682,7 +5870,7 @@ def run_once() -> None:
     run_ts = int(time.time())
 
     fetch_started = time.time()
-    pair_quotes = collect_pair_quotes(all_pairs, adapters)
+    pair_quotes, quote_discards = fetch_all_quotes(all_pairs, adapters)
     quote_latency_ms = int((time.time() - fetch_started) * 1000)
     log_event(
         "run.quotes_collected",
@@ -5695,6 +5883,7 @@ def run_once() -> None:
         DASHBOARD_STATE["last_quote_latency_ms"] = quote_latency_ms
         DASHBOARD_STATE["last_quote_count"] = sum(len(v) for v in pair_quotes.values())
         DASHBOARD_STATE["latest_quotes"] = build_quote_snapshot(pair_quotes)
+        DASHBOARD_STATE["quote_discards"] = quote_discards[:200]
 
     for pair in all_pairs:
         venues_available = sorted(pair_quotes.get(pair, {}).keys())
@@ -5880,6 +6069,7 @@ def run_once() -> None:
                 "volatility_score": volatility_score,
                 "priority_score": priority_score,
                 "confidence": confidence_label,
+                "quality_score": opp.quality_score,
                 "threshold_hit": est_percent >= threshold,
                 "transfer_cost_quote": transfer_est.total_cost_quote,
                 "transfer_minutes": transfer_est.total_minutes,
@@ -6025,6 +6215,7 @@ def run_once() -> None:
                     "volatility_score": volatility_score,
                     "priority_score": priority_score,
                     "confidence": confidence_label,
+                "quality_score": opp.quality_score,
                     "threshold_hit": True,
                     "strategy": opp.strategy,
                     "notes": opp.notes,
@@ -6133,6 +6324,7 @@ def run_once() -> None:
                     "volatility_score": volatility_score,
                     "priority_score": priority_score,
                     "confidence": confidence_label,
+                "quality_score": opp.quality_score,
                     "threshold_hit": True,
                     "strategy": opp.strategy,
                     "notes": opp.notes,
