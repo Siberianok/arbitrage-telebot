@@ -2528,6 +2528,14 @@ MAX_CHECKSUM_STALENESS_MS = 60_000
 NON_RETRYABLE_STATUS_CODES = {401, 403, 451}
 
 
+def _body_preview(response: requests.Response, limit: int = 200) -> str:
+    try:
+        body = response.text
+    except Exception:
+        body = response.content.decode("utf-8", errors="replace")
+    return body[:limit]
+
+
 def http_get_json(
     url: str,
     params: Optional[dict] = None,
@@ -2560,7 +2568,17 @@ def http_get_json(
 
                 received_ts = current_millis()
                 checksum = hashlib.sha256(r.content).hexdigest()
-                payload = r.json()
+                try:
+                    payload = r.json()
+                except ValueError as exc:
+                    content_type = r.headers.get("Content-Type", "")
+                    raise HttpError(
+                        "JSON inválido en "
+                        f"{endpoint_url}: status={r.status_code} "
+                        f"content_type={content_type} "
+                        f"body_preview={_body_preview(r)!r}",
+                        status_code=r.status_code,
+                    ) from exc
                 if not isinstance(payload, dict):
                     raise HttpError(f"Respuesta no es JSON objeto en {endpoint_url}")
 
@@ -2625,7 +2643,17 @@ def http_post_json(
 
                 received_ts = current_millis()
                 checksum = hashlib.sha256(r.content).hexdigest()
-                payload_json = r.json()
+                try:
+                    payload_json = r.json()
+                except ValueError as exc:
+                    content_type = r.headers.get("Content-Type", "")
+                    raise HttpError(
+                        "JSON inválido en "
+                        f"{endpoint_url}: status={r.status_code} "
+                        f"content_type={content_type} "
+                        f"body_preview={_body_preview(r)!r}",
+                        status_code=r.status_code,
+                    ) from exc
                 if not isinstance(payload_json, dict):
                     raise HttpError(f"Respuesta no es JSON objeto en {endpoint_url}")
 
