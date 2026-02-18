@@ -102,6 +102,7 @@ from observability import (
     register_degradation_alert,
     reset_metrics,
 )
+from runtime_state import RuntimeState
 
 
 LOG_BASE_DIR = os.getenv("LOG_BASE_DIR", "logs")
@@ -1392,17 +1393,9 @@ TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS = 30.0
 TELEGRAM_WEBHOOK_RESET_COOLDOWN_SECONDS = 600.0
 TELEGRAM_LAST_WEBHOOK_RESET_TS = 0.0
 
-STATE_LOCK = threading.Lock()
-CONFIG_LOCK = threading.Lock()
-DASHBOARD_STATE: Dict[str, Any] = {
-    "last_run_summary": None,
-    "latest_alerts": [],
-    "config_snapshot": {},
-    "exchange_metrics": {},
-    "analysis": None,
-}
+CONFIG_LOCK = threading.RLock()
+RUNTIME_STATE = RuntimeState(max_alert_history=20)
 
-MAX_ALERT_HISTORY = 20
 
 WEB_AUTH_USER = os.getenv("WEB_AUTH_USER", "").strip()
 WEB_AUTH_PASS = os.getenv("WEB_AUTH_PASS", "").strip()
@@ -1434,25 +1427,25 @@ LOG_HEADER = [
 
 
 def snapshot_public_config() -> Dict[str, Any]:
-    venues = {
-        name: {
-            "enabled": bool(data.get("enabled", False)),
-            "taker_fee_percent": float(data.get("taker_fee_percent", 0.0)),
+    with CONFIG_LOCK:
+        venues = {
+            name: {
+                "enabled": bool(data.get("enabled", False)),
+                "taker_fee_percent": float(data.get("taker_fee_percent", 0.0)),
+            }
+            for name, data in CONFIG.get("venues", {}).items()
         }
-        for name, data in CONFIG.get("venues", {}).items()
-    }
-    return {
-        "threshold_percent": float(CONFIG.get("threshold_percent", 0.0)),
-        "pairs": normalize_pair_list(CONFIG.get("pairs", [])),
-        "simulation_capital_quote": float(CONFIG.get("simulation_capital_quote", 0.0)),
-        "venues": venues,
-        "telegram_enabled": bool(CONFIG.get("telegram", {}).get("enabled", False)),
-    }
+        return {
+            "threshold_percent": float(CONFIG.get("threshold_percent", 0.0)),
+            "pairs": normalize_pair_list(CONFIG.get("pairs", [])),
+            "simulation_capital_quote": float(CONFIG.get("simulation_capital_quote", 0.0)),
+            "venues": venues,
+            "telegram_enabled": bool(CONFIG.get("telegram", {}).get("enabled", False)),
+        }
 
 
 def refresh_config_snapshot() -> None:
-    with STATE_LOCK:
-        DASHBOARD_STATE["config_snapshot"] = snapshot_public_config()
+    RUNTIME_STATE.set_config_snapshot(snapshot_public_config())
 
 def update_analysis_state(capital_quote: float, log_path: str) -> None:
     """Refresh cached analysis metrics and dynamic threshold from CSV history."""
@@ -1462,12 +1455,13 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
     if not log_path:
         return
 
-    base_threshold = float(CONFIG.get("threshold_percent", 0.0))
-    analysis_cfg = CONFIG.get("analysis") or {}
+    with CONFIG_LOCK:
+        base_threshold = float(CONFIG.get("threshold_percent", 0.0))
+        analysis_cfg = dict(CONFIG.get("analysis") or {})
     if not analysis_cfg.get("enabled", True):
-        DYNAMIC_THRESHOLD_PERCENT = base_threshold
-        with STATE_LOCK:
-            DASHBOARD_STATE["analysis"] = None
+        with CONFIG_LOCK:
+            DYNAMIC_THRESHOLD_PERCENT = base_threshold
+        RUNTIME_STATE.set_analysis(None)
         return
 
     try:
@@ -1481,16 +1475,18 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
         recommended = base_threshold
 
     LATEST_ANALYSIS = analysis
-    DYNAMIC_THRESHOLD_PERCENT = recommended
+    with CONFIG_LOCK:
+        DYNAMIC_THRESHOLD_PERCENT = recommended
 
-    with STATE_LOCK:
-        DASHBOARD_STATE["analysis"] = {
+    RUNTIME_STATE.set_analysis(
+        {
             "rows_considered": analysis.rows_considered,
             "success_rate": analysis.success_rate,
             "average_net_percent": analysis.average_net_percent,
             "average_effective_percent": analysis.average_effective_percent,
             "recommended_threshold": recommended,
         }
+    )
 
     log_event(
         "analysis.updated",
@@ -1738,11 +1734,11 @@ refresh_config_snapshot()
 def build_health_payload() -> Dict[str, Any]:
     now = time.time()
     metrics = metrics_snapshot()
-    with STATE_LOCK:
-        summary = DASHBOARD_STATE.get("last_run_summary") or {}
-        latest_alerts = list(DASHBOARD_STATE.get("latest_alerts", []))[:5]
-        latest_quotes = DASHBOARD_STATE.get("latest_quotes", {})
-        quote_latency = DASHBOARD_STATE.get("last_quote_latency_ms")
+    state_snapshot = RUNTIME_STATE.health_snapshot()
+    summary = state_snapshot.get("last_run_summary") or {}
+    latest_alerts = state_snapshot.get("latest_alerts", [])
+    latest_quotes = state_snapshot.get("latest_quotes", {})
+    quote_latency = state_snapshot.get("last_quote_latency_ms")
 
     status = "ok"
     if not summary:
@@ -1750,7 +1746,8 @@ def build_health_payload() -> Dict[str, Any]:
     elif any(stats.get("errors") for stats in metrics.values()):
         status = "degraded"
 
-    telegram_enabled = bool(CONFIG.get("telegram", {}).get("enabled", False))
+    with CONFIG_LOCK:
+        telegram_enabled = bool(CONFIG.get("telegram", {}).get("enabled", False))
     if telegram_enabled and LAST_TELEGRAM_SEND_TS:
         seconds_since_last_send = now - LAST_TELEGRAM_SEND_TS
     else:
@@ -2086,15 +2083,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/api/state":
             if not self._require_authentication():
                 return
-            with STATE_LOCK:
-                payload = {
-                    "last_run_summary": DASHBOARD_STATE.get("last_run_summary"),
-                    "latest_alerts": DASHBOARD_STATE.get("latest_alerts", []),
-                    "config_snapshot": DASHBOARD_STATE.get("config_snapshot", {}),
-                    "exchange_metrics": DASHBOARD_STATE.get("exchange_metrics", {}),
-                    "analysis": DASHBOARD_STATE.get("analysis"),
-                }
-            self._send_json(payload)
+            self._send_json(RUNTIME_STATE.dashboard_snapshot())
             return
         self.send_response(404)
         self.end_headers()
@@ -2141,11 +2130,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         errors.append("pairs debe ser lista")
             refresh_config_snapshot()
             if not errors:
-                capital = float(CONFIG.get("simulation_capital_quote", 0.0))
-                log_path = str(CONFIG.get("log_csv_path", ""))
+                with CONFIG_LOCK:
+                    capital = float(CONFIG.get("simulation_capital_quote", 0.0))
+                    log_path = str(CONFIG.get("log_csv_path", ""))
                 update_analysis_state(capital, log_path)
             status = 200 if not errors else 400
-            self._send_json({"updated": updated, "errors": errors, "config": DASHBOARD_STATE["config_snapshot"]}, status=status)
+            self._send_json({"updated": updated, "errors": errors, "config": RUNTIME_STATE.dashboard_snapshot().get("config_snapshot", {})}, status=status)
             return
         self.send_response(404)
         self.end_headers()
@@ -5369,27 +5359,33 @@ def run_once() -> None:
         log_event("run.skip", reason="no_venues")
         return
 
+    with CONFIG_LOCK:
+        telegram_cfg = dict(CONFIG.get("telegram", {}))
+        configured_pairs = list(CONFIG.get("pairs", []))
+        base_threshold = float(CONFIG.get("threshold_percent", 0.0))
+        capital = float(CONFIG.get("simulation_capital_quote", 0.0))
+        log_csv = str(CONFIG.get("log_csv_path", ""))
+        tri_log_csv = CONFIG.get("triangular_log_csv_path")
+        pair_weight_cfg = dict((CONFIG.get("capital_weights", {}) or {}).get("pairs", {}))
+        triangle_weight_cfg = dict((CONFIG.get("capital_weights", {}) or {}).get("triangles", {}))
+
     run_start = time.time()
     reset_metrics(adapters.keys())
-    tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
+    tg_enabled = bool(telegram_cfg.get("enabled", False))
     polling_active = TELEGRAM_POLLING_THREAD and TELEGRAM_POLLING_THREAD.is_alive()
     if tg_enabled and not polling_active:
         tg_process_updates(enabled=tg_enabled)
 
     routes = load_triangular_routes()
-    pairs = normalize_pair_list(CONFIG["pairs"])
+    pairs = normalize_pair_list(configured_pairs)
     extra_pairs = {leg.pair for route in routes for leg in route.legs}
     p2p_pairs_cfg = configured_p2p_pairs()
     p2p_pairs = sorted({pair for venue_pairs in p2p_pairs_cfg.values() for pair in venue_pairs})
     all_pairs = sorted(set(pairs) | extra_pairs | set(p2p_pairs))
-    base_threshold = float(CONFIG.get("threshold_percent", 0.0))
-    capital = float(CONFIG["simulation_capital_quote"])
-    log_csv = CONFIG["log_csv_path"]
-    tri_log_csv = CONFIG.get("triangular_log_csv_path")
     update_analysis_state(capital, log_csv)
-    threshold = float(DYNAMIC_THRESHOLD_PERCENT or base_threshold)
-    pair_weight_cfg = CONFIG.get("capital_weights", {}).get("pairs", {})
-    triangle_weight_cfg = CONFIG.get("capital_weights", {}).get("triangles", {})
+    with CONFIG_LOCK:
+        dynamic_threshold = float(DYNAMIC_THRESHOLD_PERCENT or base_threshold)
+    threshold = dynamic_threshold
     fee_map = build_fee_map(all_pairs)
     transfers = build_transfer_profiles()
     summary_opps: List[Dict[str, Any]] = []
@@ -5406,10 +5402,11 @@ def run_once() -> None:
         latency_ms=quote_latency_ms,
     )
 
-    with STATE_LOCK:
-        DASHBOARD_STATE["last_quote_latency_ms"] = quote_latency_ms
-        DASHBOARD_STATE["last_quote_count"] = sum(len(v) for v in pair_quotes.values())
-        DASHBOARD_STATE["latest_quotes"] = build_quote_snapshot(pair_quotes)
+    RUNTIME_STATE.update_last_quote_state(
+        quote_latency_ms=quote_latency_ms,
+        quote_count=sum(len(v) for v in pair_quotes.values()),
+        latest_quotes=build_quote_snapshot(pair_quotes),
+    )
 
     for pair in all_pairs:
         venues_available = sorted(pair_quotes.get(pair, {}).keys())
@@ -5868,7 +5865,7 @@ def run_once() -> None:
         "ts_str": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(run_ts)),
         "threshold": threshold,
         "base_threshold": base_threshold,
-        "dynamic_threshold": DYNAMIC_THRESHOLD_PERCENT,
+        "dynamic_threshold": dynamic_threshold,
         "capital": capital,
         "pairs": pairs,
         "opportunities": summary_opps,
@@ -5884,14 +5881,11 @@ def run_once() -> None:
     if alert_records:
         alert_records.sort(key=lambda item: item["ts"], reverse=True)
 
-    with STATE_LOCK:
-        DASHBOARD_STATE["last_run_summary"] = summary
-        DASHBOARD_STATE["exchange_metrics"] = metrics_data
-        if alert_records:
-            history = DASHBOARD_STATE.get("latest_alerts", [])
-            history.extend(alert_records)
-            history.sort(key=lambda item: item.get("ts", 0), reverse=True)
-            DASHBOARD_STATE["latest_alerts"] = history[:MAX_ALERT_HISTORY]
+    RUNTIME_STATE.update_run_state(
+        summary=summary,
+        exchange_health=metrics_data,
+        new_alerts=alert_records,
+    )
 
     degradation_alerts = build_degradation_alerts(metrics_data)
     for alert_msg in degradation_alerts:

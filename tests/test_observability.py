@@ -43,3 +43,37 @@ def test_reset_metrics_clears_counters():
     snapshot = observability.metrics_snapshot()
     assert snapshot[exchange]["attempts"] == 0
     assert snapshot[exchange]["errors"] == 0
+
+
+
+def test_observability_concurrent_counter_updates_are_atomic():
+    from concurrent.futures import ThreadPoolExecutor
+
+    observability.reset_all_states()
+    exchange = "atomic_metrics"
+
+    def worker(_: int) -> None:
+        observability.record_exchange_attempt(exchange)
+        observability.record_exchange_error(exchange, "boom")
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(worker, range(200)))
+
+    snapshot = observability.metrics_snapshot()[exchange]
+    assert snapshot["attempts"] == 200
+    assert snapshot["errors"] == 200
+
+
+def test_concurrent_circuit_reads_do_not_break_state():
+    from concurrent.futures import ThreadPoolExecutor
+
+    observability.reset_all_states()
+    exchange = "atomic_circuit"
+    for _ in range(observability.CIRCUIT_FAILURE_THRESHOLD):
+        observability.record_exchange_attempt(exchange)
+        observability.record_exchange_error(exchange, "boom")
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: observability.is_circuit_open(exchange), range(100)))
+
+    assert all(results)
