@@ -586,13 +586,15 @@ BASE_CONFIG = {
             },
             "p2p": {
                 "enabled": True,
-                "endpoint": "https://api.fiwind.com/v1/otc/rates",
+                "endpoint": "https://criptoya.com/api/fiwind/{asset_lower}/{fiat_lower}/1",
+                "fallbacks": [
+                    "https://criptoya.com/api/fiwind/{asset_lower}/{fiat_lower}/0",
+                ],
                 "method": "GET",
-                "data_path": ["data"],
-                "bid_path": ["{asset}", "{fiat}", "sell"],
-                "ask_path": ["{asset}", "{fiat}", "buy"],
-                "invert_sides": True,
-                "source": "otc",
+                "bid_path": ["bid"],
+                "ask_path": ["ask"],
+                "timestamp_path": ["time"],
+                "source": "criptoya",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -677,12 +679,15 @@ BASE_CONFIG = {
             },
             "p2p": {
                 "enabled": True,
-                "endpoint": "https://api.tiendacrypto.com/v1/rates",
+                "endpoint": "https://criptoya.com/api/tiendacrypto/{asset_lower}/{fiat_lower}/1",
+                "fallbacks": [
+                    "https://criptoya.com/api/tiendacrypto/{asset_lower}/{fiat_lower}/0",
+                ],
                 "method": "GET",
-                "data_path": ["rates"],
-                "bid_path": ["{asset}", "{fiat}", "bid"],
-                "ask_path": ["{asset}", "{fiat}", "ask"],
-                "source": "otc",
+                "bid_path": ["bid"],
+                "ask_path": ["ask"],
+                "timestamp_path": ["time"],
+                "source": "criptoya",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -767,13 +772,15 @@ BASE_CONFIG = {
             },
             "p2p": {
                 "enabled": True,
-                "endpoint": "https://api.onebit.com/v2/p2p/rates",
+                "endpoint": "https://criptoya.com/api/onebit/{asset_lower}/{fiat_lower}/1",
+                "fallbacks": [
+                    "https://criptoya.com/api/onebit/{asset_lower}/{fiat_lower}/0",
+                ],
                 "method": "GET",
-                "data_path": ["quotes"],
-                "bid_path": ["{asset}", "{fiat}", "sell"],
-                "ask_path": ["{asset}", "{fiat}", "buy"],
-                "invert_sides": True,
-                "source": "otc",
+                "bid_path": ["bid"],
+                "ask_path": ["ask"],
+                "timestamp_path": ["time"],
+                "source": "criptoya",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -858,12 +865,15 @@ BASE_CONFIG = {
             },
             "p2p": {
                 "enabled": True,
-                "endpoint": "https://api.ripio.com/v1/rates",
+                "endpoint": "https://criptoya.com/api/ripio/{asset_lower}/{fiat_lower}/1",
+                "fallbacks": [
+                    "https://criptoya.com/api/ripio/{asset_lower}/{fiat_lower}/0",
+                ],
                 "method": "GET",
-                "data_path": ["data"],
-                "bid_path": ["{asset}", "{fiat}", "bid"],
-                "ask_path": ["{asset}", "{fiat}", "ask"],
-                "source": "otc",
+                "bid_path": ["bid"],
+                "ask_path": ["ask"],
+                "timestamp_path": ["time"],
+                "source": "criptoya",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -948,12 +958,15 @@ BASE_CONFIG = {
             },
             "p2p": {
                 "enabled": True,
-                "endpoint": "https://api.facebank.com/v1/rates",
+                "endpoint": "https://criptoya.com/api/facebank/{asset_lower}/{fiat_lower}/1",
+                "fallbacks": [
+                    "https://criptoya.com/api/facebank/{asset_lower}/{fiat_lower}/0",
+                ],
                 "method": "GET",
-                "data_path": ["data"],
-                "bid_path": ["{asset}", "{fiat}", "bid"],
-                "ask_path": ["{asset}", "{fiat}", "ask"],
-                "source": "otc",
+                "bid_path": ["bid"],
+                "ask_path": ["ask"],
+                "timestamp_path": ["time"],
+                "source": "criptoya",
                 "pairs": {
                     "USDT/ARS": {
                         "asset": "USDT",
@@ -2581,7 +2594,9 @@ def http_get_json(
                 backoff = min(0.5 * (2 ** attempt), 5.0)
                 time.sleep(backoff + random.uniform(0, 0.25))
         if non_retryable_error:
-            break
+            if fallback_endpoints and last_exc is not None:
+                print(f"[http] endpoint no reintentable {endpoint_url}: {last_exc}; probando fallback")
+            continue
         if fallback_endpoints and last_exc is not None:
             print(f"[http] cambiando a endpoint alternativo {endpoint_url}: {last_exc}")
 
@@ -2638,7 +2653,9 @@ def http_post_json(
                 backoff = min(0.5 * (2 ** attempt), 5.0)
                 time.sleep(backoff + random.uniform(0, 0.25))
         if non_retryable_error:
-            break
+            if fallback_endpoints and last_exc is not None:
+                print(f"[http] endpoint no reintentable {endpoint_url}: {last_exc}; probando fallback")
+            continue
         if fallback_endpoints and last_exc is not None:
             print(f"[http] cambiando a endpoint alternativo {endpoint_url}: {last_exc}")
 

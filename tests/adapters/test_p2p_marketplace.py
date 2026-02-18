@@ -114,3 +114,82 @@ def test_compute_spot_p2p_opportunities_applies_execution_filters(monkeypatch):
     assert all(opp.notes.get("payment_method") == "BANK_TRANSFER" for opp in opps)
     assert all(opp.notes.get("bank") == "Banco Uno" for opp in opps)
     assert all(opp.notes.get("executable_qty_real", 0) > 0 for opp in opps)
+
+
+def test_http_get_json_uses_fallback_after_http_404_and_403(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.content = b"{}"
+
+        def json(self):
+            return self._payload
+
+    responses = {
+        "https://primary-404.example/api": FakeResponse(404, {}),
+        "https://primary-403.example/api": FakeResponse(403, {}),
+        "https://fallback.example/api": FakeResponse(200, {"ok": True}),
+    }
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return responses[url]
+
+    monkeypatch.setattr(bot.requests, "get", fake_get)
+    monkeypatch.setattr(bot.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(bot.random, "uniform", lambda *_: 0.0)
+
+    resp_404 = bot.http_get_json(
+        "https://primary-404.example/api",
+        retries=1,
+        fallback_endpoints=[("https://fallback.example/api", None)],
+    )
+    assert resp_404.data == {"ok": True}
+
+    resp_403 = bot.http_get_json(
+        "https://primary-403.example/api",
+        retries=1,
+        fallback_endpoints=[("https://fallback.example/api", None)],
+    )
+    assert resp_403.data == {"ok": True}
+
+    assert calls == [
+        "https://primary-404.example/api",
+        "https://fallback.example/api",
+        "https://primary-403.example/api",
+        "https://fallback.example/api",
+    ]
+
+
+def test_http_get_json_uses_fallback_after_dns_like_error(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        content = b"{}"
+
+        @staticmethod
+        def json():
+            return {"bid": 100.0, "ask": 101.0}
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if "primary" in url:
+            raise bot.requests.exceptions.ConnectionError("Name or service not known")
+        return FakeResponse()
+
+    monkeypatch.setattr(bot.requests, "get", fake_get)
+    monkeypatch.setattr(bot.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(bot.random, "uniform", lambda *_: 0.0)
+
+    response = bot.http_get_json(
+        "https://primary.example/api",
+        retries=1,
+        fallback_endpoints=[("https://fallback.example/api", None)],
+    )
+
+    assert response.data == {"bid": 100.0, "ask": 101.0}
+    assert calls == ["https://primary.example/api", "https://fallback.example/api"]
