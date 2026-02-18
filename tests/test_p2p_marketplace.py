@@ -57,3 +57,60 @@ def test_generic_p2p_accepts_lowercase_placeholders(monkeypatch):
     assert quote.ask == pytest.approx(16200000.0)
     assert quote.metadata.get("aggregator") == "unit-test"
     assert quote.metadata.get("fiat") == "ARS"
+
+
+def test_compute_spot_p2p_opportunities_applies_execution_filters(monkeypatch):
+    monkeypatch.setitem(
+        bot.CONFIG,
+        "p2p_execution",
+        {
+            "allowed_payment_methods": ["BANK_TRANSFER"],
+            "min_advertiser_reputation": 0.90,
+        },
+    )
+    monkeypatch.setitem(bot.CONFIG, "simulation_capital_quote", 10_000)
+
+    spot_quotes = {"binance": bot.Quote("USDTARS", bid=1000.0, ask=1010.0, ts=1)}
+    p2p_quotes = {
+        "binance": bot.Quote(
+            "USDTARS",
+            bid=1040.0,
+            ask=980.0,
+            ts=1,
+            source="p2p",
+            metadata={
+                "fiat": "ARS",
+                "payment_method": "BANK_TRANSFER",
+                "bank": "Banco Uno",
+                "amount_min": 5000,
+                "amount_max": 25000,
+                "min_notional": 5000,
+                "max_notional": 25000,
+                "advertiser_reputation": 0.95,
+                "available_notional": 20000,
+            },
+        ),
+        "bybit": bot.Quote(
+            "USDTARS",
+            bid=1100.0,
+            ask=900.0,
+            ts=1,
+            source="p2p",
+            metadata={
+                "fiat": "ARS",
+                "payment_method": "CASH",
+                "advertiser_reputation": 0.99,
+                "amount_min": 1000,
+                "amount_max": 50000,
+            },
+        ),
+    }
+    fees = {"binance": bot.VenueFees(venue="binance", default=bot.FeeSchedule(taker_fee_percent=0.1))}
+
+    opps = bot.compute_spot_p2p_opportunities("USDT/ARS", spot_quotes, p2p_quotes, fees)
+
+    assert opps
+    assert all("bybit" not in (opp.buy_venue + opp.sell_venue) for opp in opps)
+    assert all(opp.notes.get("payment_method") == "BANK_TRANSFER" for opp in opps)
+    assert all(opp.notes.get("bank") == "Banco Uno" for opp in opps)
+    assert all(opp.notes.get("executable_qty_real", 0) > 0 for opp in opps)

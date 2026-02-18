@@ -2,6 +2,7 @@ import time
 
 import pytest
 
+import arbitrage_telebot as bot
 from arbitrage_telebot import (
     DepthInfo,
     FeeSchedule,
@@ -122,3 +123,97 @@ def test_build_degradation_alerts_triggers_and_debounces():
     alerts_second = build_degradation_alerts(snapshot)
     assert alerts_second == []
 
+
+
+def test_compute_p2p_cross_opportunities_filters_low_capacity(monkeypatch):
+    monkeypatch.setitem(bot.CONFIG, "simulation_capital_quote", 10_000)
+    monkeypatch.setitem(
+        bot.CONFIG,
+        "p2p_execution",
+        {"allowed_payment_methods": ["BANK_TRANSFER"], "min_advertiser_reputation": 0.8},
+    )
+
+    quotes = {
+        "binance": Quote(
+            "USDTARS",
+            bid=1110.0,
+            ask=1000.0,
+            ts=1,
+            source="p2p",
+            metadata={
+                "payment_method": "BANK_TRANSFER",
+                "advertiser_reputation": 0.99,
+                "amount_min": 1000,
+                "amount_max": 2000,
+                "max_notional": 2000,
+            },
+        ),
+        "bybit": Quote(
+            "USDTARS",
+            bid=1200.0,
+            ask=1020.0,
+            ts=1,
+            source="p2p",
+            metadata={
+                "payment_method": "BANK_TRANSFER",
+                "advertiser_reputation": 0.95,
+                "amount_min": 1000,
+                "amount_max": 1500,
+                "max_notional": 1500,
+            },
+        ),
+    }
+
+    opps = bot.compute_p2p_cross_opportunities("USDT/ARS", quotes)
+
+    assert opps == []
+
+
+def test_compute_p2p_cross_opportunities_populates_execution_notes(monkeypatch):
+    monkeypatch.setitem(bot.CONFIG, "simulation_capital_quote", 1000)
+    monkeypatch.setitem(
+        bot.CONFIG,
+        "p2p_execution",
+        {"allowed_payment_methods": ["BANK_TRANSFER"], "min_advertiser_reputation": 0.8},
+    )
+
+    quotes = {
+        "binance": Quote(
+            "USDTARS",
+            bid=1050.0,
+            ask=1000.0,
+            ts=1,
+            source="p2p",
+            metadata={
+                "bank": "Banco A",
+                "payment_method": "BANK_TRANSFER",
+                "advertiser_reputation": 0.95,
+                "amount_min": 100,
+                "amount_max": 5000,
+                "max_notional": 5000,
+            },
+        ),
+        "bybit": Quote(
+            "USDTARS",
+            bid=1100.0,
+            ask=1020.0,
+            ts=1,
+            source="p2p",
+            metadata={
+                "bank": "Banco B",
+                "payment_method": "BANK_TRANSFER",
+                "advertiser_reputation": 0.91,
+                "amount_min": 100,
+                "amount_max": 6000,
+                "max_notional": 6000,
+            },
+        ),
+    }
+
+    opps = bot.compute_p2p_cross_opportunities("USDT/ARS", quotes)
+
+    assert opps
+    top = opps[0]
+    assert top.notes["buy_payment_method"] == "BANK_TRANSFER"
+    assert top.notes["sell_payment_method"] == "BANK_TRANSFER"
+    assert top.notes["executable_qty_real"] > 0
