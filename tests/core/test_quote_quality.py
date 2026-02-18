@@ -76,3 +76,67 @@ def test_fetch_all_quotes_discards_invalid_quotes(monkeypatch):
     assert "bybit" not in pair_quotes["BTC/USDT"]
     assert discards
     assert discards[0]["reason"] == "inverted_spread"
+
+
+def test_depth_blocked_errors_enable_cooldown_without_spamming_requests(monkeypatch):
+    event_names = []
+    call_count = {"binance": 0, "bybit": 0}
+    now_ms = {"value": 1_000_000}
+
+    monkeypatch.setitem(bot.CONFIG, "depth_disable_cooldown_seconds", 3)
+    monkeypatch.setattr(bot, "current_millis", lambda: now_ms["value"])
+
+    def fake_http_get_json(url, **kwargs):
+        if "binance" in url:
+            call_count["binance"] += 1
+        elif "bybit" in url:
+            call_count["bybit"] += 1
+        raise bot.HttpError("blocked", status_code=451)
+
+    monkeypatch.setattr(bot, "http_get_json", fake_http_get_json)
+    monkeypatch.setattr(bot, "log_event", lambda name, **kwargs: event_names.append(name))
+
+    for adapter in (bot.Binance(), bot.Bybit()):
+        assert adapter.get_depth("BTC/USDT") is None
+        assert adapter.get_depth("BTC/USDT") is None
+
+    assert call_count["binance"] == 1
+    assert call_count["bybit"] == 1
+    assert event_names.count("exchange.depth.cooldown_active") == 2
+
+    now_ms["value"] += 3_500
+    assert bot.Binance().get_depth("BTC/USDT") is None
+    assert call_count["binance"] == 2
+
+
+def test_depth_cooldown_does_not_break_ticker_quote_flow(monkeypatch):
+    event_names = []
+    request_counts = {"ticker": 0, "depth": 0}
+
+    monkeypatch.setitem(bot.CONFIG, "depth_disable_cooldown_seconds", 30)
+
+    def fake_http_get_json(url, params=None, **kwargs):
+        if "depth" in url:
+            request_counts["depth"] += 1
+            raise bot.HttpError("geo blocked", status_code=403)
+        request_counts["ticker"] += 1
+        return bot.HttpJsonResponse(
+            data={"bidPrice": "100", "askPrice": "101", "time": 1_700_000_000_000},
+            checksum="ticker-checksum",
+            received_ts=1_700_000_000_100,
+        )
+
+    monkeypatch.setattr(bot, "http_get_json", fake_http_get_json)
+    monkeypatch.setattr(bot, "log_event", lambda name, **kwargs: event_names.append(name))
+
+    adapter = bot.Binance()
+    quote_first = adapter.fetch_quote("BTC/USDT")
+    quote_second = adapter.fetch_quote("BTC/USDT")
+
+    assert quote_first is not None
+    assert quote_second is not None
+    assert quote_first.source == "bookTicker"
+    assert quote_second.source == "bookTicker"
+    assert request_counts["ticker"] == 2
+    assert request_counts["depth"] == 1
+    assert event_names.count("exchange.depth.cooldown_active") == 1
