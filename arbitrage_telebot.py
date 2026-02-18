@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from statistics import StatisticsError, mean, pstdev
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
 
 import requests
 
@@ -3225,6 +3225,165 @@ class TransferEstimate:
     quote_asset_loss: float = 0.0
 
 
+@dataclass
+class AccountLimitProfile:
+    monthly_fiat_limit: float = 0.0
+    daily_payment_method_volume: Dict[str, float] = field(default_factory=dict)
+    cooldown_seconds: float = 0.0
+
+
+def _utc_day(ts: Optional[float] = None) -> str:
+    ref = float(ts if ts is not None else time.time())
+    return time.strftime("%Y-%m-%d", time.gmtime(ref))
+
+
+def _utc_month(ts: Optional[float] = None) -> str:
+    ref = float(ts if ts is not None else time.time())
+    return time.strftime("%Y-%m", time.gmtime(ref))
+
+
+def normalize_account_venue(venue: str) -> str:
+    return str(venue or "").strip().lower().replace("_p2p", "")
+
+
+def get_account_limit_profile(venue: str, account: str = "default") -> Optional[AccountLimitProfile]:
+    limits_cfg = CONFIG.get("account_limits", {}) or {}
+    venues_cfg = limits_cfg.get("venues", {}) or {}
+    venue_cfg = venues_cfg.get(normalize_account_venue(venue), {}) or {}
+    account_cfg = venue_cfg.get(account) or venue_cfg.get("default")
+    if not account_cfg:
+        return None
+    return AccountLimitProfile(
+        monthly_fiat_limit=float(account_cfg.get("monthly_fiat_limit", 0.0) or 0.0),
+        daily_payment_method_volume={
+            str(method).upper(): float(value)
+            for method, value in (account_cfg.get("daily_payment_method_volume", {}) or {}).items()
+        },
+        cooldown_seconds=float(account_cfg.get("cooldown_seconds", 0.0) or 0.0),
+    )
+
+
+def _account_ledger_path() -> Path:
+    limits_cfg = CONFIG.get("account_limits", {}) or {}
+    path = str(limits_cfg.get("ledger_path", "data/account_limits_ledger.json"))
+    return Path(path)
+
+
+def load_account_limit_ledger() -> Dict[str, Any]:
+    ledger_path = _account_ledger_path()
+    if not ledger_path.exists():
+        return {"accounts": {}}
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"accounts": {}}
+    if not isinstance(data, dict):
+        return {"accounts": {}}
+    data.setdefault("accounts", {})
+    return data
+
+
+def save_account_limit_ledger(ledger: Dict[str, Any]) -> None:
+    ledger_path = _account_ledger_path()
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def check_account_limit(
+    venue: str,
+    fiat_amount: float,
+    payment_method: str,
+    account: str = "default",
+    now_ts: Optional[float] = None,
+    consume: bool = False,
+) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    profile = get_account_limit_profile(venue, account=account)
+    if not profile or fiat_amount <= 0:
+        return True, None, {}
+
+    now = float(now_ts if now_ts is not None else time.time())
+    month_key = _utc_month(now)
+    day_key = _utc_day(now)
+    method_key = str(payment_method or "SPOT").upper()
+
+    ledger = load_account_limit_ledger()
+    account_key = f"{normalize_account_venue(venue)}::{account}"
+    account_state = ledger.setdefault("accounts", {}).setdefault(account_key, {})
+
+    current_month = str(account_state.get("monthly_period", ""))
+    if current_month != month_key:
+        account_state["monthly_period"] = month_key
+        account_state["monthly_consumed"] = 0.0
+
+    current_day = str(account_state.get("daily_period", ""))
+    if current_day != day_key:
+        account_state["daily_period"] = day_key
+        account_state["daily_consumed"] = {}
+
+    monthly_consumed = float(account_state.get("monthly_consumed", 0.0) or 0.0)
+    daily_consumed_map = account_state.setdefault("daily_consumed", {})
+    daily_consumed = float(daily_consumed_map.get(method_key, 0.0) or 0.0)
+    last_operation_ts = float(account_state.get("last_operation_ts", 0.0) or 0.0)
+
+    if profile.monthly_fiat_limit > 0 and monthly_consumed + fiat_amount > profile.monthly_fiat_limit:
+        return False, "account_limit", {
+            "scope": "monthly",
+            "monthly_fiat_limit": profile.monthly_fiat_limit,
+            "monthly_consumed": monthly_consumed,
+            "fiat_amount": fiat_amount,
+            "venue": normalize_account_venue(venue),
+            "account": account,
+        }
+
+    daily_limit = float(profile.daily_payment_method_volume.get(method_key, 0.0) or 0.0)
+    if daily_limit > 0 and daily_consumed + fiat_amount > daily_limit:
+        return False, "account_limit", {
+            "scope": "daily_payment_method",
+            "payment_method": method_key,
+            "daily_limit": daily_limit,
+            "daily_consumed": daily_consumed,
+            "fiat_amount": fiat_amount,
+            "venue": normalize_account_venue(venue),
+            "account": account,
+        }
+
+    if profile.cooldown_seconds > 0 and last_operation_ts > 0:
+        elapsed = now - last_operation_ts
+        if elapsed < profile.cooldown_seconds:
+            return False, "account_limit", {
+                "scope": "cooldown",
+                "cooldown_seconds": profile.cooldown_seconds,
+                "elapsed_seconds": elapsed,
+                "venue": normalize_account_venue(venue),
+                "account": account,
+            }
+
+    if consume:
+        account_state["monthly_consumed"] = monthly_consumed + fiat_amount
+        daily_consumed_map[method_key] = daily_consumed + fiat_amount
+        account_state["last_operation_ts"] = now
+        save_account_limit_ledger(ledger)
+
+    return True, None, {
+        "monthly_consumed": monthly_consumed,
+        "daily_consumed": daily_consumed,
+        "payment_method": method_key,
+    }
+
+
+def check_transfer_window(total_minutes: float) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    limits_cfg = CONFIG.get("account_limits", {}) or {}
+    max_minutes = float(limits_cfg.get("transfer_window_minutes", 0.0) or 0.0)
+    if max_minutes <= 0 or total_minutes <= 0:
+        return True, None, {}
+    if total_minutes <= max_minutes:
+        return True, None, {}
+    return False, "transfer_window", {
+        "transfer_window_minutes": max_minutes,
+        "transfer_minutes": total_minutes,
+    }
+
+
 def apply_slippage(price: float, slippage_bps: float, side: str) -> float:
     if price <= 0:
         return 0.0
@@ -5236,6 +5395,7 @@ def compute_opportunities_for_pair(
     pair: str,
     quotes: Dict[str, Quote],
     fees: Dict[str, VenueFees],
+    account_limit_checker: Optional[Callable[[Opportunity], Tuple[bool, Optional[str], Dict[str, Any]]]] = None,
 ) -> List[Opportunity]:
     venues = list(quotes.keys())
     opportunities: List[Opportunity] = []
@@ -5271,8 +5431,7 @@ def compute_opportunities_for_pair(
         total_fee = buy_schedule.taker_fee_percent + sell_schedule.taker_fee_percent
         net_percent = gross_percent - total_fee
 
-        opportunities.append(
-            Opportunity(
+        candidate = Opportunity(
                 pair=pair,
                 buy_venue=buy_v,
                 sell_venue=sell_v,
@@ -5288,7 +5447,20 @@ def compute_opportunities_for_pair(
                 ),
                 strategy="spot_spot",
             )
-        )
+        if account_limit_checker:
+            allowed, reason, details = account_limit_checker(candidate)
+            if not allowed:
+                log_event(
+                    "opportunity.discard",
+                    reason=reason or "account_limit",
+                    pair=candidate.pair,
+                    buy_venue=candidate.buy_venue,
+                    sell_venue=candidate.sell_venue,
+                    strategy=candidate.strategy,
+                    **(details or {}),
+                )
+                continue
+        opportunities.append(candidate)
 
     return sorted(opportunities, key=lambda o: o.net_percent, reverse=True)
 
@@ -5298,6 +5470,7 @@ def compute_spot_p2p_opportunities(
     spot_quotes: Dict[str, Quote],
     p2p_quotes: Dict[str, Quote],
     fees: Dict[str, VenueFees],
+    account_limit_checker: Optional[Callable[[Opportunity], Tuple[bool, Optional[str], Dict[str, Any]]]] = None,
 ) -> List[Opportunity]:
     opportunities: List[Opportunity] = []
     base, _ = split_pair(pair)
@@ -5326,7 +5499,7 @@ def compute_spot_p2p_opportunities(
             if p2p_bid > 0:
                 gross = (p2p_bid - spot_buy) / spot_buy * 100.0
                 net = gross - buy_fee - p2p_fee
-                opportunities.append(
+                candidates.append(
                     Opportunity(
                         pair=pair,
                         buy_venue=spot_venue,
@@ -5362,7 +5535,7 @@ def compute_spot_p2p_opportunities(
             if p2p_ask > 0:
                 gross = (spot_sell - p2p_ask) / p2p_ask * 100.0
                 net = gross - sell_fee - p2p_fee
-                opportunities.append(
+                candidates.append(
                     Opportunity(
                         pair=pair,
                         buy_venue=f"{p2p_venue}_p2p",
@@ -5395,12 +5568,28 @@ def compute_spot_p2p_opportunities(
                         },
                     )
                 )
+            for candidate in candidates:
+                if account_limit_checker:
+                    allowed, reason, details = account_limit_checker(candidate)
+                    if not allowed:
+                        log_event(
+                            "opportunity.discard",
+                            reason=reason or "account_limit",
+                            pair=candidate.pair,
+                            buy_venue=candidate.buy_venue,
+                            sell_venue=candidate.sell_venue,
+                            strategy=candidate.strategy,
+                            **(details or {}),
+                        )
+                        continue
+                opportunities.append(candidate)
     return sorted(opportunities, key=lambda o: o.net_percent, reverse=True)
 
 
 def compute_p2p_cross_opportunities(
     pair: str,
     quotes: Dict[str, Quote],
+    account_limit_checker: Optional[Callable[[Opportunity], Tuple[bool, Optional[str], Dict[str, Any]]]] = None,
 ) -> List[Opportunity]:
     base, _ = split_pair(pair)
     opportunities: List[Opportunity] = []
@@ -5465,7 +5654,20 @@ def compute_p2p_cross_opportunities(
                     "executable_qty_real": executable_notional / buy_price if buy_price > 0 else 0.0,
                 },
             )
-        )
+        if account_limit_checker:
+            allowed, reason, details = account_limit_checker(candidate)
+            if not allowed:
+                log_event(
+                    "opportunity.discard",
+                    reason=reason or "account_limit",
+                    pair=candidate.pair,
+                    buy_venue=candidate.buy_venue,
+                    sell_venue=candidate.sell_venue,
+                    strategy=candidate.strategy,
+                    **(details or {}),
+                )
+                continue
+        opportunities.append(candidate)
     return sorted(opportunities, key=lambda o: o.net_percent, reverse=True)
 
 
@@ -5907,6 +6109,57 @@ def run_once() -> None:
     alert_records: List[Dict[str, Any]] = []
     run_ts = int(time.time())
 
+    def _route_payment_method(venue_label: str) -> str:
+        return "BANK_TRANSFER" if str(venue_label).lower().endswith("_p2p") else "SPOT"
+
+    def _precheck_opportunity_account_limits(opp: Opportunity) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        capital_hint = get_weighted_capital(capital, pair_weight_cfg, opp.pair)
+        if capital_hint <= 0:
+            return True, None, {}
+        buy_method = _route_payment_method(opp.buy_venue)
+        sell_method = _route_payment_method(opp.sell_venue)
+        buy_allowed, buy_reason, buy_details = check_account_limit(
+            opp.buy_venue,
+            fiat_amount=capital_hint,
+            payment_method=buy_method,
+            now_ts=run_ts,
+            consume=False,
+        )
+        if not buy_allowed:
+            details = dict(buy_details or {})
+            details["leg"] = "buy"
+            return False, buy_reason or "account_limit", details
+        sell_allowed, sell_reason, sell_details = check_account_limit(
+            opp.sell_venue,
+            fiat_amount=capital_hint,
+            payment_method=sell_method,
+            now_ts=run_ts,
+            consume=False,
+        )
+        if not sell_allowed:
+            details = dict(sell_details or {})
+            details["leg"] = "sell"
+            return False, sell_reason or "account_limit", details
+        return True, None, {}
+
+    def _consume_opportunity_account_limits(opp: Opportunity, amount_quote: float) -> None:
+        if amount_quote <= 0:
+            return
+        check_account_limit(
+            opp.buy_venue,
+            fiat_amount=amount_quote,
+            payment_method=_route_payment_method(opp.buy_venue),
+            now_ts=time.time(),
+            consume=True,
+        )
+        check_account_limit(
+            opp.sell_venue,
+            fiat_amount=amount_quote,
+            payment_method=_route_payment_method(opp.sell_venue),
+            now_ts=time.time(),
+            consume=True,
+        )
+
     fetch_started = time.time()
     pair_quotes, quote_discards = fetch_all_quotes(all_pairs, adapters)
     quote_latency_ms = int((time.time() - fetch_started) * 1000)
@@ -5947,7 +6200,7 @@ def run_once() -> None:
             capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
             if capital_for_pair <= 0:
                 continue
-            opps = compute_opportunities_for_pair(pair, quotes, fee_map)
+            opps = compute_opportunities_for_pair(pair, quotes, fee_map, account_limit_checker=_precheck_opportunity_account_limits)
             for opp in opps[:5]:
                 fee_buy = fee_map.get(opp.buy_venue)
                 fee_sell = fee_map.get(opp.sell_venue)
@@ -6047,6 +6300,19 @@ def run_once() -> None:
                     opp.sell_price,
                     transfers,
                 )
+                transfer_ok, transfer_reason, transfer_details = check_transfer_window(transfer_est.total_minutes)
+                if not transfer_ok:
+                    log_event(
+                        "opportunity.discard",
+                        reason=transfer_reason or "transfer_window",
+                        pair=opp.pair,
+                        buy_venue=opp.buy_venue,
+                        sell_venue=opp.sell_venue,
+                        strategy=opp.strategy,
+                        **(transfer_details or {}),
+                    )
+                    print(f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} transfer_window")
+                    continue
                 est_profit_net = est_profit - transfer_est.total_cost_quote
                 if est_profit_net <= 0:
                     print(
@@ -6143,6 +6409,7 @@ def run_once() -> None:
                     net_percent=opp.net_percent,
                     est_profit=est_profit,
                 )
+                _consume_opportunity_account_limits(opp, capital_used)
                 spot_alerts += 1
                 alert_entry = dict(entry)
                 alert_entry["ts"] = int(time.time())
@@ -6167,7 +6434,7 @@ def run_once() -> None:
             capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
             if capital_for_pair <= 0:
                 continue
-            opps = compute_spot_p2p_opportunities(pair, spot_quotes, p2p_asset_quotes, fee_map)
+            opps = compute_spot_p2p_opportunities(pair, spot_quotes, p2p_asset_quotes, fee_map, account_limit_checker=_precheck_opportunity_account_limits)
             for opp in opps[:5]:
                 side = opp.notes.get("side")
                 p2p_venue = str(opp.notes.get("p2p_venue") or "")
@@ -6222,6 +6489,18 @@ def run_once() -> None:
                         print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason_p2p}")
                         continue
                 if est_percent < threshold:
+                    continue
+                allowed_route, reason_route, details_route = _precheck_opportunity_account_limits(opp)
+                if not allowed_route:
+                    log_event(
+                        "opportunity.discard",
+                        reason=reason_route or "account_limit",
+                        pair=opp.pair,
+                        buy_venue=opp.buy_venue,
+                        sell_venue=opp.sell_venue,
+                        strategy=opp.strategy,
+                        **(details_route or {}),
+                    )
                     continue
                 opp.net_percent = est_percent
                 opp.notes.setdefault("fiat", fiat)
@@ -6286,6 +6565,7 @@ def run_once() -> None:
                     net_percent=est_percent,
                     est_profit=est_profit,
                 )
+                _consume_opportunity_account_limits(opp, capital_used)
                 spot_p2p_alerts += 1
                 alert_entry = dict(entry)
                 alert_entry["ts"] = int(time.time())
@@ -6306,7 +6586,7 @@ def run_once() -> None:
             capital_for_pair = get_weighted_capital(capital, pair_weight_cfg, pair)
             if capital_for_pair <= 0:
                 continue
-            opps = compute_p2p_cross_opportunities(pair, quotes)
+            opps = compute_p2p_cross_opportunities(pair, quotes, account_limit_checker=_precheck_opportunity_account_limits)
             asset, _ = split_pair(pair)
             for opp in opps[:5]:
                 buy_fee = float(opp.notes.get("p2p_buy_fee_percent", 0.0) or 0.0)
@@ -6332,6 +6612,18 @@ def run_once() -> None:
                     print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason_sell}")
                     continue
                 if est_percent < threshold:
+                    continue
+                allowed_route, reason_route, details_route = _precheck_opportunity_account_limits(opp)
+                if not allowed_route:
+                    log_event(
+                        "opportunity.discard",
+                        reason=reason_route or "account_limit",
+                        pair=opp.pair,
+                        buy_venue=opp.buy_venue,
+                        sell_venue=opp.sell_venue,
+                        strategy=opp.strategy,
+                        **(details_route or {}),
+                    )
                     continue
                 opp.net_percent = est_percent
                 liquidity_score = 0.0
@@ -6395,6 +6687,7 @@ def run_once() -> None:
                     net_percent=est_percent,
                     est_profit=est_profit,
                 )
+                _consume_opportunity_account_limits(opp, capital_used)
                 p2p_cross_alerts += 1
                 alert_entry = dict(entry)
                 alert_entry["ts"] = int(time.time())
