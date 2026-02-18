@@ -1430,6 +1430,10 @@ LOG_HEADER = [
     "volatility_score",
     "priority_score",
     "confidence",
+    "buy_vwap",
+    "sell_vwap",
+    "effective_slippage_bps",
+    "executable_qty",
 ]
 
 
@@ -2399,6 +2403,23 @@ class DepthInfo:
     levels: int
     ts: int
     checksum: str
+    bid_levels: List[Tuple[float, float]] = field(default_factory=list)
+    ask_levels: List[Tuple[float, float]] = field(default_factory=list)
+
+
+def _parse_orderbook_levels(entries: Any, max_levels: int = 20) -> List[Tuple[float, float]]:
+    parsed: List[Tuple[float, float]] = []
+    if not isinstance(entries, list):
+        return parsed
+    for entry in entries[:max(1, int(max_levels))]:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        price = safe_float(entry[0])
+        qty = safe_float(entry[1])
+        if price <= 0 or qty <= 0:
+            continue
+        parsed.append((price, qty))
+    return parsed
 
 
 @dataclass
@@ -3093,6 +3114,49 @@ def apply_slippage(price: float, slippage_bps: float, side: str) -> float:
     return max(price * (1.0 - factor), 0.0)
 
 
+def compute_executable_price(
+    depth: Optional[DepthInfo], side: str, target_qty: float
+) -> Optional[Tuple[float, float, float]]:
+    if not depth or target_qty <= 0:
+        return None
+
+    normalized_side = side.lower()
+    if normalized_side == "buy":
+        levels = depth.ask_levels
+        reference_price = float(depth.best_ask)
+    elif normalized_side == "sell":
+        levels = depth.bid_levels
+        reference_price = float(depth.best_bid)
+    else:
+        return None
+
+    if reference_price <= 0 or not levels:
+        return None
+
+    remaining = float(target_qty)
+    executed_qty = 0.0
+    executed_notional = 0.0
+    for price, qty in levels:
+        if remaining <= 0:
+            break
+        take_qty = min(remaining, qty)
+        if take_qty <= 0:
+            continue
+        executed_qty += take_qty
+        executed_notional += take_qty * price
+        remaining -= take_qty
+
+    if executed_qty <= 0:
+        return None
+
+    vwap = executed_notional / executed_qty
+    if normalized_side == "buy":
+        slippage_bps = ((vwap / reference_price) - 1.0) * 10_000.0
+    else:
+        slippage_bps = (1.0 - (vwap / reference_price)) * 10_000.0
+    return vwap, slippage_bps, executed_qty
+
+
 def compute_base_quantity(capital_quote: float, buy_price: float, buy_slippage_bps: float) -> float:
     adjusted_buy = apply_slippage(buy_price, buy_slippage_bps, "buy")
     if adjusted_buy <= 0 or capital_quote <= 0:
@@ -3635,17 +3699,27 @@ class Binance(ExchangeAdapter):
                 integrity_key=self._integrity_key(sym, "depth"),
                 fallback_endpoints=[(fallback, {"symbol": sym, "limit": 20}) for fallback in fallbacks],
             )
-            bids = response.data.get("bids") or []
-            asks = response.data.get("asks") or []
+            bids = _parse_orderbook_levels(response.data.get("bids") or [])
+            asks = _parse_orderbook_levels(response.data.get("asks") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(b[1]) for b in bids)
-            ask_volume = sum(safe_float(a[1]) for a in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, ts_val, response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                ts_val,
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[binance] depth error {pair}: {exc}")
             return None
@@ -3798,21 +3872,31 @@ class Bybit(ExchangeAdapter):
                 ],
             )
             result = response.data.get("result") or {}
-            bids = result.get("b") or []
-            asks = result.get("a") or []
+            bids = _parse_orderbook_levels(result.get("b") or [])
+            asks = _parse_orderbook_levels(result.get("a") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(entry[1]) for entry in bids)
-            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_field = safe_float(result.get("ts") or response.data.get("time"))
             if ts_field > 0:
                 ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "bybit:depth")
             else:
                 ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                int(ts_val),
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[bybit] depth error {pair}: {exc}")
             return None
@@ -4173,21 +4257,31 @@ class KuCoin(ExchangeAdapter):
                 fallback_endpoints=[(fallback, {"symbol": sym}) for fallback in fallbacks],
             )
             data = response.data.get("data") or {}
-            bids = data.get("bids") or []
-            asks = data.get("asks") or []
+            bids = _parse_orderbook_levels(data.get("bids") or [])
+            asks = _parse_orderbook_levels(data.get("asks") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(entry[1]) for entry in bids)
-            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_field = safe_float(data.get("time"))
             if ts_field > 0:
                 ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "kucoin:depth")
             else:
                 ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                int(ts_val),
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[kucoin] depth error {pair}: {exc}")
             return None
@@ -4256,21 +4350,31 @@ class OKX(ExchangeAdapter):
             if not items:
                 raise HttpError("Depth vacío")
             item = items[0]
-            bids = item.get("bids") or []
-            asks = item.get("asks") or []
+            bids = _parse_orderbook_levels(item.get("bids") or [])
+            asks = _parse_orderbook_levels(item.get("asks") or [])
             if not bids or not asks:
                 raise HttpError("Depth vacío")
             best_bid = safe_float(bids[0][0])
             best_ask = safe_float(asks[0][0])
-            bid_volume = sum(safe_float(entry[1]) for entry in bids)
-            ask_volume = sum(safe_float(entry[1]) for entry in asks)
+            bid_volume = sum(level[1] for level in bids)
+            ask_volume = sum(level[1] for level in asks)
             levels = min(len(bids), len(asks))
             ts_field = safe_float(item.get("ts") or response.data.get("ts"))
             if ts_field > 0:
                 ts_val = ensure_fresh_timestamp(int(ts_field), response.received_ts, "okx:depth")
             else:
                 ts_val = response.received_ts
-            return DepthInfo(best_bid, best_ask, bid_volume, ask_volume, levels, int(ts_val), response.checksum)
+            return DepthInfo(
+                best_bid,
+                best_ask,
+                bid_volume,
+                ask_volume,
+                levels,
+                int(ts_val),
+                response.checksum,
+                bid_levels=bids,
+                ask_levels=asks,
+            )
         except Exception as exc:
             print(f"[okx] depth error {pair}: {exc}")
             return None
@@ -4550,6 +4654,10 @@ class Opportunity:
     confidence_label: str = "media"
     strategy: str = "spot_spot"
     notes: Dict[str, Any] = field(default_factory=dict)
+    buy_vwap: float = 0.0
+    sell_vwap: float = 0.0
+    effective_slippage_bps: float = 0.0
+    executable_qty: float = 0.0
 
 
 @dataclass
@@ -5177,6 +5285,10 @@ def append_csv(
                 f"{opp.volatility_score:.4f}",
                 f"{opp.priority_score:.6f}",
                 opp.confidence_label,
+                f"{opp.buy_vwap:.8f}",
+                f"{opp.sell_vwap:.8f}",
+                f"{opp.effective_slippage_bps:.4f}",
+                f"{opp.executable_qty:.8f}",
             ]
         )
 
@@ -5462,6 +5574,55 @@ def run_once() -> None:
                 )
                 if base_qty <= 0 or capital_used <= 0:
                     continue
+
+                buy_vwap = opp.buy_price
+                sell_vwap = opp.sell_price
+                executable_qty = base_qty
+                effective_slippage_bps = 0.0
+                buy_exec = compute_executable_price(opp.buy_depth, "buy", base_qty)
+                sell_exec = compute_executable_price(opp.sell_depth, "sell", base_qty)
+                if buy_exec or sell_exec:
+                    if not buy_exec or not sell_exec:
+                        print(
+                            f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} depth_insufficient"
+                        )
+                        continue
+                    buy_vwap, buy_slippage_bps, buy_executed_qty = buy_exec
+                    sell_vwap, sell_slippage_bps, sell_executed_qty = sell_exec
+                    if buy_executed_qty + 1e-12 < base_qty or sell_executed_qty + 1e-12 < base_qty:
+                        print(
+                            f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} depth_insufficient"
+                        )
+                        continue
+                    executable_qty = min(base_qty, buy_executed_qty, sell_executed_qty)
+                    effective_slippage_bps = buy_slippage_bps + sell_slippage_bps
+                    est_profit, est_percent, base_qty, capital_used = estimate_profit(
+                        capital_for_pair,
+                        buy_vwap,
+                        sell_vwap,
+                        total_fee_pct,
+                        max_base_qty=executable_qty,
+                    )
+                    if base_qty <= 0 or capital_used <= 0:
+                        continue
+                    if est_percent < threshold:
+                        print(
+                            f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} slippage_threshold"
+                        )
+                        continue
+
+                opp.buy_price = buy_vwap
+                opp.sell_price = sell_vwap
+                opp.executable_qty = base_qty
+                opp.buy_vwap = buy_vwap
+                opp.sell_vwap = sell_vwap
+                opp.effective_slippage_bps = effective_slippage_bps
+                opp.gross_percent = (
+                    ((opp.sell_price - opp.buy_price) / opp.buy_price) * 100.0
+                    if opp.buy_price > 0
+                    else 0.0
+                )
+                opp.net_percent = opp.gross_percent - total_fee_pct
                 valid_buy, reason_buy = validate_market_trade(
                     opp.buy_venue, opp.pair, base_qty, opp.buy_price
                 )
