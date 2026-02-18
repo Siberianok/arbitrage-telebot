@@ -4838,8 +4838,8 @@ class GenericP2PMarketplace(ExchangeAdapter):
                         formatted.append((fb_url, fb_payload))
             return formatted
 
-        try:
-            if endpoint:
+        if endpoint:
+            try:
                 if method == "GET":
                     response = http_get_json(
                         endpoint,
@@ -4859,9 +4859,11 @@ class GenericP2PMarketplace(ExchangeAdapter):
                         headers=headers_cfg or None,
                         fallback_endpoints=_format_fallbacks(),
                     )
-        except Exception as exc:
-            print(f"[{self.name}] p2p {pair} error: {exc}")
-            response = None
+            except HttpError as exc:
+                raise HttpError(
+                    f"[{self.name}] p2p {pair} gateway error: {exc}",
+                    status_code=exc.status_code,
+                ) from exc
 
         data = response.data if response else None
         base_path = _normalize_json_path(

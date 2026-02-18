@@ -1,4 +1,5 @@
 import observability
+import arbitrage_telebot as bot
 
 
 def test_circuit_breaker_opens_and_resets(monkeypatch):
@@ -77,3 +78,53 @@ def test_concurrent_circuit_reads_do_not_break_state():
         results = list(pool.map(lambda _: observability.is_circuit_open(exchange), range(100)))
 
     assert all(results)
+
+
+def test_fetch_all_quotes_opens_circuit_and_skips_failed_p2p_venue(monkeypatch):
+    observability.reset_all_states()
+
+    venue = "test_p2p"
+    pair = "BTC/USDT"
+
+    monkeypatch.setitem(
+        bot.CONFIG,
+        "venues",
+        {
+            venue: {
+                "p2p": {
+                    "enabled": True,
+                    "pairs": {
+                        pair: {
+                            "endpoint": "https://example.invalid/quote",
+                            "bid_path": "bid",
+                            "ask_path": "ask",
+                        }
+                    },
+                }
+            }
+        },
+    )
+
+    adapter = bot.GenericP2PMarketplace(venue)
+
+    def _raise_transport_error(*args, **kwargs):
+        raise bot.HttpError("transport down")
+
+    monkeypatch.setattr(bot, "http_get_json", _raise_transport_error)
+
+    for _ in range(observability.CIRCUIT_FAILURE_THRESHOLD):
+        bot.fetch_all_quotes([pair], {venue: adapter})
+
+    snapshot = observability.metrics_snapshot()[venue]
+    assert snapshot["errors"] == observability.CIRCUIT_FAILURE_THRESHOLD
+    assert snapshot["attempts"] == observability.CIRCUIT_FAILURE_THRESHOLD
+    assert snapshot["skips"] == 0
+    assert observability.is_circuit_open(venue)
+
+    bot.fetch_all_quotes([pair], {venue: adapter})
+
+    snapshot = observability.metrics_snapshot()[venue]
+    assert snapshot["attempts"] == observability.CIRCUIT_FAILURE_THRESHOLD
+    assert snapshot["errors"] == observability.CIRCUIT_FAILURE_THRESHOLD
+    assert snapshot["skips"] == 1
+
