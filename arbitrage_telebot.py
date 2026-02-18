@@ -114,6 +114,7 @@ LOG_BASE_DIR = os.getenv("LOG_BASE_DIR", "logs")
 LOG_BACKUP_DIR = os.getenv("LOG_BACKUP_DIR", "log_backups")
 DEFAULT_QUOTE_WORKERS = int(os.getenv("QUOTE_WORKERS", "16"))
 DEFAULT_QUOTE_ASSET = os.getenv("DEFAULT_QUOTE_ASSET", "USDT").strip().upper() or "USDT"
+PROCESS_ROLE = (os.getenv("PROCESS_ROLE", "all") or "all").strip().lower()
 
 PROM_REGISTRY = CollectorRegistry()
 PROM_LAST_RUN_TS = Gauge(
@@ -1418,6 +1419,7 @@ DYNAMIC_THRESHOLD_PERCENT: float = float(CONFIG.get("threshold_percent", 0.0))
 TELEGRAM_CHAT_IDS: Set[str] = set()
 TELEGRAM_LAST_UPDATE_ID = 0
 TELEGRAM_POLLING_THREAD: Optional[threading.Thread] = None
+SCANNER_LOOP_THREAD: Optional[threading.Thread] = None
 KEEPALIVE_THREAD: Optional[threading.Thread] = None
 TELEGRAM_ADMIN_IDS: Set[str] = set()
 TELEGRAM_POLL_BACKOFF_UNTIL = 0.0
@@ -1788,9 +1790,41 @@ def build_health_payload() -> Dict[str, Any]:
         quote_discards = list(DASHBOARD_STATE.get("quote_discards", []))[:50]
 
     status = "ok"
+    scanner_loop_alive = SCANNER_LOOP_THREAD is not None and SCANNER_LOOP_THREAD.is_alive()
+    telegram_polling_alive = TELEGRAM_POLLING_THREAD is not None and TELEGRAM_POLLING_THREAD.is_alive()
+    scanner_interval = float(os.getenv("INTERVAL_SECONDS", "30") or 30)
+    scanner_stale_seconds = None
+    if summary.get("ts"):
+        scanner_stale_seconds = max(0.0, now - float(summary["ts"]))
+
+    checks = {
+        "scanner_loop": {
+            "required": PROCESS_ROLE in ("all", "scanner"),
+            "alive": scanner_loop_alive,
+            "stale_seconds": scanner_stale_seconds,
+        },
+        "telegram_polling": {
+            "required": PROCESS_ROLE in ("all", "telegram-worker"),
+            "alive": telegram_polling_alive,
+        },
+        "api": {
+            "required": PROCESS_ROLE in ("all", "api"),
+            "alive": True,
+        },
+    }
+
     if not summary:
         status = "booting"
     elif any(stats.get("errors") for stats in metrics.values()):
+        status = "degraded"
+
+    if checks["scanner_loop"]["required"]:
+        stale_threshold = max(90.0, scanner_interval * 3)
+        if not scanner_loop_alive:
+            status = "degraded"
+        elif scanner_stale_seconds is not None and scanner_stale_seconds > stale_threshold:
+            status = "degraded"
+    if checks["telegram_polling"]["required"] and not telegram_polling_alive:
         status = "degraded"
 
     telegram_enabled = bool(CONFIG.get("telegram", {}).get("enabled", False))
@@ -1817,6 +1851,10 @@ def build_health_payload() -> Dict[str, Any]:
             "last_send_ts": LAST_TELEGRAM_SEND_TS or None,
             "seconds_since_last_send": seconds_since_last_send,
             "registered_chats": len(get_registered_chat_ids()),
+        },
+        "process": {
+            "role": PROCESS_ROLE,
+            "checks": checks,
         },
     }
     return payload
@@ -6439,18 +6477,75 @@ def run_once() -> None:
 # =========================
 # CLI
 # =========================
+def _run_scanner_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
+    global SCANNER_LOOP_THREAD
+
+    if tg_enabled:
+        tg_sync_command_menu(enabled=True)
+        tg_send_message(
+            "🤖 Bot reiniciado.\n\n" + format_command_help(),
+            enabled=True,
+        )
+        ensure_telegram_polling_thread(enabled=True, interval=1.0)
+
+    ensure_keepalive_thread()
+
+    if args.web:
+        SCANNER_LOOP_THREAD = threading.Thread(
+            target=run_loop_forever,
+            args=(args.interval,),
+            daemon=True,
+            name="scanner-loop",
+        )
+        SCANNER_LOOP_THREAD.start()
+        serve_http(args.port)
+        return
+
+    if args.once and args.loop:
+        log_event("cli.invalid_args", once=args.once, loop=args.loop)
+        return
+
+    if args.once or not args.loop:
+        run_once()
+        return
+
+    run_loop_forever(args.interval)
+
+
+def _run_api_mode(args: argparse.Namespace) -> None:
+    serve_http(args.port)
+
+
+def _run_telegram_worker_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
+    if tg_enabled:
+        ensure_telegram_polling_thread(enabled=True, interval=1.0)
+    else:
+        log_event("telegram.poll.disabled", reason="telegram_not_enabled")
+
+    if args.web:
+        serve_http(args.port)
+        return
+
+    while True:
+        time.sleep(5)
+
+
 def main():
+    global PROCESS_ROLE
+
     ap = argparse.ArgumentParser(description="Arbitrage TeleBot (spot, inventario) - web-ready")
     ap.add_argument("--once", action="store_true", help="Ejecuta una vez y termina")
     ap.add_argument("--loop", action="store_true", help="Ejecuta en loop continuo")
     ap.add_argument("--interval", type=int, default=int(os.getenv("INTERVAL_SECONDS", "30")), help="Segundos entre corridas en modo loop")
-    ap.add_argument("--web", action="store_true", help="Expone /health y corre el loop en background")
+    ap.add_argument("--web", action="store_true", help="Expone /health y endpoints HTTP")
     ap.add_argument("--port", type=int, default=int(os.getenv("PORT", "10000")), help="Puerto HTTP para /health (Render usa $PORT)")
+    ap.add_argument("--role", choices=["all", "scanner", "api", "telegram-worker"], default=PROCESS_ROLE, help="Proceso lógico a ejecutar")
     ap.add_argument("--diagnose-exchanges", action="store_true", help="Verifica conectividad de cada exchange y par configurado")
     ap.add_argument("--diagnose-pair", action="append", dest="diagnose_pairs", help="Limita el diagnóstico a uno o más pares (puede repetirse)")
     ap.add_argument("--diagnose-venue", action="append", dest="diagnose_venues", help="Limita el diagnóstico a uno o más exchanges (puede repetirse)")
 
     args = ap.parse_args()
+    PROCESS_ROLE = args.role
 
     if args.diagnose_exchanges:
         selected_pairs = normalize_pair_list(args.diagnose_pairs or CONFIG["pairs"])
@@ -6499,38 +6594,13 @@ def main():
         return
 
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
-    if tg_enabled:
-        tg_sync_command_menu(enabled=True)
-        tg_send_message(
-            "🤖 Bot reiniciado.\n\n" + format_command_help(),
-            enabled=True,
-        )
-    if tg_enabled and (args.loop or args.web):
-        ensure_telegram_polling_thread(enabled=True, interval=1.0)
-
-    if args.loop or args.web:
-        ensure_keepalive_thread()
-
-    if args.web:
-        t = threading.Thread(target=run_loop_forever, args=(args.interval,), daemon=True)
-        t.start()
-        serve_http(args.port)
+    if args.role in ("all", "scanner"):
+        _run_scanner_mode(args, tg_enabled=tg_enabled)
         return
-
-    if args.once and args.loop:
-        log_event("cli.invalid_args", once=args.once, loop=args.loop)
+    if args.role == "api":
+        _run_api_mode(args)
         return
-
-    if args.once or not args.loop:
-        run_once()
-        return
-
-    while True:
-        try:
-            run_once()
-        except Exception as e:
-            log_event("loop.error", error=str(e))
-        time.sleep(max(5, args.interval))
+    _run_telegram_worker_mode(args, tg_enabled=tg_enabled)
 
 if __name__ == "__main__":
     main()

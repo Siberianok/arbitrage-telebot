@@ -64,6 +64,25 @@ export WEB_AUTH_PASS="clave-super-segura"
 
 Luego iniciar con `python arbitrage_telebot.py --web --interval 30 --port 10000`.
 
+
+
+🏗️ Ejecución por procesos (producción)
+
+Para separar responsabilidades y mejorar disponibilidad, usar roles dedicados:
+
+- Scanner/engine: `python arbitrage_telebot.py --role scanner --loop --interval 30`
+- API/dashboard: `python arbitrage_telebot.py --role api --web --port 10000`
+- Telegram polling worker: `python arbitrage_telebot.py --role telegram-worker --web --port 10001`
+
+Todos los roles exponen `/health`, `/live` y `/ready` cuando arrancan con `--web`, incluyendo checks específicos por proceso en el payload (`process.checks`).
+
+🛟 Continuidad operativa y contingencia
+
+- Infra recomendada sin sleep: servicios separados en plan always-on (`render.yaml`).
+- Logs y backups: usar almacenamiento persistente vía `LOG_BASE_DIR` / `LOG_BACKUP_DIR`.
+- Estado externo: configurar `STATE_DB_URL` para persistencia fuera del filesystem local.
+- Runbook completo: `docs/continuity_runbook.md`.
+
 📦 Variables clave para despliegues resilientes
 
 - `LOG_BASE_DIR` / `LOG_BACKUP_DIR`: directorios para logs y respaldos persistentes (por defecto `logs/` y `log_backups/`).
