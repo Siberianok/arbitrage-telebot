@@ -1356,6 +1356,20 @@ CONFIG = {
             ],
         },
     ],
+    "analysis": {
+        "enabled": True,
+        "lookback_hours": 72,
+        "target_success_rate": 0.6,
+        "min_threshold_percent": 0.1,
+        "max_threshold_percent": 5.0,
+        "adjust_multiplier": 0.4,
+    },
+    "execution_costs": {
+        "slippage_bps": 12.0,
+        "rebalance_bps": 6.0,
+        "latency_seconds": 30.0,
+        "latency_penalty_multiplier": 0.2,
+    },
     "telegram": {
         "enabled": True,                 # poner False para pruebas sin enviar
         "bot_token_env": "TG_BOT_TOKEN",
@@ -1415,12 +1429,19 @@ PENDING_CHAT_ACTIONS: Dict[str, str] = {}
 LOG_HEADER = [
     "ts",
     "pair",
+    "strategy",
+    "fiat",
+    "bucket",
     "buy_venue",
     "sell_venue",
     "buy_price",
     "sell_price",
     "gross_%",
     "net_%",
+    "effective_net_%",
+    "slippage_drawdown_%",
+    "threshold_used_%",
+    "threshold_hit",
     "est_profit_quote",
     "base_qty",
     "capital_used_quote",
@@ -1490,6 +1511,8 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
             "average_net_percent": analysis.average_net_percent,
             "average_effective_percent": analysis.average_effective_percent,
             "recommended_threshold": recommended,
+            "context_thresholds": analysis.context_thresholds,
+            "bucket_metrics": analysis.bucket_metrics,
         }
 
     log_event(
@@ -4581,6 +4604,49 @@ class HistoricalAnalysis:
     pair_volatility: Dict[str, float]
     max_volatility: float
     backtest: BacktestReport
+    context_thresholds: Dict[str, float] = field(default_factory=dict)
+    bucket_metrics: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+
+@dataclass
+class ThresholdContext:
+    strategy: str
+    pair: str
+    fiat: str = ""
+
+    @property
+    def context_key(self) -> str:
+        return build_context_key(self.strategy, self.pair, self.fiat)
+
+
+def normalize_strategy_name(strategy: str) -> str:
+    normalized = str(strategy or "spot_spot").strip().lower()
+    if normalized == "triangular_intra_venue":
+        return "triangular"
+    return normalized or "spot_spot"
+
+
+def build_context_key(strategy: str, pair: str, fiat: str = "") -> str:
+    normalized_pair = normalize_pair_input(pair) or str(pair or "").strip().upper()
+    normalized_fiat = str(fiat or "").strip().upper()
+    suffix = normalized_fiat or "NA"
+    return f"{normalize_strategy_name(strategy)}|{normalized_pair}|{suffix}"
+
+
+def is_ars_usdt_route(pair: str, fiat: str = "") -> bool:
+    pair_up = (normalize_pair_input(pair) or str(pair or "").strip().upper())
+    fiat_up = str(fiat or "").strip().upper()
+    assets = set(pair_up.split("/"))
+    if {"ARS", "USDT"}.issubset(assets):
+        return True
+    return "USDT" in assets and fiat_up == "ARS"
+
+
+def floor_for_context(pair: str, fiat: str = "") -> float:
+    base_floor = float((CONFIG.get("analysis") or {}).get("min_threshold_percent", 0.1))
+    if is_ars_usdt_route(pair, fiat):
+        return max(base_floor, 0.50)
+    return base_floor
 def load_historical_rows(path: str, lookback_hours: int) -> List[Dict[str, str]]:
     if not os.path.exists(path):
         return []
@@ -4715,12 +4781,99 @@ def compute_dynamic_threshold(
     return max(min_thr, min(max_thr, blended))
 
 
+def compute_context_thresholds(
+    rows: List[Dict[str, str]],
+    effective_by_index: List[float],
+    analysis_cfg: Dict[str, float],
+    base_threshold: float,
+) -> Dict[str, float]:
+    grouped_net: Dict[str, List[float]] = {}
+    grouped_eff: Dict[str, List[float]] = {}
+    grouped_hits: Dict[str, int] = {}
+
+    for idx, row in enumerate(rows):
+        pair = normalize_pair_input(row.get("pair", "")) or ""
+        if not pair:
+            continue
+        strategy = normalize_strategy_name(row.get("strategy", "spot_spot"))
+        fiat = str(row.get("fiat", "")).strip().upper()
+        context_key = build_context_key(strategy, pair, fiat)
+        net = safe_float(row.get("net_%"), 0.0)
+        eff = effective_by_index[idx] if idx < len(effective_by_index) else net
+        grouped_net.setdefault(context_key, []).append(net)
+        grouped_eff.setdefault(context_key, []).append(eff)
+        grouped_hits[context_key] = grouped_hits.get(context_key, 0) + (1 if eff > 0 else 0)
+
+    context_thresholds: Dict[str, float] = {}
+    for context_key, nets in grouped_net.items():
+        effs = grouped_eff.get(context_key, [])
+        hit_rate = grouped_hits.get(context_key, 0) / len(nets) if nets else 0.0
+        strategy, pair, fiat = context_key.split("|", 2)
+        threshold = compute_dynamic_threshold(nets, effs, hit_rate, base_threshold, analysis_cfg)
+        floor = floor_for_context(pair, fiat if fiat != "NA" else "")
+        context_thresholds[context_key] = max(floor, threshold)
+
+    return context_thresholds
+
+
+def compute_bucket_metrics(
+    rows: List[Dict[str, str]],
+    effective_by_index: List[float],
+) -> Dict[str, Dict[str, float]]:
+    stats: Dict[str, Dict[str, float]] = {}
+    for idx, row in enumerate(rows):
+        pair = normalize_pair_input(row.get("pair", "")) or ""
+        if not pair:
+            continue
+        strategy = normalize_strategy_name(row.get("strategy", "spot_spot"))
+        fiat = str(row.get("fiat", "")).strip().upper()
+        bucket = str(row.get("bucket", "")).strip() or build_context_key(strategy, pair, fiat)
+
+        net = safe_float(row.get("net_%"), 0.0)
+        effective = safe_float(row.get("effective_net_%"), net)
+        if not row.get("effective_net_%") and idx < len(effective_by_index):
+            effective = effective_by_index[idx]
+        drawdown = max(0.0, net - effective)
+
+        bucket_stat = stats.setdefault(bucket, {"samples": 0.0, "hits": 0.0, "drawdown": 0.0, "sum_effective": 0.0})
+        bucket_stat["samples"] += 1.0
+        bucket_stat["hits"] += 1.0 if effective > 0 else 0.0
+        bucket_stat["drawdown"] += drawdown
+        bucket_stat["sum_effective"] += effective
+
+    metrics: Dict[str, Dict[str, float]] = {}
+    for bucket, acc in stats.items():
+        samples = max(1.0, acc["samples"])
+        metrics[bucket] = {
+            "samples": acc["samples"],
+            "hit_rate_real": acc["hits"] / samples,
+            "avg_slippage_drawdown_percent": acc["drawdown"] / samples,
+            "avg_effective_net_percent": acc["sum_effective"] / samples,
+        }
+    return metrics
+
+
+def resolve_threshold_for_context(
+    context: ThresholdContext,
+    base_threshold: float,
+    dynamic_threshold: float,
+) -> float:
+    if LATEST_ANALYSIS and getattr(LATEST_ANALYSIS, "context_thresholds", None):
+        value = LATEST_ANALYSIS.context_thresholds.get(context.context_key)
+        if value and math.isfinite(value):
+            return max(floor_for_context(context.pair, context.fiat), float(value))
+
+    fallback = float(dynamic_threshold or base_threshold)
+    return max(floor_for_context(context.pair, context.fiat), fallback)
+
+
 def analyze_historical_performance(path: str, capital: float) -> HistoricalAnalysis:
     analysis_cfg = CONFIG.get("analysis", {})
     lookback_hours = int(analysis_cfg.get("lookback_hours", 0))
     rows = load_historical_rows(path, lookback_hours)
 
     params = build_backtest_params(capital, CONFIG.get("execution_costs", {}))
+    base_threshold = float(CONFIG.get("threshold_percent", 0.0))
 
     if not rows:
         backtest = BacktestReport()
@@ -4729,10 +4882,12 @@ def analyze_historical_performance(path: str, capital: float) -> HistoricalAnaly
             success_rate=backtest.success_rate,
             average_net_percent=0.0,
             average_effective_percent=backtest.average_effective_percent,
-            recommended_threshold=float(CONFIG["threshold_percent"]),
+            recommended_threshold=base_threshold,
             pair_volatility={},
             max_volatility=0.0,
             backtest=backtest,
+            context_thresholds={},
+            bucket_metrics={},
         )
 
     volatility, max_volatility = compute_pair_volatility(rows)
@@ -4743,9 +4898,12 @@ def analyze_historical_performance(path: str, capital: float) -> HistoricalAnaly
         net_values,
         effective_values,
         backtest.success_rate,
-        float(CONFIG["threshold_percent"]),
+        base_threshold,
         analysis_cfg,
     )
+
+    context_thresholds = compute_context_thresholds(rows, effective_values, analysis_cfg, recommended_threshold)
+    bucket_metrics = compute_bucket_metrics(rows, effective_values)
 
     return HistoricalAnalysis(
         rows_considered=len(net_values),
@@ -4756,6 +4914,8 @@ def analyze_historical_performance(path: str, capital: float) -> HistoricalAnaly
         pair_volatility=volatility,
         max_volatility=max_volatility,
         backtest=backtest,
+        context_thresholds=context_thresholds,
+        bucket_metrics=bucket_metrics,
     )
 
 @dataclass
@@ -5152,22 +5312,34 @@ def append_csv(
     capital_used: float,
     buy_depth: Optional[DepthInfo],
     sell_depth: Optional[DepthInfo],
+    threshold_used: float,
+    effective_net_percent: float,
+    slippage_drawdown_percent: float,
+    fiat: str = "",
 ) -> None:
     ensure_log_header(path)
     buy_depth_qty = _available_depth_qty(buy_depth, "buy")
     sell_depth_qty = _available_depth_qty(sell_depth, "sell")
+    bucket = build_context_key(opp.strategy, opp.pair, fiat)
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
             [
                 int(time.time()),
                 opp.pair,
+                opp.strategy,
+                fiat,
+                bucket,
                 opp.buy_venue,
                 opp.sell_venue,
                 f"{opp.buy_price:.8f}",
                 f"{opp.sell_price:.8f}",
                 f"{opp.gross_percent:.4f}",
                 f"{opp.net_percent:.4f}",
+                f"{effective_net_percent:.4f}",
+                f"{slippage_drawdown_percent:.4f}",
+                f"{threshold_used:.4f}",
+                "1" if opp.net_percent >= threshold_used else "0",
                 f"{est_profit:.4f}",
                 f"{base_qty:.8f}",
                 f"{capital_used:.8f}",
@@ -5387,7 +5559,7 @@ def run_once() -> None:
     log_csv = CONFIG["log_csv_path"]
     tri_log_csv = CONFIG.get("triangular_log_csv_path")
     update_analysis_state(capital, log_csv)
-    threshold = float(DYNAMIC_THRESHOLD_PERCENT or base_threshold)
+    dynamic_threshold = float(DYNAMIC_THRESHOLD_PERCENT or base_threshold)
     pair_weight_cfg = CONFIG.get("capital_weights", {}).get("pairs", {})
     triangle_weight_cfg = CONFIG.get("capital_weights", {}).get("triangles", {})
     fee_map = build_fee_map(all_pairs)
@@ -5495,7 +5667,14 @@ def run_once() -> None:
                 effective_net_percent = (
                     (est_profit_net / capital_used) * 100.0 if capital_used > 0 else 0.0
                 )
-                if effective_net_percent < threshold:
+                slippage_drawdown_percent = max(0.0, est_percent - effective_net_percent)
+                threshold_ctx = ThresholdContext(strategy=opp.strategy, pair=opp.pair)
+                context_threshold = resolve_threshold_for_context(
+                    threshold_ctx,
+                    base_threshold,
+                    dynamic_threshold,
+                )
+                if effective_net_percent < context_threshold:
                     print(
                         f"[SKIP] {opp.pair} {opp.buy_venue}->{opp.sell_venue} transfer_fee/ETA"
                     )
@@ -5517,7 +5696,7 @@ def run_once() -> None:
             )
             confidence_label = classify_confidence(
                 opp.net_percent,
-                threshold,
+                context_threshold,
                 liquidity_score,
                 volatility_score,
                 priority_score,
@@ -5546,14 +5725,14 @@ def run_once() -> None:
                 "volatility_score": volatility_score,
                 "priority_score": priority_score,
                 "confidence": confidence_label,
-                "threshold_hit": est_percent >= threshold,
+                "threshold_hit": est_percent >= context_threshold,
                 "transfer_cost_quote": transfer_est.total_cost_quote,
                 "transfer_minutes": transfer_est.total_minutes,
                 "strategy": opp.strategy,
                 "notes": opp.notes,
             }
             summary_opps.append(entry)
-            if est_percent >= threshold:
+            if est_percent >= context_threshold:
                 append_csv(
                     log_csv,
                     opp,
@@ -5562,6 +5741,9 @@ def run_once() -> None:
                     capital_used,
                     opp.buy_depth,
                     opp.sell_depth,
+                    context_threshold,
+                    effective_net_percent,
+                    slippage_drawdown_percent,
                 )
                 msg = fmt_alert(
                     opp,
@@ -5659,7 +5841,13 @@ def run_once() -> None:
                     if not valid_p2p:
                         print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason_p2p}")
                         continue
-                if est_percent < threshold:
+                threshold_ctx = ThresholdContext(strategy=opp.strategy, pair=opp.pair, fiat=str(fiat or ""))
+                context_threshold = resolve_threshold_for_context(
+                    threshold_ctx,
+                    base_threshold,
+                    dynamic_threshold,
+                )
+                if est_percent < context_threshold:
                     continue
                 opp.net_percent = est_percent
                 opp.notes.setdefault("fiat", fiat)
@@ -5667,7 +5855,7 @@ def run_once() -> None:
                 volatility_score = compute_volatility_score(pair)
                 priority_score = compute_priority_score(est_percent, liquidity_score, volatility_score)
                 confidence_label = classify_confidence(
-                    est_percent, threshold, liquidity_score, volatility_score, priority_score
+                    est_percent, context_threshold, liquidity_score, volatility_score, priority_score
                 )
                 opp.liquidity_score = liquidity_score
                 opp.volatility_score = volatility_score
@@ -5691,7 +5879,7 @@ def run_once() -> None:
                     "volatility_score": volatility_score,
                     "priority_score": priority_score,
                     "confidence": confidence_label,
-                    "threshold_hit": True,
+                    "threshold_hit": est_percent >= context_threshold,
                     "strategy": opp.strategy,
                     "notes": opp.notes,
                 }
@@ -5704,6 +5892,10 @@ def run_once() -> None:
                     capital_used,
                     opp.buy_depth,
                     opp.sell_depth,
+                    context_threshold,
+                    est_percent,
+                    0.0,
+                    str(fiat or ""),
                 )
                 msg = fmt_alert(
                     opp,
@@ -5768,14 +5960,21 @@ def run_once() -> None:
                 if not valid_sell:
                     print(f"[SKIP] {pair} {opp.buy_venue}->{opp.sell_venue} {reason_sell}")
                     continue
-                if est_percent < threshold:
+                quote_asset = split_pair(pair)[1]
+                threshold_ctx = ThresholdContext(strategy=opp.strategy, pair=opp.pair, fiat=quote_asset)
+                context_threshold = resolve_threshold_for_context(
+                    threshold_ctx,
+                    base_threshold,
+                    dynamic_threshold,
+                )
+                if est_percent < context_threshold:
                     continue
                 opp.net_percent = est_percent
                 liquidity_score = 0.0
                 volatility_score = compute_volatility_score(pair)
                 priority_score = compute_priority_score(est_percent, liquidity_score, volatility_score)
                 confidence_label = classify_confidence(
-                    est_percent, threshold, liquidity_score, volatility_score, priority_score
+                    est_percent, context_threshold, liquidity_score, volatility_score, priority_score
                 )
                 opp.liquidity_score = liquidity_score
                 opp.volatility_score = volatility_score
@@ -5799,7 +5998,7 @@ def run_once() -> None:
                     "volatility_score": volatility_score,
                     "priority_score": priority_score,
                     "confidence": confidence_label,
-                    "threshold_hit": True,
+                    "threshold_hit": est_percent >= context_threshold,
                     "strategy": opp.strategy,
                     "notes": opp.notes,
                 }
@@ -5812,6 +6011,10 @@ def run_once() -> None:
                     capital_used,
                     None,
                     None,
+                    context_threshold,
+                    est_percent,
+                    0.0,
+                    quote_asset,
                 )
                 msg = fmt_alert(
                     opp,
@@ -5847,7 +6050,9 @@ def run_once() -> None:
         if route_capital <= 0:
             continue
         opp = compute_triangular_opportunity(route, pair_quotes, fee_map, route_capital)
-        if not opp or opp.net_percent < threshold:
+        tri_context = ThresholdContext(strategy="triangular", pair=f"{route.start_asset}/USDT")
+        tri_threshold = resolve_threshold_for_context(tri_context, base_threshold, dynamic_threshold)
+        if not opp or opp.net_percent < tri_threshold:
             continue
 
         if tri_log_csv:
@@ -5866,9 +6071,11 @@ def run_once() -> None:
     summary = {
         "ts": run_ts,
         "ts_str": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(run_ts)),
-        "threshold": threshold,
+        "threshold": dynamic_threshold,
         "base_threshold": base_threshold,
         "dynamic_threshold": DYNAMIC_THRESHOLD_PERCENT,
+        "context_thresholds": (LATEST_ANALYSIS.context_thresholds if LATEST_ANALYSIS else {}),
+        "bucket_metrics": (LATEST_ANALYSIS.bucket_metrics if LATEST_ANALYSIS else {}),
         "capital": capital,
         "pairs": pairs,
         "opportunities": summary_opps,
