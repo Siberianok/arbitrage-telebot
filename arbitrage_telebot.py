@@ -1926,20 +1926,17 @@ def tg_sync_command_menu(enabled: bool = True) -> None:
         log_event("telegram.commands.skip", reason="missing_token")
         return
 
-    commands_payload = tg_command_menu_payload()
     try:
+        tg_api_request("deleteMyCommands", http_method="post")
         tg_api_request(
-            "setMyCommands",
-            params={"commands": json.dumps(commands_payload)},
+            "setChatMenuButton",
+            params={"menu_button": json.dumps({"type": "default"})},
             http_method="post",
         )
     except Exception as exc:  # pragma: no cover - logging only
         log_event("telegram.commands.error", error=str(exc))
     else:
-        log_event("telegram.commands.synced", commands=len(commands_payload))
-        tg_enable_menu_button()
-        for chat_id in get_registered_chat_ids():
-            tg_enable_menu_button(chat_id=chat_id)
+        log_event("telegram.commands.cleared")
 
 
 def _load_telegram_chat_ids_from_env() -> None:
@@ -2796,7 +2793,6 @@ def register_telegram_chat(chat_id) -> str:
         TELEGRAM_CHAT_IDS.add(cid)
         os.environ[CONFIG["telegram"]["chat_ids_env"]] = ",".join(sorted(TELEGRAM_CHAT_IDS))
         log_event("telegram.chat_registered", chat_id=cid)
-        tg_enable_menu_button(chat_id=cid)
     return cid
 
 
