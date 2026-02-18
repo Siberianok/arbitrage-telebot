@@ -13,6 +13,7 @@ from arbitrage_telebot import (
     VenueFees,
     build_degradation_alerts,
     classify_confidence,
+    compute_executable_price,
     compute_liquidity_score,
     compute_priority_score,
     compute_triangular_opportunity,
@@ -35,6 +36,49 @@ def make_depth(*, best_bid: float, best_ask: float, bid_volume: float, ask_volum
 def make_quote(symbol: str, bid: float, ask: float) -> Quote:
     return Quote(symbol=symbol, bid=bid, ask=ask, ts=int(time.time() * 1000))
 
+
+
+
+def test_compute_executable_price_vwap_and_slippage():
+    depth = make_depth(
+        best_bid=99.0,
+        best_ask=100.0,
+        bid_volume=6.0,
+        ask_volume=6.0,
+        levels=3,
+    )
+    depth.ask_levels = [(100.0, 2.0), (101.0, 2.0), (102.0, 2.0)]
+    depth.bid_levels = [(99.0, 2.0), (98.0, 2.0), (97.0, 2.0)]
+
+    buy = compute_executable_price(depth, "buy", 3.0)
+    sell = compute_executable_price(depth, "sell", 3.0)
+
+    assert buy is not None and sell is not None
+    buy_vwap, buy_slippage, buy_qty = buy
+    sell_vwap, sell_slippage, sell_qty = sell
+
+    assert pytest.approx(100.333333, rel=1e-6) == buy_vwap
+    assert pytest.approx(33.3333, rel=1e-3) == buy_slippage
+    assert pytest.approx(3.0, rel=1e-9) == buy_qty
+    assert pytest.approx(98.666666, rel=1e-6) == sell_vwap
+    assert pytest.approx(33.6700, rel=1e-3) == sell_slippage
+    assert pytest.approx(3.0, rel=1e-9) == sell_qty
+
+
+def test_compute_executable_price_reports_partial_qty_when_depth_short():
+    depth = make_depth(
+        best_bid=99.0,
+        best_ask=100.0,
+        bid_volume=1.0,
+        ask_volume=1.0,
+        levels=1,
+    )
+    depth.ask_levels = [(100.0, 1.0)]
+
+    buy = compute_executable_price(depth, "buy", 2.0)
+
+    assert buy is not None
+    assert pytest.approx(1.0, rel=1e-9) == buy[2]
 
 def test_compute_liquidity_score_blends_depth_and_coverage():
     opp = Opportunity(
