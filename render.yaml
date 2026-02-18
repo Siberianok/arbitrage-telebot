@@ -1,16 +1,14 @@
 services:
-  - type: web
-    name: arbitrage-telebot-web
-    plan: free
+  - type: worker
+    name: arbitrage-telebot-scanner
+    plan: starter
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python arbitrage_telebot.py --web --interval 30
+    startCommand: python arbitrage_telebot.py --role scanner --loop --interval 30
     healthCheckPath: /health
-    disk:
-      name: arbitrage-telebot-data
-      mountPath: /var/lib/arbitrage-telebot
-      sizeGB: 1
     envVars:
+      - key: PROCESS_ROLE
+        value: scanner
       - key: TG_BOT_TOKEN
         sync: false
       - key: TG_CHAT_IDS
@@ -18,12 +16,44 @@ services:
       - key: INTERVAL_SECONDS
         value: "30"
       - key: LOG_BASE_DIR
-        value: /var/lib/arbitrage-telebot/logs
+        value: /var/log/arbitrage-telebot/scanner
       - key: LOG_BACKUP_DIR
-        value: /var/lib/arbitrage-telebot/backups
-      - key: KEEPALIVE_ENABLED
-        value: "true"
-      - key: KEEPALIVE_URL
+        value: /var/log/arbitrage-telebot/scanner-backups
+      - key: STATE_DB_URL
         sync: false
-      - key: KEEPALIVE_INTERVAL_SECONDS
-        value: "240"
+
+  - type: web
+    name: arbitrage-telebot-api
+    plan: starter
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python arbitrage_telebot.py --role api --web --port $PORT
+    healthCheckPath: /ready
+    envVars:
+      - key: PROCESS_ROLE
+        value: api
+      - key: WEB_AUTH_USER
+        sync: false
+      - key: WEB_AUTH_PASS
+        sync: false
+      - key: STATE_DB_URL
+        sync: false
+
+  - type: worker
+    name: arbitrage-telebot-telegram
+    plan: starter
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python arbitrage_telebot.py --role telegram-worker --web --port $PORT
+    healthCheckPath: /live
+    envVars:
+      - key: PROCESS_ROLE
+        value: telegram-worker
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: TG_CHAT_IDS
+        sync: false
+      - key: TG_ADMIN_IDS
+        sync: false
+      - key: STATE_DB_URL
+        sync: false
