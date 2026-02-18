@@ -1439,6 +1439,7 @@ DASHBOARD_STATE: Dict[str, Any] = {
     "analysis": None,
     "quote_discards": [],
 }
+RUNTIME_STATE = RuntimeState()
 
 
 WEB_AUTH_USER = os.getenv("WEB_AUTH_USER", "").strip()
@@ -1484,32 +1485,21 @@ def snapshot_public_config() -> Dict[str, Any]:
             for name, data in CONFIG.get("venues", {}).items()
         }
         return {
+            "config_version": int(CONFIG.get("config_version", 1)),
+            "updated_at": str(CONFIG.get("updated_at", "")),
             "threshold_percent": float(CONFIG.get("threshold_percent", 0.0)),
             "pairs": normalize_pair_list(CONFIG.get("pairs", [])),
             "simulation_capital_quote": float(CONFIG.get("simulation_capital_quote", 0.0)),
+            "strategies": dict(CONFIG.get("strategies", {})),
             "venues": venues,
             "telegram_enabled": bool(CONFIG.get("telegram", {}).get("enabled", False)),
         }
-        for name, data in CONFIG.get("venues", {}).items()
-    }
-    return {
-        "config_version": int(CONFIG.get("config_version", 1)),
-        "updated_at": str(CONFIG.get("updated_at", "")),
-        "threshold_percent": float(CONFIG.get("threshold_percent", 0.0)),
-        "pairs": normalize_pair_list(CONFIG.get("pairs", [])),
-        "simulation_capital_quote": float(CONFIG.get("simulation_capital_quote", 0.0)),
-        "strategies": dict(CONFIG.get("strategies", {})),
-        "venues": venues,
-        "telegram_enabled": bool(CONFIG.get("telegram", {}).get("enabled", False)),
-    }
 
 
 def refresh_config_snapshot() -> None:
     RUNTIME_STATE.set_config_snapshot(snapshot_public_config())
 
 def update_analysis_state(capital_quote: float, log_path: str) -> None:
-    """Refresh cached analysis metrics and dynamic threshold from CSV history."""
-
     global LATEST_ANALYSIS, DYNAMIC_THRESHOLD_PERCENT
 
     if not log_path:
@@ -1521,6 +1511,9 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
     if not analysis_cfg.get("enabled", True):
         with CONFIG_LOCK:
             DYNAMIC_THRESHOLD_PERCENT = base_threshold
+        LATEST_ANALYSIS = None
+        with STATE_LOCK:
+            DASHBOARD_STATE["analysis"] = None
         RUNTIME_STATE.set_analysis(None)
         return
 
@@ -1538,15 +1531,16 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
     with CONFIG_LOCK:
         DYNAMIC_THRESHOLD_PERCENT = recommended
 
-    RUNTIME_STATE.set_analysis(
-        {
-            "rows_considered": analysis.rows_considered,
-            "success_rate": analysis.success_rate,
-            "average_net_percent": analysis.average_net_percent,
-            "average_effective_percent": analysis.average_effective_percent,
-            "recommended_threshold": recommended,
-        }
-    )
+    analysis_payload = {
+        "rows_considered": analysis.rows_considered,
+        "success_rate": analysis.success_rate,
+        "average_net_percent": analysis.average_net_percent,
+        "average_effective_percent": analysis.average_effective_percent,
+        "recommended_threshold": recommended,
+    }
+    with STATE_LOCK:
+        DASHBOARD_STATE["analysis"] = dict(analysis_payload)
+    RUNTIME_STATE.set_analysis(analysis_payload)
 
     log_event(
         "analysis.updated",
@@ -5579,6 +5573,7 @@ def compute_spot_p2p_opportunities(
             passes_filters, execution_meta, _ = _p2p_quote_passes_filters(p2p_venue, p2p_quote, target_notional)
             if not passes_filters:
                 continue
+            candidates: List[Opportunity] = []
             buy_fee = buy_schedule.taker_fee_percent
             sell_fee = sell_schedule.taker_fee_percent
             p2p_fee = get_p2p_fee_percent(p2p_venue, asset)
@@ -5705,8 +5700,7 @@ def compute_p2p_cross_opportunities(
             _effective_notional_capacity(buy_meta, target_notional),
             _effective_notional_capacity(sell_meta, target_notional),
         )
-        opportunities.append(
-            Opportunity(
+        candidate = Opportunity(
                 pair=pair,
                 buy_venue=f"{buy_v}_p2p",
                 sell_venue=f"{sell_v}_p2p",
