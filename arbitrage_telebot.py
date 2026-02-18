@@ -1852,6 +1852,7 @@ def build_pairs_reply_keyboard(pairs: Iterable[str]) -> Dict[str, Any]:
             row = []
     if row:
         keyboard.append(row)
+    keyboard.append([{"text": "⬅️ Volver"}])
     return {
         "keyboard": keyboard,
         "resize_keyboard": True,
@@ -2940,6 +2941,17 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
         return False
 
     raw_text = text.strip()
+    cancel_tokens = {"cancelar", "⬅️ volver", "volver"}
+    if raw_text.casefold() in cancel_tokens:
+        set_pending_action(chat_id, None)
+        tg_send_message(
+            "Operación cancelada.",
+            enabled=enabled,
+            chat_id=chat_id,
+            reply_markup={"remove_keyboard": True},
+        )
+        return True
+
     value = normalize_pair_input(text)
     if not value:
         tg_send_message(
