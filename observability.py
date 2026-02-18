@@ -92,37 +92,38 @@ DEGRADATION_ALERT_COOLDOWN = 600
 ERROR_RATE_ALERT_THRESHOLD = 0.5
 
 
-def _get_metrics(exchange: str) -> ExchangeMetrics:
-    with _METRICS_LOCK:
-        metrics = _EXCHANGE_METRICS.setdefault(exchange, ExchangeMetrics())
-    return metrics
+def _get_metrics_locked(exchange: str) -> ExchangeMetrics:
+    return _EXCHANGE_METRICS.setdefault(exchange, ExchangeMetrics())
 
 
-def _get_circuit(exchange: str) -> CircuitBreaker:
-    with _METRICS_LOCK:
-        state = _EXCHANGE_CIRCUITS.setdefault(exchange, CircuitBreaker())
-    return state
+def _get_circuit_locked(exchange: str) -> CircuitBreaker:
+    return _EXCHANGE_CIRCUITS.setdefault(exchange, CircuitBreaker())
 
 
 def record_exchange_attempt(exchange: str, pair: Optional[str] = None) -> None:
-    metrics = _get_metrics(exchange)
-    metrics.attempts += 1
-    payload = {"exchange": exchange, "attempts": metrics.attempts}
+    with _METRICS_LOCK:
+        metrics = _get_metrics_locked(exchange)
+        metrics.attempts += 1
+        attempts = metrics.attempts
+    payload = {"exchange": exchange, "attempts": attempts}
     if pair:
         payload["pair"] = pair
     log_event("exchange.attempt", **payload)
 
 
 def record_exchange_success(exchange: str, pair: Optional[str] = None) -> None:
-    metrics = _get_metrics(exchange)
-    metrics.successes += 1
-    metrics.last_success_ts = time.time()
-    circuit = _get_circuit(exchange)
-    circuit.consecutive_failures = 0
+    with _METRICS_LOCK:
+        metrics = _get_metrics_locked(exchange)
+        metrics.successes += 1
+        metrics.last_success_ts = time.time()
+        successes = metrics.successes
+        circuit = _get_circuit_locked(exchange)
+        circuit.consecutive_failures = 0
+        consecutive_failures = circuit.consecutive_failures
     payload = {
         "exchange": exchange,
-        "successes": metrics.successes,
-        "consecutive_failures": circuit.consecutive_failures,
+        "successes": successes,
+        "consecutive_failures": consecutive_failures,
     }
     if pair:
         payload["pair"] = pair
@@ -130,23 +131,28 @@ def record_exchange_success(exchange: str, pair: Optional[str] = None) -> None:
 
 
 def record_exchange_error(exchange: str, error: str, pair: Optional[str] = None) -> None:
-    metrics = _get_metrics(exchange)
-    metrics.errors += 1
-    metrics.last_error = error
-    circuit = _get_circuit(exchange)
-    circuit.consecutive_failures += 1
-    if circuit.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD:
-        circuit.open_until = time.time() + CIRCUIT_COOLDOWN_SECONDS
+    open_until = None
+    with _METRICS_LOCK:
+        metrics = _get_metrics_locked(exchange)
+        metrics.errors += 1
+        metrics.last_error = error
+        circuit = _get_circuit_locked(exchange)
+        circuit.consecutive_failures += 1
+        consecutive_failures = circuit.consecutive_failures
+        if circuit.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD:
+            circuit.open_until = time.time() + CIRCUIT_COOLDOWN_SECONDS
+            open_until = circuit.open_until
+    if open_until is not None:
         log_event(
             "exchange.circuit_open",
             exchange=exchange,
-            open_until=circuit.open_until,
-            consecutive_failures=circuit.consecutive_failures,
+            open_until=open_until,
+            consecutive_failures=consecutive_failures,
         )
     payload = {
         "exchange": exchange,
         "error": error,
-        "consecutive_failures": circuit.consecutive_failures,
+        "consecutive_failures": consecutive_failures,
     }
     if pair:
         payload["pair"] = pair
@@ -154,30 +160,39 @@ def record_exchange_error(exchange: str, error: str, pair: Optional[str] = None)
 
 
 def record_exchange_no_data(exchange: str, pair: Optional[str] = None) -> None:
-    metrics = _get_metrics(exchange)
-    metrics.no_data += 1
-    payload = {"exchange": exchange, "no_data": metrics.no_data}
+    with _METRICS_LOCK:
+        metrics = _get_metrics_locked(exchange)
+        metrics.no_data += 1
+        no_data = metrics.no_data
+    payload = {"exchange": exchange, "no_data": no_data}
     if pair:
         payload["pair"] = pair
     log_event("exchange.no_data", **payload)
 
 
 def record_exchange_skip(exchange: str, reason: str, pair: Optional[str] = None) -> None:
-    metrics = _get_metrics(exchange)
-    metrics.skips += 1
-    payload = {"exchange": exchange, "reason": reason, "skips": metrics.skips}
+    with _METRICS_LOCK:
+        metrics = _get_metrics_locked(exchange)
+        metrics.skips += 1
+        skips = metrics.skips
+    payload = {"exchange": exchange, "reason": reason, "skips": skips}
     if pair:
         payload["pair"] = pair
     log_event("exchange.skip", **payload)
 
 
 def is_circuit_open(exchange: str) -> bool:
-    circuit = _get_circuit(exchange)
-    if circuit.is_open():
-        return True
-    if circuit.open_until and not circuit.is_open():
-        circuit.open_until = 0.0
-        circuit.consecutive_failures = 0
+    should_log_reset = False
+    with _METRICS_LOCK:
+        circuit = _get_circuit_locked(exchange)
+        is_open = circuit.is_open()
+        if is_open:
+            return True
+        if circuit.open_until and not is_open:
+            circuit.open_until = 0.0
+            circuit.consecutive_failures = 0
+            should_log_reset = True
+    if should_log_reset:
         log_event("exchange.circuit_reset", exchange=exchange)
     return False
 
@@ -190,10 +205,11 @@ def metrics_snapshot() -> Dict[str, Dict]:
 def register_degradation_alert(exchange: str, reason: str) -> bool:
     key = f"{exchange}:{reason}"
     now = time.time()
-    last = _ALERT_STATE.get(key, 0)
-    if now - last < DEGRADATION_ALERT_COOLDOWN:
-        return False
-    _ALERT_STATE[key] = now
+    with _METRICS_LOCK:
+        last = _ALERT_STATE.get(key, 0)
+        if now - last < DEGRADATION_ALERT_COOLDOWN:
+            return False
+        _ALERT_STATE[key] = now
     log_event("exchange.degradation", exchange=exchange, reason=reason)
     return True
 
