@@ -1907,7 +1907,14 @@ def build_test_signal_message() -> str:
         links=link_items,
     )
 
-    return "Señal de prueba ✅\n\n" + alert_message
+    intro_lines = [
+        "🧪✨ *SEÑAL DE PRUEBA* ✨🧪",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "📢 *Demo profesional del formato de alerta*",
+        "⚠️ *No ejecutar* — mensaje solo para validación visual",
+    ]
+
+    return "\n".join(intro_lines) + "\n\n" + alert_message
 
 
 def tg_sync_command_menu(enabled: bool = True) -> None:
