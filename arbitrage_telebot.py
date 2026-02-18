@@ -3151,7 +3151,6 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
 
     if command == "/status":
         pairs = CONFIG["pairs"]
-        chats = get_registered_chat_ids()
         analysis_summary = "Sin historial"
         if LATEST_ANALYSIS and LATEST_ANALYSIS.rows_considered:
             analysis_summary = (
@@ -3162,8 +3161,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             "Estado actual:\n"
             f"Threshold base: {CONFIG['threshold_percent']:.3f}% | dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
             f"Histórico: {analysis_summary}\n"
-            f"Pares ({len(pairs)}): {', '.join(pairs) if pairs else 'sin pares'}\n"
-            f"Chats registrados: {', '.join(chats) if chats else 'ninguno'}"
+            f"Pares ({len(pairs)}): {', '.join(pairs) if pairs else 'sin pares'}"
         )
         tg_send_message(response, enabled=enabled, chat_id=chat_id)
         return
