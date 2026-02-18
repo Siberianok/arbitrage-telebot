@@ -4295,6 +4295,85 @@ class ExchangeAdapter:
     def fetch_depth_snapshot(self, pair: str) -> Optional[DepthInfo]:
         return None
 
+    def _depth_disable_key(self, pair: str, venue_wide: bool = False) -> Tuple[str, str]:
+        if venue_wide:
+            return (self.name, "*")
+        return (self.name, self.normalize_symbol(pair))
+
+    def _depth_disable_cooldown_ms(self) -> int:
+        venue_cfg = CONFIG.get("venues", {}).get(self.name, {})
+        depth_cfg = venue_cfg.get("depth") or {}
+        cooldown_seconds = depth_cfg.get(
+            "disable_cooldown_seconds",
+            CONFIG.get("depth_disable_cooldown_seconds", 90),
+        )
+        return max(1_000, int(float(cooldown_seconds) * 1_000))
+
+    def _mark_depth_temporarily_disabled(
+        self,
+        pair: str,
+        *,
+        status_code: Optional[int],
+        reason: str,
+        venue_wide: bool = True,
+    ) -> None:
+        now = current_millis()
+        until_ts = now + self._depth_disable_cooldown_ms()
+        disabled_until = getattr(self, "_depth_disabled_until", {})
+        disabled_until[self._depth_disable_key(pair, venue_wide=False)] = until_ts
+        if venue_wide:
+            disabled_until[self._depth_disable_key(pair, venue_wide=True)] = until_ts
+        self._depth_disabled_until = disabled_until
+        cooldown_logged = getattr(self, "_depth_cooldown_logged", {})
+        cooldown_logged[self._depth_disable_key(pair, venue_wide=False)] = False
+        if venue_wide:
+            cooldown_logged[self._depth_disable_key(pair, venue_wide=True)] = False
+        self._depth_cooldown_logged = cooldown_logged
+        log_event(
+            "exchange.depth.blocked",
+            venue=self.name,
+            pair=self.normalize_symbol(pair),
+            status_code=status_code,
+            cooldown_ms=self._depth_disable_cooldown_ms(),
+            disabled_until_ts=until_ts,
+            venue_wide=venue_wide,
+            reason=reason,
+        )
+
+    def _is_depth_temporarily_disabled(self, pair: str) -> bool:
+        now = current_millis()
+        disabled_until = getattr(self, "_depth_disabled_until", {})
+        cooldown_logged = getattr(self, "_depth_cooldown_logged", {})
+        keys = [
+            self._depth_disable_key(pair, venue_wide=False),
+            self._depth_disable_key(pair, venue_wide=True),
+        ]
+        active_key: Optional[Tuple[str, str]] = None
+        active_until = 0
+        for key in keys:
+            until_ts = int(disabled_until.get(key, 0) or 0)
+            if until_ts > now and until_ts > active_until:
+                active_key = key
+                active_until = until_ts
+            elif until_ts and until_ts <= now:
+                disabled_until.pop(key, None)
+                cooldown_logged.pop(key, None)
+        self._depth_disabled_until = disabled_until
+        self._depth_cooldown_logged = cooldown_logged
+        if not active_key:
+            return False
+        if not cooldown_logged.get(active_key, False):
+            log_event(
+                "exchange.depth.cooldown_active",
+                venue=self.name,
+                pair=self.normalize_symbol(pair),
+                disabled_until_ts=active_until,
+                cooldown_remaining_ms=max(0, active_until - now),
+            )
+            cooldown_logged[active_key] = True
+            self._depth_cooldown_logged = cooldown_logged
+        return True
+
     def _test_mode_config(self) -> Dict[str, Any]:
         cfg = CONFIG.get("test_mode") or {}
         if not isinstance(cfg, dict):
@@ -4389,6 +4468,8 @@ class ExchangeAdapter:
         if not self.depth_supported:
             return None
         if self._is_test_mode_enabled() and self._test_mode_paused():
+            return None
+        if self._is_depth_temporarily_disabled(pair):
             return None
         symbol = self.normalize_symbol(pair)
         cache_key = (self.name, symbol)
@@ -4507,6 +4588,13 @@ class Binance(ExchangeAdapter):
                 ask_levels=asks,
             )
         except Exception as exc:
+            if isinstance(exc, HttpError) and exc.status_code in {403, 451}:
+                self._mark_depth_temporarily_disabled(
+                    pair,
+                    status_code=exc.status_code,
+                    reason=str(exc),
+                    venue_wide=True,
+                )
             print(f"[binance] depth error {pair}: {exc}")
             return None
 
@@ -4684,6 +4772,13 @@ class Bybit(ExchangeAdapter):
                 ask_levels=asks,
             )
         except Exception as exc:
+            if isinstance(exc, HttpError) and exc.status_code in {403, 451}:
+                self._mark_depth_temporarily_disabled(
+                    pair,
+                    status_code=exc.status_code,
+                    reason=str(exc),
+                    venue_wide=True,
+                )
             print(f"[bybit] depth error {pair}: {exc}")
             return None
 
