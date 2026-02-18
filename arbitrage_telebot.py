@@ -22,6 +22,12 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
 
 import requests
 
+from config_store import (
+    build_runtime_payload,
+    load_config_with_runtime,
+    write_runtime_config,
+)
+
 try:
     from prometheus_client import (
         CONTENT_TYPE_LATEST,
@@ -159,7 +165,7 @@ def emit_pair_coverage(pair: str, venues: Iterable[str]) -> None:
 # =========================
 # CONFIG
 # =========================
-CONFIG = {
+BASE_CONFIG = {
     "threshold_percent": 0.30,      # alerta si neto >= 0.30%
     "pairs": [
         # En modo de prueba solo consideramos los activos solicitados
@@ -1379,6 +1385,17 @@ CONFIG = {
     },
 }
 
+RUNTIME_CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", "data/runtime_config.json"))
+
+CONFIG, _RUNTIME_LOADED = load_config_with_runtime(BASE_CONFIG, RUNTIME_CONFIG_PATH)
+
+
+def persist_runtime_config() -> None:
+    runtime_payload = build_runtime_payload(CONFIG)
+    write_runtime_config(RUNTIME_CONFIG_PATH, runtime_payload)
+    CONFIG["config_version"] = runtime_payload["config_version"]
+    CONFIG["updated_at"] = runtime_payload["updated_at"]
+
 DYNAMIC_THRESHOLD_PERCENT: float = float(CONFIG.get("threshold_percent", 0.0))
 
 TELEGRAM_CHAT_IDS: Set[str] = set()
@@ -1442,9 +1459,12 @@ def snapshot_public_config() -> Dict[str, Any]:
         for name, data in CONFIG.get("venues", {}).items()
     }
     return {
+        "config_version": int(CONFIG.get("config_version", 1)),
+        "updated_at": str(CONFIG.get("updated_at", "")),
         "threshold_percent": float(CONFIG.get("threshold_percent", 0.0)),
         "pairs": normalize_pair_list(CONFIG.get("pairs", [])),
         "simulation_capital_quote": float(CONFIG.get("simulation_capital_quote", 0.0)),
+        "strategies": dict(CONFIG.get("strategies", {})),
         "venues": venues,
         "telegram_enabled": bool(CONFIG.get("telegram", {}).get("enabled", False)),
     }
@@ -2111,6 +2131,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             updated = {}
             errors: List[str] = []
+            should_persist = False
             with CONFIG_LOCK:
                 if "threshold_percent" in data:
                     try:
@@ -2118,6 +2139,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         CONFIG["threshold_percent"] = value
                         DYNAMIC_THRESHOLD_PERCENT = value
                         updated["threshold_percent"] = value
+                        should_persist = True
                     except (TypeError, ValueError):
                         errors.append("threshold_percent inválido")
                 if "simulation_capital_quote" in data:
@@ -2127,18 +2149,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             raise ValueError
                         CONFIG["simulation_capital_quote"] = value
                         updated["simulation_capital_quote"] = value
+                        should_persist = True
                     except (TypeError, ValueError):
                         errors.append("simulation_capital_quote inválido")
                 if "pairs" in data:
                     if isinstance(data["pairs"], list):
-                        pairs = [str(p).upper() for p in data["pairs"] if str(p).strip()]
+                        pairs = normalize_pair_list(data["pairs"])
                         if pairs:
                             CONFIG["pairs"] = pairs
                             updated["pairs"] = pairs
+                            should_persist = True
                         else:
                             errors.append("pairs no puede quedar vacío")
                     else:
                         errors.append("pairs debe ser lista")
+                if "strategies" in data:
+                    if isinstance(data["strategies"], dict):
+                        CONFIG["strategies"] = {k: bool(v) for k, v in data["strategies"].items()}
+                        updated["strategies"] = dict(CONFIG["strategies"])
+                        should_persist = True
+                    else:
+                        errors.append("strategies debe ser objeto")
+                if "p2p" in data:
+                    if isinstance(data["p2p"], dict):
+                        for venue, p2p_cfg in data["p2p"].items():
+                            if not isinstance(p2p_cfg, dict):
+                                errors.append(f"p2p.{venue} debe ser objeto")
+                                continue
+                            CONFIG.setdefault("venues", {}).setdefault(venue, {})["p2p"] = p2p_cfg
+                        if not any(err.startswith("p2p.") for err in errors):
+                            updated["p2p"] = data["p2p"]
+                            should_persist = True
+                    else:
+                        errors.append("p2p debe ser objeto")
+                if should_persist and not errors:
+                    persist_runtime_config()
             refresh_config_snapshot()
             if not errors:
                 capital = float(CONFIG.get("simulation_capital_quote", 0.0))
@@ -2565,6 +2610,7 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
             return True
         with CONFIG_LOCK:
             CONFIG["pairs"].append(pair)
+            persist_runtime_config()
         refresh_config_snapshot()
         set_pending_action(chat_id, None)
         tg_send_message(
@@ -2594,6 +2640,7 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
             return True
         with CONFIG_LOCK:
             CONFIG["pairs"] = [p for p in CONFIG["pairs"] if p != target]
+            persist_runtime_config()
         refresh_config_snapshot()
         set_pending_action(chat_id, None)
         tg_send_message(
@@ -2684,6 +2731,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             return
         with CONFIG_LOCK:
             CONFIG["simulation_capital_quote"] = value
+            persist_runtime_config()
         refresh_config_snapshot()
         tg_send_message(
             (
