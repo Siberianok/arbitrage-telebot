@@ -1749,7 +1749,6 @@ COMMANDS_HELP: List[Tuple[str, str]] = [
     ("/start", "Registrar chat y mostrar ayuda"),
     ("/ping", "Ping"),
     ("/status", "Estado"),
-    ("/threshold", "Ver/actualizar threshold"),
     ("/capital", "Capital"),
     ("/pairs", "Listar pares"),
     ("/addpair", "Agregar par"),
@@ -3160,85 +3159,13 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             )
         response = (
             "Estado actual:\n"
-            f"Threshold base: {CONFIG['threshold_percent']:.3f}% | dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
+            f"Umbral mínimo de ganancia: {format_decimal_comma(CONFIG['threshold_percent'], decimals=2)}% en adelante\n"
+            f"Threshold dinámico actual: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
             f"Histórico: {analysis_summary}\n"
             f"Pares ({len(pairs)}): {', '.join(pairs) if pairs else 'sin pares'}\n"
             f"Chats registrados: {', '.join(chats) if chats else 'ninguno'}"
         )
         tg_send_message(response, enabled=enabled, chat_id=chat_id)
-        return
-
-    if command == "/threshold":
-        if not ensure_admin(chat_id, enabled):
-            return
-
-        analysis_cfg = CONFIG.get("analysis") or {}
-        min_threshold = float(analysis_cfg.get("min_threshold_percent", 0.1))
-        max_threshold = float(analysis_cfg.get("max_threshold_percent", 5.0))
-
-        current_threshold = float(CONFIG.get("threshold_percent", 0.0))
-        if not argument:
-            tg_send_message(
-                (
-                    "Threshold actual: "
-                    f"{format_decimal_comma(current_threshold, decimals=3)}% "
-                    f"(mín {format_decimal_comma(min_threshold, decimals=3)}% "
-                    f"/ máx {format_decimal_comma(max_threshold, decimals=3)}%)."
-                ),
-                enabled=enabled,
-                chat_id=chat_id,
-            )
-            return
-
-        cleaned = argument.strip().replace("%", "")
-        cleaned = cleaned.replace(" ", "")
-        if "," in cleaned and "." in cleaned:
-            cleaned = cleaned.replace(",", "")
-        elif cleaned.count(",") == 1 and cleaned.count(".") == 0:
-            cleaned = cleaned.replace(",", ".")
-
-        try:
-            new_threshold = float(cleaned)
-        except ValueError:
-            tg_send_message(
-                "Valor inválido. Ej: /threshold 0.45",
-                enabled=enabled,
-                chat_id=chat_id,
-            )
-            return
-
-        if new_threshold < min_threshold or new_threshold > max_threshold:
-            tg_send_message(
-                (
-                    "Threshold fuera de rango. "
-                    f"Permitido: {format_decimal_comma(min_threshold, decimals=3)}% "
-                    f"a {format_decimal_comma(max_threshold, decimals=3)}%."
-                ),
-                enabled=enabled,
-                chat_id=chat_id,
-            )
-            return
-
-        with CONFIG_LOCK:
-            previous_threshold = float(CONFIG.get("threshold_percent", 0.0))
-            CONFIG["threshold_percent"] = new_threshold
-
-        refresh_config_snapshot()
-        log_event(
-            "telegram.threshold.updated",
-            chat_id=chat_id,
-            previous_threshold=previous_threshold,
-            new_threshold=new_threshold,
-        )
-        tg_send_message(
-            (
-                "Threshold actualizado: "
-                f"{format_decimal_comma(previous_threshold, decimals=3)}% → "
-                f"{format_decimal_comma(new_threshold, decimals=3)}%"
-            ),
-            enabled=enabled,
-            chat_id=chat_id,
-        )
         return
 
     if command == "/capital":
