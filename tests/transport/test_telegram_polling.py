@@ -95,3 +95,32 @@ def test_tg_handle_command_status_includes_minimum_gain_threshold(monkeypatch):
     assert any("0.550%" in msg for msg in messages)
 
 
+def test_tg_sync_command_menu_registers_commands(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(bot, "get_bot_token", lambda: "token")
+    monkeypatch.setattr(bot, "log_event", lambda *args, **kwargs: None)
+
+    def fake_tg_api_request(method, params=None, http_method="get"):
+        calls.append((method, params, http_method))
+        return {"ok": True}
+
+    monkeypatch.setattr(bot, "tg_api_request", fake_tg_api_request)
+
+    bot.tg_sync_command_menu(enabled=True)
+
+    assert calls[0][0] == "setMyCommands"
+    assert calls[1][0] == "setChatMenuButton"
+
+
+def test_tg_handle_pending_input_cancel_restores_command_keyboard(monkeypatch):
+    sent_payloads = []
+    monkeypatch.setitem(bot.PENDING_CHAT_ACTIONS, "42", "delpair")
+    monkeypatch.setattr(bot, "tg_send_message", lambda text, **payload: sent_payloads.append(payload))
+
+    handled = bot.tg_handle_pending_input("42", "⬅️ Volver", enabled=True)
+
+    assert handled is True
+    assert bot.get_pending_action("42") is None
+    assert sent_payloads[0]["reply_markup"] == bot.tg_commands_reply_markup()
+
