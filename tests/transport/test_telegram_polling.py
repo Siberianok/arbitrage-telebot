@@ -156,7 +156,7 @@ def test_tg_sync_command_menu_registers_commands(monkeypatch):
 
     bot.tg_sync_command_menu(enabled=True)
 
-    assert calls[0][0] == "setMyCommands"
+    assert calls[0][0] == "deleteMyCommands"
     assert calls[1][0] == "setChatMenuButton"
 
 
