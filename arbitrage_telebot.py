@@ -1939,16 +1939,21 @@ def tg_sync_command_menu(enabled: bool = True) -> None:
         return
 
     try:
-        tg_api_request("deleteMyCommands", http_method="post")
+        commands_payload = json.dumps(tg_command_menu_payload(), ensure_ascii=False)
+        tg_api_request(
+            "setMyCommands",
+            params={"commands": commands_payload},
+            http_method="post",
+        )
         tg_api_request(
             "setChatMenuButton",
-            params={"menu_button": json.dumps({"type": "default"})},
+            params={"menu_button": json.dumps({"type": "commands"})},
             http_method="post",
         )
     except Exception as exc:  # pragma: no cover - logging only
         log_event("telegram.commands.error", error=str(exc))
     else:
-        log_event("telegram.commands.cleared")
+        log_event("telegram.commands.synced", count=len(COMMANDS_HELP))
 
 
 def _load_telegram_chat_ids_from_env() -> None:
@@ -2946,7 +2951,7 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
             "Operación cancelada.",
             enabled=enabled,
             chat_id=chat_id,
-            reply_markup={"remove_keyboard": True},
+            reply_markup=tg_commands_reply_markup(),
         )
         return True
 
@@ -3010,7 +3015,7 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
             f"Par eliminado: {target}",
             enabled=enabled,
             chat_id=chat_id,
-            reply_markup={"remove_keyboard": True},
+            reply_markup=tg_commands_reply_markup(),
         )
         return True
 
@@ -3350,6 +3355,7 @@ def tg_process_updates(enabled: bool = True) -> None:
     params: Dict[str, int] = {}
     if TELEGRAM_LAST_UPDATE_ID:
         params["offset"] = TELEGRAM_LAST_UPDATE_ID + 1
+    params["timeout"] = 25
 
     try:
         data = tg_api_request("getUpdates", params=params or None)
@@ -3396,7 +3402,7 @@ def tg_process_updates(enabled: bool = True) -> None:
 
 
 
-def ensure_telegram_polling_thread(enabled: bool, interval: float = 1.0) -> None:
+def ensure_telegram_polling_thread(enabled: bool, interval: float = 0.2) -> None:
     """Arranca un hilo dedicado a leer updates de Telegram frecuentemente."""
     global TELEGRAM_POLLING_THREAD
 
@@ -7408,7 +7414,7 @@ def _run_scanner_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
             "🤖 Bot reiniciado.\n\n" + format_command_help(),
             enabled=True,
         )
-        ensure_telegram_polling_thread(enabled=True, interval=1.0)
+        ensure_telegram_polling_thread(enabled=True, interval=0.2)
 
     ensure_keepalive_thread()
 
@@ -7440,9 +7446,12 @@ def _run_api_mode(args: argparse.Namespace) -> None:
 
 def _run_telegram_worker_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
     if tg_enabled:
-        ensure_telegram_polling_thread(enabled=True, interval=1.0)
+        tg_sync_command_menu(enabled=True)
+        ensure_telegram_polling_thread(enabled=True, interval=0.2)
     else:
         log_event("telegram.poll.disabled", reason="telegram_not_enabled")
+
+    ensure_keepalive_thread()
 
     if args.web:
         serve_http(args.port)
