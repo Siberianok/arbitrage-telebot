@@ -1789,7 +1789,6 @@ def tg_commands_reply_markup() -> Dict[str, Any]:
     return {
         "keyboard": keyboard,
         "resize_keyboard": True,
-        "is_persistent": True,
         "one_time_keyboard": False,
     }
 
@@ -1863,14 +1862,14 @@ def build_pairs_reply_keyboard(pairs: Iterable[str]) -> Dict[str, Any]:
 
 
 def tg_enable_menu_button(chat_id: Optional[str] = None) -> None:
-    """Fuerza el botón de menú de comandos en el cliente de Telegram."""
+    """Oculta el menú de comandos para priorizar el teclado inferior."""
 
     token = get_bot_token()
     if not token:
         log_event("telegram.menu_button.skip", reason="missing_token")
         return
 
-    params = {"menu_button": json.dumps({"type": "commands"})}
+    params = {"menu_button": json.dumps({"type": "default"})}
     if chat_id:
         params["chat_id"] = str(chat_id)
 
@@ -1883,7 +1882,7 @@ def tg_enable_menu_button(chat_id: Optional[str] = None) -> None:
     except Exception as exc:  # pragma: no cover - logging only
         log_event("telegram.menu_button.error", error=str(exc), chat_id=chat_id)
     else:
-        log_event("telegram.menu_button.enabled", chat_id=chat_id)
+        log_event("telegram.menu_button.hidden", chat_id=chat_id)
 
 
 def build_test_signal_message() -> str:
@@ -1942,21 +1941,20 @@ def tg_sync_command_menu(enabled: bool = True) -> None:
         return
 
     try:
-        commands_payload = json.dumps(tg_command_menu_payload(), ensure_ascii=False)
         tg_api_request(
-            "setMyCommands",
-            params={"commands": commands_payload},
+            "deleteMyCommands",
+            params={},
             http_method="post",
         )
         tg_api_request(
             "setChatMenuButton",
-            params={"menu_button": json.dumps({"type": "commands"})},
+            params={"menu_button": json.dumps({"type": "default"})},
             http_method="post",
         )
     except Exception as exc:  # pragma: no cover - logging only
         log_event("telegram.commands.error", error=str(exc))
     else:
-        log_event("telegram.commands.synced", count=len(COMMANDS_HELP))
+        log_event("telegram.commands.cleared")
 
 
 def _load_telegram_chat_ids_from_env() -> None:
