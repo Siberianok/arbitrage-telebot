@@ -24,7 +24,7 @@ def test_tg_process_updates_resets_webhook_on_conflict(monkeypatch):
 
     methods = []
 
-    def fake_api(method, params=None, http_method="get"):
+    def fake_api(method, params=None, http_method="get", request_timeout=None):
         if method == "getUpdates":
             raise bot.HttpError("HTTP 409 -> conflict", status_code=409)
         methods.append(method)
@@ -54,7 +54,7 @@ def test_tg_process_updates_skips_webhook_reset_during_cooldown(monkeypatch):
     monkeypatch.setattr(bot, "TELEGRAM_WEBHOOK_RESET_COOLDOWN_SECONDS", 300.0, raising=False)
     bot.TELEGRAM_LAST_WEBHOOK_RESET_TS = 100.0
 
-    def fake_api(method, params=None, http_method="get"):
+    def fake_api(method, params=None, http_method="get", request_timeout=None):
         if method == "getUpdates":
             raise bot.HttpError("HTTP 409 -> conflict", status_code=409)
         raise AssertionError("deleteWebhook should not be called during cooldown")
@@ -72,6 +72,53 @@ def test_tg_process_updates_skips_webhook_reset_during_cooldown(monkeypatch):
     assert any(event == "telegram.poll.reset_webhook.skip" for event, _ in events)
     assert bot.TELEGRAM_POLL_BACKOFF_UNTIL == fake_time.monotonic() + bot.TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS
     assert bot.TELEGRAM_LAST_WEBHOOK_RESET_TS == 100.0
+
+
+
+
+def test_tg_process_updates_uses_long_poll_http_timeout(monkeypatch):
+    _setup_common(monkeypatch)
+
+    calls = []
+
+    def fake_api(method, params=None, http_method="get", request_timeout=None):
+        calls.append((method, params, request_timeout))
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bot, "tg_api_request", fake_api)
+    monkeypatch.setattr(bot, "log_event", lambda *args, **kwargs: None)
+
+    bot.tg_process_updates(enabled=True)
+
+    assert calls
+    method, params, request_timeout = calls[0]
+    assert method == "getUpdates"
+    assert params["timeout"] == bot.TELEGRAM_POLL_TIMEOUT_SECONDS
+    assert request_timeout > params["timeout"]
+    assert request_timeout == params["timeout"] + bot.TELEGRAM_POLL_HTTP_TIMEOUT_GRACE_SECONDS
+
+
+def test_tg_process_updates_logs_poll_timeout_as_non_critical(monkeypatch):
+    _setup_common(monkeypatch)
+
+    def fake_api(method, params=None, http_method="get", request_timeout=None):
+        raise bot.HttpError("poll timeout", is_timeout=True)
+
+    events = []
+
+    def fake_log_event(event, **payload):
+        events.append((event, payload))
+
+    monkeypatch.setattr(bot, "tg_api_request", fake_api)
+    monkeypatch.setattr(bot, "log_event", fake_log_event)
+
+    bot.tg_process_updates(enabled=True)
+
+    timeout_events = [payload for event, payload in events if event == "telegram.poll.timeout"]
+    assert timeout_events
+    assert timeout_events[0]["polling_timeout_seconds"] == bot.TELEGRAM_POLL_TIMEOUT_SECONDS
+    assert timeout_events[0]["request_timeout_seconds"] > timeout_events[0]["polling_timeout_seconds"]
+    assert not any(event == "telegram.poll.error" for event, _ in events)
 
 
 def test_tg_handle_command_status_includes_minimum_gain_threshold(monkeypatch):
@@ -101,7 +148,7 @@ def test_tg_sync_command_menu_registers_commands(monkeypatch):
     monkeypatch.setattr(bot, "get_bot_token", lambda: "token")
     monkeypatch.setattr(bot, "log_event", lambda *args, **kwargs: None)
 
-    def fake_tg_api_request(method, params=None, http_method="get"):
+    def fake_tg_api_request(method, params=None, http_method="get", request_timeout=None):
         calls.append((method, params, http_method))
         return {"ok": True}
 
