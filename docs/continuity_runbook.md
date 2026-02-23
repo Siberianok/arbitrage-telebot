@@ -11,7 +11,7 @@ La operación queda dividida en 3 procesos independientes:
    - Comando: `python arbitrage_telebot.py --role api --web --port $PORT`
    - Responsabilidad: exponer `/health`, `/live`, `/ready`, `/metrics`, `/api/state` y dashboard.
 3. **Worker de Telegram polling**
-   - Comando: `python arbitrage_telebot.py --role telegram-worker --web --port $PORT`
+   - Comando: `python arbitrage_telebot.py --role telegram-worker`
    - Responsabilidad: consumir updates y responder comandos de Telegram sin bloquear scanner.
 
 ## 2) Infra con uptime continuo
