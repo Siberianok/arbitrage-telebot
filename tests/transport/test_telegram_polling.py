@@ -194,6 +194,7 @@ def test_build_health_payload_reports_telegram_polling_alive(monkeypatch):
     monkeypatch.setattr(bot, "TELEGRAM_POLLING_THREAD", _AliveThread())
     monkeypatch.setattr(bot, "SCANNER_LOOP_THREAD", None)
     monkeypatch.setattr(bot, "LAST_TELEGRAM_SEND_TS", 0, raising=False)
+    monkeypatch.setattr(bot, "TELEGRAM_POLL_HEARTBEAT_TS", 0.0, raising=False)
 
     with bot.STATE_LOCK:
         bot.DASHBOARD_STATE["last_run_summary"] = {"ts": 1, "ts_str": "1970-01-01T00:00:01Z"}
@@ -204,3 +205,48 @@ def test_build_health_payload_reports_telegram_polling_alive(monkeypatch):
     assert payload["process"]["checks"]["telegram_polling"]["required"] is True
     assert payload["process"]["checks"]["telegram_polling"]["alive"] is True
     assert payload["status"] == "ok"
+
+
+def test_build_health_payload_marks_degraded_when_telegram_poll_stale(monkeypatch):
+    monkeypatch.setattr(bot, "PROCESS_ROLE", "telegram-worker")
+    monkeypatch.setattr(bot, "metrics_snapshot", lambda: {})
+    monkeypatch.setattr(bot, "TELEGRAM_POLLING_THREAD", type("Alive", (), {"is_alive": lambda self: True})())
+    monkeypatch.setattr(bot, "SCANNER_LOOP_THREAD", None)
+    monkeypatch.setattr(bot, "LAST_TELEGRAM_SEND_TS", 0, raising=False)
+    monkeypatch.setattr(bot, "TELEGRAM_POLL_HEARTBEAT_TS", 1.0, raising=False)
+
+    class _FakeTime:
+        def time(self):
+            return 200.0
+
+        def monotonic(self):
+            return 200.0
+
+    monkeypatch.setattr(bot, "time", _FakeTime())
+
+    with bot.STATE_LOCK:
+        bot.DASHBOARD_STATE["last_run_summary"] = {"ts": 150.0, "ts_str": "1970-01-01T00:02:30Z"}
+
+    payload = bot.build_health_payload()
+
+    assert payload["status"] == "degraded"
+    assert payload["process"]["checks"]["telegram_polling"]["stale_seconds"] > 100
+
+
+def test_health_status_code_returns_503_on_stale_live_check():
+    payload = {
+        "status": "ok",
+        "process": {
+            "checks": {
+                "scanner_loop": {"required": False, "alive": True},
+                "telegram_polling": {
+                    "required": True,
+                    "alive": True,
+                    "stale_seconds": bot.TELEGRAM_POLL_TIMEOUT_SECONDS + bot.TELEGRAM_POLL_HTTP_TIMEOUT_GRACE_SECONDS + 60,
+                },
+            }
+        },
+    }
+
+    assert bot.health_status_code("/live", payload) == 503
+    assert bot.health_status_code("/health", payload) == 200

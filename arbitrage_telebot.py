@@ -1449,6 +1449,7 @@ TELEGRAM_POLL_BACKOFF_UNTIL = 0.0
 TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS = 30.0
 TELEGRAM_WEBHOOK_RESET_COOLDOWN_SECONDS = 600.0
 TELEGRAM_LAST_WEBHOOK_RESET_TS = 0.0
+TELEGRAM_POLL_HEARTBEAT_TS = 0.0
 TELEGRAM_API_DEFAULT_TIMEOUT_SECONDS = 8
 TELEGRAM_POLL_TIMEOUT_SECONDS = 25
 TELEGRAM_POLL_HTTP_TIMEOUT_GRACE_SECONDS = 8
@@ -1992,6 +1993,7 @@ refresh_config_snapshot()
 
 def build_health_payload() -> Dict[str, Any]:
     now = time.time()
+    now_monotonic = time.monotonic()
     metrics = metrics_snapshot()
     with STATE_LOCK:
         summary = DASHBOARD_STATE.get("last_run_summary") or {}
@@ -2003,6 +2005,9 @@ def build_health_payload() -> Dict[str, Any]:
     status = "ok"
     scanner_loop_alive = SCANNER_LOOP_THREAD is not None and SCANNER_LOOP_THREAD.is_alive()
     telegram_polling_alive = TELEGRAM_POLLING_THREAD is not None and TELEGRAM_POLLING_THREAD.is_alive()
+    telegram_poll_stale_seconds = None
+    if TELEGRAM_POLL_HEARTBEAT_TS:
+        telegram_poll_stale_seconds = max(0.0, now_monotonic - float(TELEGRAM_POLL_HEARTBEAT_TS))
     scanner_interval = float(os.getenv("INTERVAL_SECONDS", "30") or 30)
     scanner_stale_seconds = None
     if summary.get("ts"):
@@ -2017,6 +2022,7 @@ def build_health_payload() -> Dict[str, Any]:
         "telegram_polling": {
             "required": PROCESS_ROLE in ("all", "telegram-worker"),
             "alive": telegram_polling_alive,
+            "stale_seconds": telegram_poll_stale_seconds,
         },
         "api": {
             "required": PROCESS_ROLE in ("all", "api"),
@@ -2037,6 +2043,12 @@ def build_health_payload() -> Dict[str, Any]:
             status = "degraded"
     if checks["telegram_polling"]["required"] and not telegram_polling_alive:
         status = "degraded"
+    if checks["telegram_polling"]["required"] and telegram_poll_stale_seconds is not None:
+        telegram_stale_threshold = float(
+            TELEGRAM_POLL_TIMEOUT_SECONDS + TELEGRAM_POLL_HTTP_TIMEOUT_GRACE_SECONDS + 45
+        )
+        if telegram_poll_stale_seconds > telegram_stale_threshold:
+            status = "degraded"
 
     telegram_enabled = bool(CONFIG.get("telegram", {}).get("enabled", False))
     if telegram_enabled and LAST_TELEGRAM_SEND_TS:
@@ -2069,6 +2081,32 @@ def build_health_payload() -> Dict[str, Any]:
         },
     }
     return payload
+
+
+def health_status_code(path: str, payload: Dict[str, Any]) -> int:
+    """Devuelve código HTTP según tipo de healthcheck y estado reportado."""
+
+    checks = payload.get("process", {}).get("checks", {})
+    status = payload.get("status", "booting")
+
+    if path == "/live":
+        scanner_required = bool(checks.get("scanner_loop", {}).get("required"))
+        scanner_alive = bool(checks.get("scanner_loop", {}).get("alive"))
+        telegram_required = bool(checks.get("telegram_polling", {}).get("required"))
+        telegram_alive = bool(checks.get("telegram_polling", {}).get("alive"))
+        if (scanner_required and not scanner_alive) or (telegram_required and not telegram_alive):
+            return 503
+        if telegram_required:
+            stale_seconds = checks.get("telegram_polling", {}).get("stale_seconds")
+            stale_threshold = float(TELEGRAM_POLL_TIMEOUT_SECONDS + TELEGRAM_POLL_HTTP_TIMEOUT_GRACE_SECONDS + 45)
+            if stale_seconds is not None and float(stale_seconds) > stale_threshold:
+                return 503
+        return 200
+
+    if path == "/ready":
+        return 200 if status in {"ok", "booting"} else 503
+
+    return 200
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -2360,7 +2398,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         if self._is_healthcheck():
-            self.send_response(200)
+            payload = build_health_payload()
+            self.send_response(health_status_code(self.path, payload))
             self.end_headers()
             return
         if not self._require_authentication():
@@ -2372,7 +2411,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self._is_healthcheck():
             payload = build_health_payload()
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
+            self.send_response(health_status_code(self.path, payload))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.send_header("Content-Length", str(len(body)))
@@ -3351,7 +3390,7 @@ def _reset_telegram_webhook_after_conflict(now: Optional[float] = None) -> None:
 
 
 def tg_process_updates(enabled: bool = True) -> None:
-    global TELEGRAM_LAST_UPDATE_ID, TELEGRAM_POLL_BACKOFF_UNTIL
+    global TELEGRAM_LAST_UPDATE_ID, TELEGRAM_POLL_BACKOFF_UNTIL, TELEGRAM_POLL_HEARTBEAT_TS
 
     if not get_bot_token():
         return
@@ -3372,6 +3411,7 @@ def tg_process_updates(enabled: bool = True) -> None:
     )
 
     try:
+        TELEGRAM_POLL_HEARTBEAT_TS = time.monotonic()
         data = tg_api_request(
             "getUpdates",
             params=params or None,
@@ -3398,6 +3438,8 @@ def tg_process_updates(enabled: bool = True) -> None:
     except Exception as e:
         log_event("telegram.poll.error", error=str(e))
         return
+
+    TELEGRAM_POLL_HEARTBEAT_TS = time.monotonic()
 
     for update in data.get("result", []):
         update_id = update.get("update_id")
