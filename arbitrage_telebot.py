@@ -1449,6 +1449,9 @@ TELEGRAM_POLL_BACKOFF_UNTIL = 0.0
 TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS = 30.0
 TELEGRAM_WEBHOOK_RESET_COOLDOWN_SECONDS = 600.0
 TELEGRAM_LAST_WEBHOOK_RESET_TS = 0.0
+TELEGRAM_API_DEFAULT_TIMEOUT_SECONDS = 8
+TELEGRAM_POLL_TIMEOUT_SECONDS = 25
+TELEGRAM_POLL_HTTP_TIMEOUT_GRACE_SECONDS = 8
 
 STATE_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
@@ -2527,9 +2530,10 @@ def run_loop_forever(interval: int):
 class HttpError(Exception):
     """Error HTTP con código opcional."""
 
-    def __init__(self, message: str, status_code: Optional[int] = None):
+    def __init__(self, message: str, status_code: Optional[int] = None, is_timeout: bool = False):
         super().__init__(message)
         self.status_code = status_code
+        self.is_timeout = is_timeout
 
 def current_millis() -> int:
     return int(time.time() * 1000)
@@ -2915,17 +2919,25 @@ def tg_send_message(
             log_event("telegram.send.exception", chat_id=cid, error=str(e))
 
 
-def tg_api_request(method: str, params: Optional[Dict] = None, http_method: str = "get") -> Dict:
+def tg_api_request(
+    method: str,
+    params: Optional[Dict] = None,
+    http_method: str = "get",
+    request_timeout: Optional[float] = None,
+) -> Dict:
     token = get_bot_token()
     if not token:
         raise HttpError("Falta TG_BOT_TOKEN")
 
     url = f"https://api.telegram.org/bot{token}/{method}"
+    timeout_seconds = TELEGRAM_API_DEFAULT_TIMEOUT_SECONDS if request_timeout is None else request_timeout
     try:
         if http_method.lower() == "post":
-            r = requests.post(url, data=params or {}, timeout=8)
+            r = requests.post(url, data=params or {}, timeout=timeout_seconds)
         else:
-            r = requests.get(url, params=params or {}, timeout=8)
+            r = requests.get(url, params=params or {}, timeout=timeout_seconds)
+    except requests.exceptions.Timeout as e:
+        raise HttpError(f"Timeout al invocar {method}: {e}", is_timeout=True) from e
     except Exception as e:
         raise HttpError(f"Error al invocar {method}: {e}") from e
 
@@ -3355,12 +3367,26 @@ def tg_process_updates(enabled: bool = True) -> None:
     params: Dict[str, int] = {}
     if TELEGRAM_LAST_UPDATE_ID:
         params["offset"] = TELEGRAM_LAST_UPDATE_ID + 1
-    params["timeout"] = 25
+    params["timeout"] = TELEGRAM_POLL_TIMEOUT_SECONDS
+    poll_request_timeout = max(
+        TELEGRAM_API_DEFAULT_TIMEOUT_SECONDS,
+        params["timeout"] + TELEGRAM_POLL_HTTP_TIMEOUT_GRACE_SECONDS,
+    )
 
     try:
-        data = tg_api_request("getUpdates", params=params or None)
+        data = tg_api_request(
+            "getUpdates",
+            params=params or None,
+            request_timeout=poll_request_timeout,
+        )
     except HttpError as e:
-        if getattr(e, "status_code", None) == 409:
+        if getattr(e, "is_timeout", False):
+            log_event(
+                "telegram.poll.timeout",
+                polling_timeout_seconds=params["timeout"],
+                request_timeout_seconds=poll_request_timeout,
+            )
+        elif getattr(e, "status_code", None) == 409:
             TELEGRAM_POLL_BACKOFF_UNTIL = time.monotonic() + TELEGRAM_POLL_CONFLICT_BACKOFF_SECONDS
             log_event(
                 "telegram.poll.conflict",
