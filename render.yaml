@@ -45,7 +45,7 @@ services:
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python arbitrage_telebot.py --role telegram-worker --web --port $PORT
-    healthCheckPath: /live
+    healthCheckPath: /health
     envVars:
       - key: PROCESS_ROLE
         value: telegram-worker
