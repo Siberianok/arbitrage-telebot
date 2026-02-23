@@ -7444,7 +7444,32 @@ def _run_api_mode(args: argparse.Namespace) -> None:
     serve_http(args.port)
 
 
+def ensure_telegram_startup_requirements(role: str, tg_enabled: bool) -> None:
+    """Valida precondiciones obligatorias para habilitar comandos de Telegram."""
+
+    if role not in ("all", "scanner", "telegram-worker"):
+        return
+    if not tg_enabled:
+        return
+    if get_bot_token():
+        return
+
+    message = (
+        "Startup abortado: Telegram está habilitado pero falta el token del bot. "
+        "Definí la variable de entorno configurada en telegram.bot_token_env (ej. TG_BOT_TOKEN)."
+    )
+    log_event(
+        "telegram.startup.missing_token",
+        role=role,
+        token_env=CONFIG["telegram"].get("bot_token_env"),
+    )
+    print(message)
+    raise SystemExit(1)
+
+
 def _run_telegram_worker_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
+    ensure_telegram_startup_requirements("telegram-worker", tg_enabled)
+
     if tg_enabled:
         tg_sync_command_menu(enabled=True)
         ensure_telegram_polling_thread(enabled=True, interval=0.2)
@@ -7525,6 +7550,8 @@ def main():
         return
 
     tg_enabled = bool(CONFIG["telegram"].get("enabled", False))
+    ensure_telegram_startup_requirements(args.role, tg_enabled)
+
     if args.role in ("all", "scanner"):
         _run_scanner_mode(args, tg_enabled=tg_enabled)
         return
