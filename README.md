@@ -80,6 +80,14 @@ Para separar responsabilidades y mejorar disponibilidad, usar roles dedicados:
 - API/dashboard: `python arbitrage_telebot.py --role api --web --port 10000`
 - Telegram polling worker: `python arbitrage_telebot.py --role telegram-worker --web --port 10001`
 
+En Render, evitar volver al despliegue monolítico (`python arbitrage_telebot.py --web --interval 30`) y mantener estos 3 servicios con `PROCESS_ROLE` explícito:
+
+- `arbitrage-telebot-scanner` → `PROCESS_ROLE=scanner` + health check `/health`.
+- `arbitrage-telebot-api` → `PROCESS_ROLE=api` + health check `/ready`.
+- `arbitrage-telebot-telegram` → `PROCESS_ROLE=telegram-worker` + health check `/live`.
+
+> Servicio crítico para comandos de Telegram: **`arbitrage-telebot-telegram`**. Si este proceso cae, el bot deja de procesar polling y no responderá comandos como `/ping`, aunque scanner y API sigan activos.
+
 Todos los roles exponen `/health`, `/live` y `/ready` cuando arrancan con `--web`, incluyendo checks específicos por proceso en el payload (`process.checks`).
 
 🛟 Continuidad operativa y contingencia
