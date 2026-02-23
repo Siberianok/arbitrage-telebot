@@ -14,6 +14,8 @@ La operación queda dividida en 3 procesos independientes:
    - Comando: `python arbitrage_telebot.py --role telegram-worker --web --port $PORT`
    - Responsabilidad: consumir updates y responder comandos de Telegram sin bloquear scanner.
 
+> Requisito crítico: si `telegram.enabled=true`, debe existir `TG_BOT_TOKEN` (o la env definida en `telegram.bot_token_env`) para los roles `all`, `scanner` y `telegram-worker`. Sin ese secreto, el proceso aborta startup (`exit 1`) y registra `telegram.startup.missing_token`.
+
 ## 2) Infra con uptime continuo
 
 - En `render.yaml` cada proceso está en servicio independiente, con plan `starter` (sin sleep por inactividad).

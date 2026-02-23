@@ -49,6 +49,8 @@ Aliases soportados: `/listapares` → `/pairs`, `/adherirpar` → `/addpair`, `/
 
 Para restringir quién puede modificar parámetros, definir `TG_ADMIN_IDS` (lista de chat IDs separados por coma). Si no se configura, cualquier chat registrado podrá editar la configuración.
 
+> ⚠️ Si `telegram.enabled=true`, el secreto `TG_BOT_TOKEN` (o la variable definida en `telegram.bot_token_env`) es **obligatorio** al arrancar los roles `all`, `scanner` o `telegram-worker`. Si falta, el proceso aborta startup con código no cero y registra `telegram.startup.missing_token`.
+
 📈 Panel web
 
 Ejecutar el bot con `--web` expone:
