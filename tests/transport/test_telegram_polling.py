@@ -124,3 +124,36 @@ def test_tg_handle_pending_input_cancel_restores_command_keyboard(monkeypatch):
     assert bot.get_pending_action("42") is None
     assert sent_payloads[0]["reply_markup"] == bot.tg_commands_reply_markup()
 
+
+
+def test_tg_handle_command_ping_returns_pong(monkeypatch):
+    messages = []
+
+    monkeypatch.setattr(bot, "tg_send_message", lambda text, **payload: messages.append(text))
+
+    bot.tg_handle_command("/ping", "", "123", enabled=True)
+
+    assert messages == ["pong"]
+
+
+def test_build_health_payload_reports_telegram_polling_alive(monkeypatch):
+    monkeypatch.setattr(bot, "PROCESS_ROLE", "telegram-worker")
+    monkeypatch.setattr(bot, "metrics_snapshot", lambda: {})
+
+    class _AliveThread:
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(bot, "TELEGRAM_POLLING_THREAD", _AliveThread())
+    monkeypatch.setattr(bot, "SCANNER_LOOP_THREAD", None)
+    monkeypatch.setattr(bot, "LAST_TELEGRAM_SEND_TS", 0, raising=False)
+
+    with bot.STATE_LOCK:
+        bot.DASHBOARD_STATE["last_run_summary"] = {"ts": 1, "ts_str": "1970-01-01T00:00:01Z"}
+
+    payload = bot.build_health_payload()
+
+    assert payload["process"]["role"] == "telegram-worker"
+    assert payload["process"]["checks"]["telegram_polling"]["required"] is True
+    assert payload["process"]["checks"]["telegram_polling"]["alive"] is True
+    assert payload["status"] == "ok"
