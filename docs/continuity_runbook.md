@@ -57,6 +57,22 @@ curl -fsS https://<telegram-worker-url>/health | jq '.process'
 
 Si `alive=false`, reiniciar el worker y revisar inmediatamente conflictos de polling (`telegram.poll.conflict`) o errores de comando (`telegram.commands.error`).
 
+### Configuración keepalive obligatoria para el worker de Telegram
+
+Configurar en el servicio `arbitrage-telebot-telegram` estas variables de entorno:
+
+- `KEEPALIVE_URL=https://<tu-servicio>.onrender.com`
+- `KEEPALIVE_ENABLED=true`
+- Opcionales recomendadas:
+  - `KEEPALIVE_INTERVAL_SECONDS=180`
+  - `KEEPALIVE_TIMEOUT_SECONDS=8`
+
+Checklist de validación operativa post-deploy:
+
+1. Reiniciar el servicio y confirmar en logs el evento `keepalive.started` (no debe aparecer `keepalive.skip` por `disabled` o `missing_url`).
+2. Esperar al menos un intervalo y validar eventos `keepalive.ping` con `status=200`.
+3. Si el plan actual sigue permitiendo sleep agresivo o cortes por inactividad, migrar el worker de Telegram a un servicio/plan **always-on** según política de plataforma.
+
 ### Alerta recomendada (opcional)
 
 Crear alerta operativa (Render o monitor externo) sobre `/health` del worker Telegram con condición:

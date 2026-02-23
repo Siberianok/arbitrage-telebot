@@ -54,5 +54,13 @@ services:
         sync: false
       - key: TG_ADMIN_IDS
         sync: false
+      - key: KEEPALIVE_URL
+        sync: false
+      - key: KEEPALIVE_ENABLED
+        value: "true"
+      - key: KEEPALIVE_INTERVAL_SECONDS
+        value: "180"
+      - key: KEEPALIVE_TIMEOUT_SECONDS
+        value: "8"
       - key: STATE_DB_URL
         sync: false
