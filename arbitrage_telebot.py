@@ -1926,7 +1926,7 @@ def build_test_signal_message() -> str:
     intro_lines = [
         "🧪✨ *SEÑAL DE PRUEBA* ✨🧪",
         "━━━━━━━━━━━━━━━━━━━━",
-        "⚠️ *Solo validación visual / no ejecutar*",
+        "⚠️ *No ejecutar* — mensaje solo para validación visual",
     ]
 
     return "\n".join(intro_lines) + "\n\n" + alert_message
@@ -6582,31 +6582,32 @@ def fmt_test_alert_table(
     sell_label = format_venue_label(opp.sell_venue)
     now_text = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    rows = [
-        ("Par", opp.pair),
-        ("Ruta", f"{buy_label} → {sell_label}"),
-        (
-            "Spread bruto/neto",
-            f"{format_percent_comma(opp.gross_percent)} / {format_percent_comma(opp.net_percent)}",
-        ),
-        (
-            "PnL estimado",
-            f"~{format_decimal_comma(est_profit, decimals=2)} USDT ({format_percent_comma(est_percent)})",
-        ),
-        (
-            "Capital base",
+    return "\n".join(
+        [
+            "🚨 *Formato de alerta (test)*",
+            "📢 *Demo profesional del formato de alerta*",
+            "",
+            f"*Par:* `{opp.pair}`",
+            f"*Ruta sugerida:* Comprar en *{buy_label}* → Vender en *{sell_label}*",
             (
-                f"{format_decimal_comma(capital_quote, decimals=2)} USDT | "
-                f"Qty {base_qty:.6f} ({format_decimal_comma(capital_used, decimals=2)} USDT usados)"
+                "*Spreads:* "
+                f"Bruto `{format_percent_comma(opp.gross_percent)}` · "
+                f"Neto `{format_percent_comma(opp.net_percent)}`"
             ),
-        ),
-        ("Fecha", now_text),
-    ]
-
-    key_width = max(len(key) for key, _ in rows)
-    table_lines = [f"{key:<{key_width}} | {value}" for key, value in rows]
-    table_block = "```\n" + "\n".join(table_lines) + "\n```"
-    return "🚨 *Formato de alerta (test)*\n" + table_block
+            (
+                "*PnL estimado:* "
+                f"`~{format_decimal_comma(est_profit, decimals=2)} USDT` "
+                f"(`{format_percent_comma(est_percent)}`)"
+            ),
+            (
+                "*Capital y tamaño:* "
+                f"`{format_decimal_comma(capital_quote, decimals=2)} USDT` · "
+                f"Qty `{base_qty:.6f}` · "
+                f"Usado `{format_decimal_comma(capital_used, decimals=2)} USDT`"
+            ),
+            f"*Fecha:* `{now_text}`",
+        ]
+    )
 
 
 def fmt_triangular_alert(opp: TriangularOpportunity, fee_percent: float) -> str:
