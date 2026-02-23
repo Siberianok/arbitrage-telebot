@@ -34,6 +34,36 @@ Criterios:
 - Telegram worker degrada si el hilo de polling no está activo.
 - API se reporta viva cuando el servidor HTTP responde.
 
+### Validación obligatoria en Render para Telegram worker
+
+Ante cualquier incidencia tipo **"el bot no responde comandos"**, ejecutar este bloque como **primer check obligatorio**:
+
+1. Confirmar que existe un servicio dedicado `arbitrage-telebot-telegram` con `--role telegram-worker` en `render.yaml`.
+2. Revisar logs recientes del proceso y validar presencia de eventos de polling/comandos:
+   - `telegram.poll.*`
+   - `telegram.commands.*`
+3. Consultar `/health` del servicio de Telegram y validar:
+   - `process.role == "telegram-worker"`
+   - `process.checks.telegram_polling.required == true`
+   - `process.checks.telegram_polling.alive == true`
+
+Ejemplo de verificación rápida:
+
+```bash
+curl -fsS https://<telegram-worker-url>/health | jq '.process'
+```
+
+Si `alive=false`, reiniciar el worker y revisar inmediatamente conflictos de polling (`telegram.poll.conflict`) o errores de comando (`telegram.commands.error`).
+
+### Alerta recomendada (opcional)
+
+Crear alerta operativa (Render o monitor externo) sobre `/health` del worker Telegram con condición:
+
+- `process.checks.telegram_polling.required == true`
+- `process.checks.telegram_polling.alive == false`
+
+Escalar como incidente de disponibilidad de comandos hasta recuperar `alive=true`.
+
 ## 4) Persistencia de logs y estado
 
 - Mantener `LOG_BASE_DIR` y `LOG_BACKUP_DIR` en almacenamiento persistente (volumen/objeto externo).

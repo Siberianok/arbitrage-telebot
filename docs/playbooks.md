@@ -22,9 +22,10 @@
 4. Mantener monitorización continua del dashboard y Telegram para detectar divergencias.
 
 ## 4. Gestión de incidentes
-1. Si el dashboard deja de actualizar, revisar logs del servicio web (`/health`) y reiniciar proceso.
-2. Ante errores de APIs de exchanges, considerar pausar alertas temporalmente bajando el threshold a un valor alto.
-3. Documentar incidentes en un runbook y actualizar este playbook con lecciones aprendidas.
+1. Ante incidente **"no responde comandos"**, primer check obligatorio: estado del worker de polling (`arbitrage-telebot-telegram`) en `/health`, validando `process.role=telegram-worker` y `process.checks.telegram_polling.alive=true`, junto con eventos `telegram.poll.*`/`telegram.commands.*` en logs.
+2. Si el dashboard deja de actualizar, revisar logs del servicio web (`/health`) y reiniciar proceso.
+3. Ante errores de APIs de exchanges, considerar pausar alertas temporalmente bajando el threshold a un valor alto.
+4. Documentar incidentes en un runbook y actualizar este playbook con lecciones aprendidas.
 
 ## 5. Checklist post-operación
 - Confirmar ejecución en ambos exchanges.
