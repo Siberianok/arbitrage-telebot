@@ -160,6 +160,33 @@ def test_tg_sync_command_menu_registers_commands(monkeypatch):
     assert calls[1][0] == "setChatMenuButton"
 
 
+
+
+def test_tg_send_message_includes_inline_keyboard_reply_markup(monkeypatch):
+    sent_payloads = []
+
+    class _Response:
+        status_code = 200
+        text = "ok"
+
+    monkeypatch.setattr(bot, "get_bot_token", lambda: "token")
+    monkeypatch.setattr(bot, "get_registered_chat_ids", lambda: ["123"])
+    monkeypatch.setattr(bot, "log_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bot.requests, "post", lambda _url, data, timeout: sent_payloads.append(data) or _Response())
+
+    links = bot.build_trade_link_items("binance", "bybit", "BTC/USDT")
+    reply_markup = bot.build_trade_reply_markup(links)
+
+    bot.tg_send_message("alerta", enabled=True, reply_markup=reply_markup)
+
+    assert sent_payloads
+    assert "reply_markup" in sent_payloads[0]
+    parsed_markup = bot.json.loads(sent_payloads[0]["reply_markup"])
+    assert "inline_keyboard" in parsed_markup
+    assert parsed_markup["inline_keyboard"][0][0]["text"] == "Comprar en BINANCE"
+    assert parsed_markup["inline_keyboard"][1][0]["text"] == "Vender en BYBIT"
+
+
 def test_tg_handle_pending_input_cancel_restores_command_keyboard(monkeypatch):
     sent_payloads = []
     monkeypatch.setitem(bot.PENDING_CHAT_ACTIONS, "42", "delpair")
