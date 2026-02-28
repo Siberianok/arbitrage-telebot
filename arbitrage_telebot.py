@@ -4086,11 +4086,26 @@ def build_trade_link_items(buy_venue: str, sell_venue: str, pair: str) -> List[D
     items: List[Dict[str, str]] = []
     buy_link = build_trade_link(buy_venue, pair)
     if buy_link:
-        items.append({"label": f"Comprar en {buy_venue.title()}", "url": buy_link})
+        items.append({"label": f"Comprar en {format_venue_label(buy_venue)}", "url": buy_link})
     sell_link = build_trade_link(sell_venue, pair)
     if sell_link:
-        items.append({"label": f"Vender en {sell_venue.title()}", "url": sell_link})
+        items.append({"label": f"Vender en {format_venue_label(sell_venue)}", "url": sell_link})
     return items
+
+
+def build_trade_reply_markup(link_items: Optional[List[Dict[str, str]]]) -> Optional[Dict[str, Any]]:
+    if not link_items:
+        return None
+    keyboard = []
+    for item in link_items:
+        label = str(item.get("label") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if not label or not url:
+            continue
+        keyboard.append([{"text": label, "url": url}])
+    if not keyboard:
+        return None
+    return {"inline_keyboard": keyboard}
 
 
 def is_strategy_enabled(name: str) -> bool:
@@ -7047,7 +7062,8 @@ def run_once() -> None:
                     est_pnl_quote=est_profit,
                 )
                 msg = f"{msg}\n*Signal ID:* `{signal_id}`"
-                tg_send_message(msg, enabled=tg_enabled)
+                reply_markup = build_trade_reply_markup(link_items)
+                tg_send_message(msg, enabled=tg_enabled, reply_markup=reply_markup)
                 SIGNAL_REGISTRY[signal_id]["state"] = "sent"
                 record_signal_lifecycle_event(
                     signal_id,
@@ -7227,7 +7243,8 @@ def run_once() -> None:
                     est_pnl_quote=est_profit,
                 )
                 msg = f"{msg}\n*Signal ID:* `{signal_id}`"
-                tg_send_message(msg, enabled=tg_enabled)
+                reply_markup = build_trade_reply_markup(link_items)
+                tg_send_message(msg, enabled=tg_enabled, reply_markup=reply_markup)
                 SIGNAL_REGISTRY[signal_id]["state"] = "sent"
                 record_signal_lifecycle_event(
                     signal_id,
@@ -7373,7 +7390,8 @@ def run_once() -> None:
                     est_pnl_quote=est_profit,
                 )
                 msg = f"{msg}\n*Signal ID:* `{signal_id}`"
-                tg_send_message(msg, enabled=tg_enabled)
+                reply_markup = build_trade_reply_markup(link_items)
+                tg_send_message(msg, enabled=tg_enabled, reply_markup=reply_markup)
                 SIGNAL_REGISTRY[signal_id]["state"] = "sent"
                 record_signal_lifecycle_event(
                     signal_id,
