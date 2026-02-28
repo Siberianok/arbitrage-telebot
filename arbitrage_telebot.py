@@ -4066,15 +4066,31 @@ def split_pair(pair: str) -> Tuple[str, str]:
     return base.upper(), quote.upper()
 
 
-def build_trade_link(venue: str, pair: str) -> Optional[str]:
+def _has_device_trade_link(venue: str, pair: str, device: str) -> bool:
+    venue_cfg = CONFIG.get("venues", {}).get(venue.lower()) or {}
+    trade_links = venue_cfg.get("trade_links") or {}
+    pair_key = pair.upper()
+    return bool(
+        trade_links.get(f"{pair_key}_{device}") or trade_links.get(f"default_{device}")
+    )
+
+
+def build_trade_link(venue: str, pair: str, device: str = "desktop") -> Optional[str]:
     base, quote = split_pair(pair)
+    normalized_pair = pair.upper()
+    normalized_device = device.lower().strip() if device else "desktop"
     venue_cfg = CONFIG.get("venues", {}).get(venue.lower())
     if venue_cfg:
         trade_links = venue_cfg.get("trade_links") or {}
-        template = trade_links.get(pair.upper()) or trade_links.get("default")
+        template = (
+            trade_links.get(f"{normalized_pair}_{normalized_device}")
+            or trade_links.get(f"default_{normalized_device}")
+            or trade_links.get(normalized_pair)
+            or trade_links.get("default")
+        )
         if template:
             try:
-                return template.format(pair=pair.upper(), base=base, quote=quote)
+                return template.format(pair=normalized_pair, base=base, quote=quote)
             except Exception:
                 pass
     venue = venue.lower()
@@ -4091,7 +4107,8 @@ def build_trade_link(venue: str, pair: str) -> Optional[str]:
 
 def build_trade_link_items(buy_venue: str, sell_venue: str, pair: str) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
-    buy_link = build_trade_link(buy_venue, pair)
+
+    buy_link = build_trade_link(buy_venue, pair, device="desktop")
     if buy_link:
         items.append({"label": f"Comprar en {format_venue_label(buy_venue)}", "url": buy_link})
     sell_link = build_trade_link(sell_venue, pair)
