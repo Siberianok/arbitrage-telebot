@@ -95,7 +95,6 @@ Todos los roles exponen `/health`, `/live` y `/ready` cuando arrancan con `--web
 - Infra recomendada sin sleep: servicios separados en plan always-on (`render.yaml`).
 - Logs y backups: usar almacenamiento persistente vía `LOG_BASE_DIR` / `LOG_BACKUP_DIR`.
 - Estado externo: configurar `STATE_DB_URL` para persistencia fuera del filesystem local.
-- Runbook completo: `docs/continuity_runbook.md`.
 
 📦 Variables clave para despliegues resilientes
 
@@ -106,10 +105,6 @@ Todos los roles exponen `/health`, `/live` y `/ready` cuando arrancan con `--web
 - `KEEPALIVE_ENABLED`: habilita/deshabilita el auto-ping (`true`/`false`, default activado si `KEEPALIVE_URL` está definido).
 - `KEEPALIVE_INTERVAL_SECONDS`: cada cuántos segundos ejecutar el ping (mínimo 60, default 240).
 - `KEEPALIVE_TIMEOUT_SECONDS`: timeout HTTP del ping (default 8).
-
-🔎 Playbooks operativos
-
-Revisa `docs/playbooks.md` para procedimientos manuales, semiautomáticos y automatizados ante oportunidades detectadas.
 
 🧠 Cómo funciona (resumen)
 
