@@ -3320,7 +3320,14 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         return
 
     if command in ("/test", "/senalprueba"):
-        tg_send_message(build_test_signal_message(), enabled=enabled, chat_id=chat_id)
+        link_items = build_trade_link_items("binance", "bybit", "BTC/USDT")
+        reply_markup = tg_inline_keyboard_from_link_items(link_items)
+        tg_send_message(
+            build_test_signal_message(),
+            enabled=enabled,
+            chat_id=chat_id,
+            reply_markup=reply_markup,
+        )
         return
 
     if command == "/settle":
@@ -4103,78 +4110,31 @@ def build_trade_link_items(buy_venue: str, sell_venue: str, pair: str) -> List[D
 
     buy_link = build_trade_link(buy_venue, pair, device="desktop")
     if buy_link:
-        items.append(
-            {
-                "label": f"Comprar ({buy_venue.title()} · Desktop)",
-                "url": buy_link,
-                "side": "buy",
-                "device": "desktop",
-            }
-        )
-
-    sell_link = build_trade_link(sell_venue, pair, device="desktop")
+        items.append({"label": f"Comprar en {format_venue_label(buy_venue)}", "url": buy_link})
+    sell_link = build_trade_link(sell_venue, pair)
     if sell_link:
-        items.append(
-            {
-                "label": f"Vender ({sell_venue.title()} · Desktop)",
-                "url": sell_link,
-                "side": "sell",
-                "device": "desktop",
-            }
-        )
-
-    mobile_enabled = _has_device_trade_link(buy_venue, pair, "mobile") or _has_device_trade_link(
-        sell_venue, pair, "mobile"
-    )
-    if mobile_enabled:
-        buy_mobile_link = build_trade_link(buy_venue, pair, device="mobile")
-        if buy_mobile_link:
-            items.append(
-                {
-                    "label": f"Comprar ({buy_venue.title()} · Móvil)",
-                    "url": buy_mobile_link,
-                    "side": "buy",
-                    "device": "mobile",
-                }
-            )
-
-        sell_mobile_link = build_trade_link(sell_venue, pair, device="mobile")
-        if sell_mobile_link:
-            items.append(
-                {
-                    "label": f"Vender ({sell_venue.title()} · Móvil)",
-                    "url": sell_mobile_link,
-                    "side": "sell",
-                    "device": "mobile",
-                }
-            )
+        items.append({"label": f"Vender en {format_venue_label(sell_venue)}", "url": sell_link})
     return items
 
 
-def build_trade_links_inline_keyboard(link_items: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+def tg_inline_keyboard_from_link_items(
+    link_items: Optional[List[Dict[str, str]]],
+) -> Optional[Dict[str, List[List[Dict[str, str]]]]]:
     if not link_items:
         return None
 
-    rows: List[List[Dict[str, str]]] = []
-    for device in ("desktop", "mobile"):
-        row: List[Dict[str, str]] = []
-        for side in ("buy", "sell"):
-            item = next(
-                (
-                    candidate
-                    for candidate in link_items
-                    if candidate.get("device") == device and candidate.get("side") == side
-                ),
-                None,
-            )
-            if item and item.get("url"):
-                row.append({"text": item["label"], "url": item["url"]})
-        if row:
-            rows.append(row)
+    keyboard: List[List[Dict[str, str]]] = []
+    for item in link_items:
+        label = str(item.get("label", "")).strip() if isinstance(item, dict) else ""
+        url = str(item.get("url", "")).strip() if isinstance(item, dict) else ""
+        if not label or not url:
+            continue
+        keyboard.append([{"text": label, "url": url}])
 
-    if not rows:
+    if not keyboard:
         return None
-    return {"inline_keyboard": rows}
+
+    return {"inline_keyboard": keyboard}
 
 
 def is_strategy_enabled(name: str) -> bool:
@@ -6700,38 +6660,45 @@ def fmt_test_alert_table(
     capital_used: float,
     links: Optional[List[Dict[str, str]]] = None,
 ) -> str:
-    del links  # reservado para uso futuro en modo test
+    quick_actions: List[str] = []
+    for item in links or []:
+        label = str(item.get("label", "")).strip() if isinstance(item, dict) else ""
+        url = str(item.get("url", "")).strip() if isinstance(item, dict) else ""
+        if label and url:
+            quick_actions.append(label)
 
     buy_label = format_venue_label(opp.buy_venue)
     sell_label = format_venue_label(opp.sell_venue)
     now_text = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    return "\n".join(
-        [
-            "🚨 *Formato de alerta (test)*",
-            "📢 *Demo profesional del formato de alerta*",
-            "",
-            f"*Par:* `{opp.pair}`",
-            f"*Ruta sugerida:* Comprar en *{buy_label}* → Vender en *{sell_label}*",
-            (
-                "*Spreads:* "
-                f"Bruto `{format_percent_comma(opp.gross_percent)}` · "
-                f"Neto `{format_percent_comma(opp.net_percent)}`"
-            ),
-            (
-                "*PnL estimado:* "
-                f"`~{format_decimal_comma(est_profit, decimals=2)} USDT` "
-                f"(`{format_percent_comma(est_percent)}`)"
-            ),
-            (
-                "*Capital y tamaño:* "
-                f"`{format_decimal_comma(capital_quote, decimals=2)} USDT` · "
-                f"Qty `{base_qty:.6f}` · "
-                f"Usado `{format_decimal_comma(capital_used, decimals=2)} USDT`"
-            ),
-            f"*Fecha:* `{now_text}`",
-        ]
-    )
+    lines = [
+        "🚨 *Formato de alerta (test)*",
+        "📢 *Demo profesional del formato de alerta*",
+        "",
+        f"*Par:* `{opp.pair}`",
+        f"*Ruta sugerida:* Comprar en *{buy_label}* → Vender en *{sell_label}*",
+        (
+            "*Spreads:* "
+            f"Bruto `{format_percent_comma(opp.gross_percent)}` · "
+            f"Neto `{format_percent_comma(opp.net_percent)}`"
+        ),
+        (
+            "*PnL estimado:* "
+            f"`~{format_decimal_comma(est_profit, decimals=2)} USDT` "
+            f"(`{format_percent_comma(est_percent)}`)"
+        ),
+        (
+            "*Capital y tamaño:* "
+            f"`{format_decimal_comma(capital_quote, decimals=2)} USDT` · "
+            f"Qty `{base_qty:.6f}` · "
+            f"Usado `{format_decimal_comma(capital_used, decimals=2)} USDT`"
+        ),
+    ]
+    if quick_actions:
+        lines.append(f"*Acciones rápidas:* {' · '.join(quick_actions)}")
+    lines.append(f"*Fecha:* `{now_text}`")
+
+    return "\n".join(lines)
 
 
 def fmt_triangular_alert(opp: TriangularOpportunity, fee_percent: float) -> str:
@@ -7131,11 +7098,8 @@ def run_once() -> None:
                     est_pnl_quote=est_profit,
                 )
                 msg = f"{msg}\n*Signal ID:* `{signal_id}`"
-                tg_send_message(
-                    msg,
-                    enabled=tg_enabled,
-                    reply_markup=build_trade_links_inline_keyboard(link_items),
-                )
+                reply_markup = build_trade_reply_markup(link_items)
+                tg_send_message(msg, enabled=tg_enabled, reply_markup=reply_markup)
                 SIGNAL_REGISTRY[signal_id]["state"] = "sent"
                 record_signal_lifecycle_event(
                     signal_id,
@@ -7315,11 +7279,8 @@ def run_once() -> None:
                     est_pnl_quote=est_profit,
                 )
                 msg = f"{msg}\n*Signal ID:* `{signal_id}`"
-                tg_send_message(
-                    msg,
-                    enabled=tg_enabled,
-                    reply_markup=build_trade_links_inline_keyboard(link_items),
-                )
+                reply_markup = build_trade_reply_markup(link_items)
+                tg_send_message(msg, enabled=tg_enabled, reply_markup=reply_markup)
                 SIGNAL_REGISTRY[signal_id]["state"] = "sent"
                 record_signal_lifecycle_event(
                     signal_id,
@@ -7465,11 +7426,8 @@ def run_once() -> None:
                     est_pnl_quote=est_profit,
                 )
                 msg = f"{msg}\n*Signal ID:* `{signal_id}`"
-                tg_send_message(
-                    msg,
-                    enabled=tg_enabled,
-                    reply_markup=build_trade_links_inline_keyboard(link_items),
-                )
+                reply_markup = build_trade_reply_markup(link_items)
+                tg_send_message(msg, enabled=tg_enabled, reply_markup=reply_markup)
                 SIGNAL_REGISTRY[signal_id]["state"] = "sent"
                 record_signal_lifecycle_event(
                     signal_id,
