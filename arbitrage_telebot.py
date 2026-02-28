@@ -3320,7 +3320,14 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         return
 
     if command in ("/test", "/senalprueba"):
-        tg_send_message(build_test_signal_message(), enabled=enabled, chat_id=chat_id)
+        link_items = build_trade_link_items("binance", "bybit", "BTC/USDT")
+        reply_markup = tg_inline_keyboard_from_link_items(link_items)
+        tg_send_message(
+            build_test_signal_message(),
+            enabled=enabled,
+            chat_id=chat_id,
+            reply_markup=reply_markup,
+        )
         return
 
     if command == "/settle":
@@ -4093,18 +4100,23 @@ def build_trade_link_items(buy_venue: str, sell_venue: str, pair: str) -> List[D
     return items
 
 
-def build_trade_reply_markup(link_items: Optional[List[Dict[str, str]]]) -> Optional[Dict[str, Any]]:
+def tg_inline_keyboard_from_link_items(
+    link_items: Optional[List[Dict[str, str]]],
+) -> Optional[Dict[str, List[List[Dict[str, str]]]]]:
     if not link_items:
         return None
-    keyboard = []
+
+    keyboard: List[List[Dict[str, str]]] = []
     for item in link_items:
-        label = str(item.get("label") or "").strip()
-        url = str(item.get("url") or "").strip()
+        label = str(item.get("label", "")).strip() if isinstance(item, dict) else ""
+        url = str(item.get("url", "")).strip() if isinstance(item, dict) else ""
         if not label or not url:
             continue
         keyboard.append([{"text": label, "url": url}])
+
     if not keyboard:
         return None
+
     return {"inline_keyboard": keyboard}
 
 
@@ -6631,38 +6643,45 @@ def fmt_test_alert_table(
     capital_used: float,
     links: Optional[List[Dict[str, str]]] = None,
 ) -> str:
-    del links  # reservado para uso futuro en modo test
+    quick_actions: List[str] = []
+    for item in links or []:
+        label = str(item.get("label", "")).strip() if isinstance(item, dict) else ""
+        url = str(item.get("url", "")).strip() if isinstance(item, dict) else ""
+        if label and url:
+            quick_actions.append(label)
 
     buy_label = format_venue_label(opp.buy_venue)
     sell_label = format_venue_label(opp.sell_venue)
     now_text = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    return "\n".join(
-        [
-            "🚨 *Formato de alerta (test)*",
-            "📢 *Demo profesional del formato de alerta*",
-            "",
-            f"*Par:* `{opp.pair}`",
-            f"*Ruta sugerida:* Comprar en *{buy_label}* → Vender en *{sell_label}*",
-            (
-                "*Spreads:* "
-                f"Bruto `{format_percent_comma(opp.gross_percent)}` · "
-                f"Neto `{format_percent_comma(opp.net_percent)}`"
-            ),
-            (
-                "*PnL estimado:* "
-                f"`~{format_decimal_comma(est_profit, decimals=2)} USDT` "
-                f"(`{format_percent_comma(est_percent)}`)"
-            ),
-            (
-                "*Capital y tamaño:* "
-                f"`{format_decimal_comma(capital_quote, decimals=2)} USDT` · "
-                f"Qty `{base_qty:.6f}` · "
-                f"Usado `{format_decimal_comma(capital_used, decimals=2)} USDT`"
-            ),
-            f"*Fecha:* `{now_text}`",
-        ]
-    )
+    lines = [
+        "🚨 *Formato de alerta (test)*",
+        "📢 *Demo profesional del formato de alerta*",
+        "",
+        f"*Par:* `{opp.pair}`",
+        f"*Ruta sugerida:* Comprar en *{buy_label}* → Vender en *{sell_label}*",
+        (
+            "*Spreads:* "
+            f"Bruto `{format_percent_comma(opp.gross_percent)}` · "
+            f"Neto `{format_percent_comma(opp.net_percent)}`"
+        ),
+        (
+            "*PnL estimado:* "
+            f"`~{format_decimal_comma(est_profit, decimals=2)} USDT` "
+            f"(`{format_percent_comma(est_percent)}`)"
+        ),
+        (
+            "*Capital y tamaño:* "
+            f"`{format_decimal_comma(capital_quote, decimals=2)} USDT` · "
+            f"Qty `{base_qty:.6f}` · "
+            f"Usado `{format_decimal_comma(capital_used, decimals=2)} USDT`"
+        ),
+    ]
+    if quick_actions:
+        lines.append(f"*Acciones rápidas:* {' · '.join(quick_actions)}")
+    lines.append(f"*Fecha:* `{now_text}`")
+
+    return "\n".join(lines)
 
 
 def fmt_triangular_alert(opp: TriangularOpportunity, fee_percent: float) -> str:
