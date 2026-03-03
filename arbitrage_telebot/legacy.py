@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""CLI entrypoint for arbitrage_telebot."""
+import argparse
+import base64
+import csv
+import hashlib
+import itertools
+import json
+import math
+import os
+import random
+import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from statistics import StatisticsError, mean, pstdev
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
 
-from arbitrage_telebot.runtime.runner import main
+import requests
 
 from config_store import (
     build_runtime_payload,
@@ -1437,7 +1454,16 @@ TELEGRAM_API_DEFAULT_TIMEOUT_SECONDS = 8
 TELEGRAM_POLL_TIMEOUT_SECONDS = 25
 TELEGRAM_POLL_HTTP_TIMEOUT_GRACE_SECONDS = 8
 
+STATE_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
+DASHBOARD_STATE: Dict[str, Any] = {
+    "last_run_summary": None,
+    "latest_alerts": [],
+    "config_snapshot": {},
+    "exchange_metrics": {},
+    "analysis": None,
+    "quote_discards": [],
+}
 RUNTIME_STATE = RuntimeState()
 
 
@@ -1683,6 +1709,8 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
         with CONFIG_LOCK:
             DYNAMIC_THRESHOLD_PERCENT = base_threshold
         LATEST_ANALYSIS = None
+        with STATE_LOCK:
+            DASHBOARD_STATE["analysis"] = None
         RUNTIME_STATE.set_analysis(None)
         return
 
@@ -1707,6 +1735,8 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
         "average_effective_percent": analysis.average_effective_percent,
         "recommended_threshold": recommended,
     }
+    with STATE_LOCK:
+        DASHBOARD_STATE["analysis"] = dict(analysis_payload)
     RUNTIME_STATE.set_analysis(analysis_payload)
 
     log_event(
@@ -1965,12 +1995,12 @@ def build_health_payload() -> Dict[str, Any]:
     now = time.time()
     now_monotonic = time.monotonic()
     metrics = metrics_snapshot()
-    snapshot = RUNTIME_STATE.health_snapshot()
-    summary = snapshot.get("last_run_summary") or {}
-    latest_alerts = list(snapshot.get("latest_alerts", []))[:5]
-    latest_quotes = snapshot.get("latest_quotes", {})
-    quote_latency = snapshot.get("last_quote_latency_ms")
-    quote_discards = list(snapshot.get("quote_discards", []))[:50]
+    with STATE_LOCK:
+        summary = DASHBOARD_STATE.get("last_run_summary") or {}
+        latest_alerts = list(DASHBOARD_STATE.get("latest_alerts", []))[:5]
+        latest_quotes = DASHBOARD_STATE.get("latest_quotes", {})
+        quote_latency = DASHBOARD_STATE.get("last_quote_latency_ms")
+        quote_discards = list(DASHBOARD_STATE.get("quote_discards", []))[:50]
 
     status = "ok"
     scanner_loop_alive = SCANNER_LOOP_THREAD is not None and SCANNER_LOOP_THREAD.is_alive()
@@ -2404,7 +2434,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/api/state":
             if not self._require_authentication():
                 return
-            payload = RUNTIME_STATE.dashboard_snapshot()
+            with STATE_LOCK:
+                payload = {
+                    "last_run_summary": DASHBOARD_STATE.get("last_run_summary"),
+                    "latest_alerts": DASHBOARD_STATE.get("latest_alerts", []),
+                    "config_snapshot": DASHBOARD_STATE.get("config_snapshot", {}),
+                    "exchange_metrics": DASHBOARD_STATE.get("exchange_metrics", {}),
+                    "analysis": DASHBOARD_STATE.get("analysis"),
+                    "quote_discards": DASHBOARD_STATE.get("quote_discards", []),
+                }
             self._send_json(payload)
             return
         self.send_response(404)
@@ -3134,18 +3172,17 @@ def settle_signal_result(payload: Dict[str, Any], settled_by: str = "manual") ->
         ],
     )
 
-    RUNTIME_STATE.merge_analysis(
-        {
-            "last_manual_settlement": {
-                "signal_id": signal_id,
-                "outcome": outcome,
-                "pnl_real_quote": pnl_real,
-                "delta_quote": delta_quote,
-                "delta_percent": delta_pct,
-            },
-            "reliability_ranking": compute_reliability_rankings(limit=5),
+    with STATE_LOCK:
+        analysis_state = DASHBOARD_STATE.setdefault("analysis", {}) or {}
+        analysis_state["last_manual_settlement"] = {
+            "signal_id": signal_id,
+            "outcome": outcome,
+            "pnl_real_quote": pnl_real,
+            "delta_quote": delta_quote,
+            "delta_percent": delta_pct,
         }
-    )
+        analysis_state["reliability_ranking"] = compute_reliability_rankings(limit=5)
+        DASHBOARD_STATE["analysis"] = analysis_state
 
     return True, (
         f"Resultado guardado para {signal_id}: {outcome.upper()} | "
@@ -3284,9 +3321,25 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
 
     if command in ("/test", "/senalprueba"):
         link_items = build_trade_link_items("binance", "bybit", "BTC/USDT")
-        reply_markup = tg_inline_keyboard_from_link_items(link_items)
+        test_items: List[Dict[str, str]] = []
+        for item in link_items:
+            if item.get("device") != "desktop":
+                continue
+            side = str(item.get("side", "")).lower()
+            venue = format_venue_label(str(item.get("venue", ""))).title()
+            url = str(item.get("url", "")).strip()
+            if side == "buy" and url:
+                test_items.append({"label": f"Comprar en {venue}", "url": url})
+            if side == "sell" and url:
+                test_items.append({"label": f"Vender en {venue}", "url": url})
+        reply_markup = tg_inline_keyboard_from_link_items(test_items)
+        message = build_test_signal_message()
+        if test_items:
+            labels = " · ".join(item.get("label", "") for item in test_items if item.get("label"))
+            if labels:
+                message = f"{message}\n\n*Acciones rápidas:* {labels}"
         tg_send_message(
-            build_test_signal_message(),
+            message,
             enabled=enabled,
             chat_id=chat_id,
             reply_markup=reply_markup,
@@ -4071,13 +4124,75 @@ def build_trade_link(venue: str, pair: str, device: str = "desktop") -> Optional
 def build_trade_link_items(buy_venue: str, sell_venue: str, pair: str) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
 
-    buy_link = build_trade_link(buy_venue, pair, device="desktop")
-    if buy_link:
-        items.append({"label": f"Comprar en {format_venue_label(buy_venue)}", "url": buy_link})
-    sell_link = build_trade_link(sell_venue, pair)
-    if sell_link:
-        items.append({"label": f"Vender en {format_venue_label(sell_venue)}", "url": sell_link})
+    desktop_buy = build_trade_link(buy_venue, pair, device="desktop")
+    desktop_sell = build_trade_link(sell_venue, pair, device="desktop")
+    if desktop_buy:
+        items.append({"side": "buy", "venue": buy_venue, "device": "desktop", "url": desktop_buy})
+    if desktop_sell:
+        items.append({"side": "sell", "venue": sell_venue, "device": "desktop", "url": desktop_sell})
+
+    mobile_buy = build_trade_link(buy_venue, pair, device="mobile")
+    mobile_sell = build_trade_link(sell_venue, pair, device="mobile")
+    has_mobile_specific = (mobile_buy and mobile_buy != desktop_buy) or (mobile_sell and mobile_sell != desktop_sell)
+    if has_mobile_specific:
+        if mobile_buy:
+            items.append({"side": "buy", "venue": buy_venue, "device": "mobile", "url": mobile_buy})
+        if mobile_sell:
+            items.append({"side": "sell", "venue": sell_venue, "device": "mobile", "url": mobile_sell})
+
     return items
+
+
+def build_trade_links_inline_keyboard(
+    link_items: Optional[List[Dict[str, str]]],
+) -> Optional[Dict[str, List[List[Dict[str, str]]]]]:
+    if not link_items:
+        return None
+
+    keyboard: List[List[Dict[str, str]]] = []
+    for device in ["desktop", "mobile"]:
+        row: List[Dict[str, str]] = []
+        for item in link_items:
+            if not isinstance(item, dict) or item.get("device") != device:
+                continue
+            url = str(item.get("url", "")).strip()
+            side = str(item.get("side", "")).strip().lower()
+            venue = format_venue_label(str(item.get("venue", ""))).title()
+            if not url or side not in {"buy", "sell"}:
+                continue
+            action = "Comprar" if side == "buy" else "Vender"
+            device_label = "Desktop" if device == "desktop" else "Móvil"
+            row.append({"text": f"{action} ({venue} · {device_label})", "url": url})
+        if row:
+            keyboard.append(row)
+
+    if not keyboard:
+        return None
+
+    return {"inline_keyboard": keyboard}
+
+
+def build_trade_reply_markup(link_items: Optional[List[Dict[str, str]]]) -> Optional[Dict[str, List[List[Dict[str, str]]]]]:
+    """Backward-compatible helper for Telegram inline keyboard payloads."""
+
+    if not link_items:
+        return None
+
+    legacy_items: List[Dict[str, str]] = []
+    for item in link_items:
+        if item.get("device") != "desktop":
+            continue
+        side = str(item.get("side", "")).lower()
+        venue = format_venue_label(str(item.get("venue", "")))
+        url = str(item.get("url", "")).strip()
+        if not url:
+            continue
+        if side == "buy":
+            legacy_items.append({"label": f"Comprar en {venue}", "url": url})
+        elif side == "sell":
+            legacy_items.append({"label": f"Vender en {venue}", "url": url})
+
+    return tg_inline_keyboard_from_link_items(legacy_items)
 
 
 def tg_inline_keyboard_from_link_items(
@@ -6817,12 +6932,11 @@ def run_once() -> None:
         latency_ms=quote_latency_ms,
     )
 
-    RUNTIME_STATE.update_last_quote_state(
-        quote_latency_ms=quote_latency_ms,
-        quote_count=sum(len(v) for v in pair_quotes.values()),
-        latest_quotes=build_quote_snapshot(pair_quotes),
-        quote_discards=quote_discards,
-    )
+    with STATE_LOCK:
+        DASHBOARD_STATE["last_quote_latency_ms"] = quote_latency_ms
+        DASHBOARD_STATE["last_quote_count"] = sum(len(v) for v in pair_quotes.values())
+        DASHBOARD_STATE["latest_quotes"] = build_quote_snapshot(pair_quotes)
+        DASHBOARD_STATE["quote_discards"] = quote_discards[:200]
 
     for pair in all_pairs:
         venues_available = sorted(pair_quotes.get(pair, {}).keys())
