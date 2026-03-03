@@ -25,16 +25,14 @@ def test_update_analysis_state_updates_globals(monkeypatch):
 
     monkeypatch.setattr(bot, "DYNAMIC_THRESHOLD_PERCENT", 0.30, raising=False)
     monkeypatch.setattr(bot, "LATEST_ANALYSIS", None, raising=False)
-    with bot.STATE_LOCK:
-        bot.DASHBOARD_STATE["analysis"] = None
+    bot.RUNTIME_STATE.set_analysis(None)
 
     bot.update_analysis_state(5000.0, "logs/opportunities.csv")
 
     assert bot.LATEST_ANALYSIS is analysis
     assert bot.DYNAMIC_THRESHOLD_PERCENT == pytest.approx(0.42)
 
-    with bot.STATE_LOCK:
-        analysis_state = bot.DASHBOARD_STATE["analysis"]
+    analysis_state = bot.RUNTIME_STATE.dashboard_snapshot()["analysis"]
 
     assert analysis_state["recommended_threshold"] == pytest.approx(0.42)
     assert analysis_state["rows_considered"] == 5
