@@ -1454,16 +1454,7 @@ TELEGRAM_API_DEFAULT_TIMEOUT_SECONDS = 8
 TELEGRAM_POLL_TIMEOUT_SECONDS = 25
 TELEGRAM_POLL_HTTP_TIMEOUT_GRACE_SECONDS = 8
 
-STATE_LOCK = threading.Lock()
 CONFIG_LOCK = threading.Lock()
-DASHBOARD_STATE: Dict[str, Any] = {
-    "last_run_summary": None,
-    "latest_alerts": [],
-    "config_snapshot": {},
-    "exchange_metrics": {},
-    "analysis": None,
-    "quote_discards": [],
-}
 RUNTIME_STATE = RuntimeState()
 
 
@@ -1709,8 +1700,6 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
         with CONFIG_LOCK:
             DYNAMIC_THRESHOLD_PERCENT = base_threshold
         LATEST_ANALYSIS = None
-        with STATE_LOCK:
-            DASHBOARD_STATE["analysis"] = None
         RUNTIME_STATE.set_analysis(None)
         return
 
@@ -1735,8 +1724,6 @@ def update_analysis_state(capital_quote: float, log_path: str) -> None:
         "average_effective_percent": analysis.average_effective_percent,
         "recommended_threshold": recommended,
     }
-    with STATE_LOCK:
-        DASHBOARD_STATE["analysis"] = dict(analysis_payload)
     RUNTIME_STATE.set_analysis(analysis_payload)
 
     log_event(
@@ -1995,12 +1982,12 @@ def build_health_payload() -> Dict[str, Any]:
     now = time.time()
     now_monotonic = time.monotonic()
     metrics = metrics_snapshot()
-    with STATE_LOCK:
-        summary = DASHBOARD_STATE.get("last_run_summary") or {}
-        latest_alerts = list(DASHBOARD_STATE.get("latest_alerts", []))[:5]
-        latest_quotes = DASHBOARD_STATE.get("latest_quotes", {})
-        quote_latency = DASHBOARD_STATE.get("last_quote_latency_ms")
-        quote_discards = list(DASHBOARD_STATE.get("quote_discards", []))[:50]
+    snapshot = RUNTIME_STATE.health_snapshot()
+    summary = snapshot.get("last_run_summary") or {}
+    latest_alerts = list(snapshot.get("latest_alerts", []))[:5]
+    latest_quotes = snapshot.get("latest_quotes", {})
+    quote_latency = snapshot.get("last_quote_latency_ms")
+    quote_discards = list(snapshot.get("quote_discards", []))[:50]
 
     status = "ok"
     scanner_loop_alive = SCANNER_LOOP_THREAD is not None and SCANNER_LOOP_THREAD.is_alive()
@@ -2434,15 +2421,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/api/state":
             if not self._require_authentication():
                 return
-            with STATE_LOCK:
-                payload = {
-                    "last_run_summary": DASHBOARD_STATE.get("last_run_summary"),
-                    "latest_alerts": DASHBOARD_STATE.get("latest_alerts", []),
-                    "config_snapshot": DASHBOARD_STATE.get("config_snapshot", {}),
-                    "exchange_metrics": DASHBOARD_STATE.get("exchange_metrics", {}),
-                    "analysis": DASHBOARD_STATE.get("analysis"),
-                    "quote_discards": DASHBOARD_STATE.get("quote_discards", []),
-                }
+            payload = RUNTIME_STATE.dashboard_snapshot()
             self._send_json(payload)
             return
         self.send_response(404)
@@ -3172,17 +3151,18 @@ def settle_signal_result(payload: Dict[str, Any], settled_by: str = "manual") ->
         ],
     )
 
-    with STATE_LOCK:
-        analysis_state = DASHBOARD_STATE.setdefault("analysis", {}) or {}
-        analysis_state["last_manual_settlement"] = {
-            "signal_id": signal_id,
-            "outcome": outcome,
-            "pnl_real_quote": pnl_real,
-            "delta_quote": delta_quote,
-            "delta_percent": delta_pct,
+    RUNTIME_STATE.merge_analysis(
+        {
+            "last_manual_settlement": {
+                "signal_id": signal_id,
+                "outcome": outcome,
+                "pnl_real_quote": pnl_real,
+                "delta_quote": delta_quote,
+                "delta_percent": delta_pct,
+            },
+            "reliability_ranking": compute_reliability_rankings(limit=5),
         }
-        analysis_state["reliability_ranking"] = compute_reliability_rankings(limit=5)
-        DASHBOARD_STATE["analysis"] = analysis_state
+    )
 
     return True, (
         f"Resultado guardado para {signal_id}: {outcome.upper()} | "
@@ -6854,11 +6834,12 @@ def run_once() -> None:
         latency_ms=quote_latency_ms,
     )
 
-    with STATE_LOCK:
-        DASHBOARD_STATE["last_quote_latency_ms"] = quote_latency_ms
-        DASHBOARD_STATE["last_quote_count"] = sum(len(v) for v in pair_quotes.values())
-        DASHBOARD_STATE["latest_quotes"] = build_quote_snapshot(pair_quotes)
-        DASHBOARD_STATE["quote_discards"] = quote_discards[:200]
+    RUNTIME_STATE.update_last_quote_state(
+        quote_latency_ms=quote_latency_ms,
+        quote_count=sum(len(v) for v in pair_quotes.values()),
+        latest_quotes=build_quote_snapshot(pair_quotes),
+        quote_discards=quote_discards,
+    )
 
     for pair in all_pairs:
         venues_available = sorted(pair_quotes.get(pair, {}).keys())
