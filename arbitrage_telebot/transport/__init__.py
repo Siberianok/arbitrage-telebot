@@ -1,6 +1,4 @@
-"""Telegram transport compatibility module."""
-
-from arbitrage_telebot.transport.telegram import (
+from .telegram import (
     ensure_telegram_polling_thread,
     tg_api_request,
     tg_enable_menu_button,

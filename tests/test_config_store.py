@@ -62,3 +62,27 @@ def test_validate_runtime_schema_rejects_missing_fields():
         assert "Faltan claves requeridas" in str(exc)
     else:
         raise AssertionError("Se esperaba ValueError por esquema incompleto")
+
+
+def test_runtime_load_returns_base_when_primary_and_backup_are_corrupt(tmp_path, caplog):
+    runtime_path = tmp_path / "runtime_config.json"
+    backup_path = runtime_path.with_suffix(".json.bak")
+    base = _base_config()
+
+    runtime_path.write_text("{ archivo-json-corrupto", encoding="utf-8")
+    backup_path.write_text("{ backup-json-corrupto", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        loaded, loaded_from_runtime = config_store.load_config_with_runtime(base, runtime_path)
+
+    assert loaded_from_runtime is False
+    assert loaded["pairs"] == base["pairs"]
+    assert loaded["threshold_percent"] == base["threshold_percent"]
+    assert loaded["simulation_capital_quote"] == base["simulation_capital_quote"]
+    assert loaded["strategies"] == base["strategies"]
+    assert loaded["venues"] == base["venues"]
+    assert loaded["config_version"] == config_store.RUNTIME_CONFIG_VERSION
+    assert isinstance(loaded["updated_at"], str)
+    assert loaded["updated_at"].strip()
+    assert "primaria" in caplog.text
+    assert "backup" in caplog.text

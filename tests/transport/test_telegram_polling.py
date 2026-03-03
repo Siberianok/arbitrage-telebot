@@ -223,8 +223,11 @@ def test_build_health_payload_reports_telegram_polling_alive(monkeypatch):
     monkeypatch.setattr(bot, "LAST_TELEGRAM_SEND_TS", 0, raising=False)
     monkeypatch.setattr(bot, "TELEGRAM_POLL_HEARTBEAT_TS", 0.0, raising=False)
 
-    with bot.STATE_LOCK:
-        bot.DASHBOARD_STATE["last_run_summary"] = {"ts": 1, "ts_str": "1970-01-01T00:00:01Z"}
+    bot.RUNTIME_STATE.update_run_state(
+        summary={"ts": 1, "ts_str": "1970-01-01T00:00:01Z"},
+        exchange_health={},
+        new_alerts=[],
+    )
 
     payload = bot.build_health_payload()
 
@@ -251,8 +254,11 @@ def test_build_health_payload_marks_degraded_when_telegram_poll_stale(monkeypatc
 
     monkeypatch.setattr(bot, "time", _FakeTime())
 
-    with bot.STATE_LOCK:
-        bot.DASHBOARD_STATE["last_run_summary"] = {"ts": 150.0, "ts_str": "1970-01-01T00:02:30Z"}
+    bot.RUNTIME_STATE.update_run_state(
+        summary={"ts": 150.0, "ts_str": "1970-01-01T00:02:30Z"},
+        exchange_health={},
+        new_alerts=[],
+    )
 
     payload = bot.build_health_payload()
 
@@ -279,19 +285,28 @@ def test_health_status_code_returns_503_on_stale_live_check():
     assert bot.health_status_code("/health", payload) == 200
 
 
-def test_build_health_payload_can_hide_diagnostics(monkeypatch):
-    monkeypatch.setattr(bot, "PROCESS_ROLE", "telegram-worker")
-    monkeypatch.setattr(bot, "metrics_snapshot", lambda: {})
-    monkeypatch.setattr(bot, "TELEGRAM_POLLING_THREAD", type("Alive", (), {"is_alive": lambda self: True})())
-    monkeypatch.setattr(bot, "SCANNER_LOOP_THREAD", None)
-    monkeypatch.setattr(bot, "LAST_TELEGRAM_SEND_TS", 0, raising=False)
-    monkeypatch.setattr(bot, "TELEGRAM_POLL_HEARTBEAT_TS", 0.0, raising=False)
+def test_api_state_payload_contains_summary_and_alerts_after_run_once(monkeypatch):
+    runtime_state = bot.RuntimeState()
+    monkeypatch.setattr(bot, "RUNTIME_STATE", runtime_state)
 
-    with bot.STATE_LOCK:
-        bot.DASHBOARD_STATE["last_run_summary"] = {"ts": 1, "ts_str": "1970-01-01T00:00:01Z"}
+    def fake_run_once():
+        bot.RUNTIME_STATE.update_run_state(
+            summary={"ts": 123, "ts_str": "1970-01-01T00:02:03Z", "alerts_sent": 1},
+            exchange_health={"binance": {"attempts": 1}},
+            new_alerts=[{"ts": 123, "message": "alert"}],
+        )
 
-    payload = bot.build_health_payload(include_diagnostics=False)
+    fake_run_once()
 
-    assert "latest_alerts" not in payload
-    assert "latest_quotes" not in payload
-    assert "quote_discards" not in payload
+    handler = bot.DashboardHandler.__new__(bot.DashboardHandler)
+    handler.path = "/api/state"
+    handler.headers = {}
+    sent = {}
+    handler._require_authentication = lambda: True
+    handler._send_json = lambda payload, status=200: sent.update({"payload": payload, "status": status})
+
+    handler.do_GET()
+
+    assert sent["status"] == 200
+    assert sent["payload"]["last_run_summary"]
+    assert sent["payload"]["latest_alerts"]

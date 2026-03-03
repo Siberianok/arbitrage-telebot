@@ -1,4 +1,4 @@
-"""Compatibility wrapper for runtime state."""
+"""Thread-safe runtime state store for dashboard and polling consumers."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ class RuntimeState:
         self._latest_quotes: Dict[str, Dict[str, Any]] = {}
         self._last_quote_latency_ms: Optional[int] = None
         self._last_quote_count: int = 0
-        self._quote_discards: List[Dict[str, Any]] = []
 
     def set_config_snapshot(self, snapshot: Dict[str, Any]) -> None:
         with self._lock:
@@ -31,25 +30,17 @@ class RuntimeState:
         with self._lock:
             self._analysis = copy.deepcopy(analysis) if analysis is not None else None
 
-    def merge_analysis(self, fields: Dict[str, Any]) -> None:
-        with self._lock:
-            base = copy.deepcopy(self._analysis) if self._analysis is not None else {}
-            base.update(copy.deepcopy(fields))
-            self._analysis = base
-
     def update_last_quote_state(
         self,
         *,
         quote_latency_ms: int,
         quote_count: int,
         latest_quotes: Dict[str, Dict[str, Any]],
-        quote_discards: Optional[Iterable[Dict[str, Any]]] = None,
     ) -> None:
         with self._lock:
             self._last_quote_latency_ms = int(quote_latency_ms)
             self._last_quote_count = int(quote_count)
             self._latest_quotes = copy.deepcopy(latest_quotes)
-            self._quote_discards = copy.deepcopy(list(quote_discards or []))[:200]
 
     def update_run_state(
         self,
@@ -74,7 +65,6 @@ class RuntimeState:
                 "latest_quotes": copy.deepcopy(self._latest_quotes),
                 "last_quote_latency_ms": self._last_quote_latency_ms,
                 "last_quote_count": self._last_quote_count,
-                "quote_discards": copy.deepcopy(self._quote_discards[:50]),
                 "exchange_health": copy.deepcopy(self._exchange_health),
             }
 
@@ -86,7 +76,6 @@ class RuntimeState:
                 "config_snapshot": copy.deepcopy(self._config_snapshot),
                 "exchange_metrics": copy.deepcopy(self._exchange_health),
                 "analysis": copy.deepcopy(self._analysis),
-                "quote_discards": copy.deepcopy(self._quote_discards),
             }
 
 
