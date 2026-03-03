@@ -1761,6 +1761,59 @@ COMMANDS_HELP: List[Tuple[str, str]] = [
 ]
 
 
+# =========================
+# Telegram text design system
+# =========================
+TG_STYLE = {
+    "prefix": {
+        "INFO": "ℹ️",
+        "ALERTA": "⚠️",
+        "ERROR": "❌",
+        "OK": "✅",
+    },
+    "separator": {
+        "line": "━━━━━━━━━━━━━━━━━━━━",
+        "soft": "────────────────────",
+    },
+    "title": {
+        1: "{prefix} *{title}*",
+        2: "*{title}*",
+        3: "_{title}_",
+    },
+    "number": {
+        "decimal": lambda value, decimals=2: format_decimal_comma(value, decimals=decimals),
+        "percent": lambda value: format_percent_comma(value),
+        "currency": lambda value, symbol="USDT", decimals=2: (
+            f"{format_decimal_comma(value, decimals=decimals)} {symbol}"
+        ),
+    },
+}
+
+
+def render_header(title: str, level: int = 1, kind: str = "INFO") -> str:
+    prefix = TG_STYLE["prefix"].get(kind, TG_STYLE["prefix"]["INFO"])
+    template = TG_STYLE["title"].get(level, TG_STYLE["title"][1])
+    return template.format(prefix=prefix, title=title)
+
+
+def render_kv(label: str, value: str) -> str:
+    return f"*{label}:* {value}"
+
+
+def render_section(title: str, lines: List[str]) -> str:
+    section_lines = [render_header(title, level=2), TG_STYLE["separator"]["soft"]]
+    section_lines.extend(lines)
+    return "\n".join(section_lines)
+
+
+def render_footer(timestamp: float, signal_id: Optional[str] = None) -> str:
+    ts_label = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+    footer_lines = [TG_STYLE["separator"]["line"], render_kv("Actualizado", ts_label)]
+    if signal_id:
+        footer_lines.append(render_kv("Signal ID", signal_id))
+    return "\n".join(footer_lines)
+
+
 def format_command_help() -> str:
     command_lines = [f"- {command}: {description}" for command, description in COMMANDS_HELP]
     aliases = (
@@ -3196,11 +3249,24 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
     register_telegram_chat(chat_id)
 
     if command == "/start":
-        response = (
-            "Hola! Ya estás registrado para recibir señales.\n"
-            f"Threshold base: {CONFIG['threshold_percent']:.3f}% | dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
-            f"{format_command_help()}"
-        )
+        response = "\n".join([
+            render_header("Bot registrado", level=1, kind="OK"),
+            render_kv("Estado", "Ya estás listo para recibir señales"),
+            render_kv("Threshold base", TG_STYLE["number"]["percent"](CONFIG["threshold_percent"])),
+            render_kv("Threshold dinámico", TG_STYLE["number"]["percent"](DYNAMIC_THRESHOLD_PERCENT)),
+            TG_STYLE["separator"]["line"],
+            render_section(
+                "Comandos",
+                [f"- {command}: {description}" for command, description in COMMANDS_HELP]
+                + [
+                    (
+                        "Aliases: /listapares → /pairs, /adherirpar → /addpair, "
+                        "/eliminarpar → /delpair, /senalprueba → /test"
+                    ),
+                ],
+            ),
+            render_footer(time.time()),
+        ])
         tg_send_message(
             response,
             enabled=enabled,
@@ -3221,13 +3287,15 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
                 f"SR: {LATEST_ANALYSIS.success_rate*100:.1f}%"
                 f" ({LATEST_ANALYSIS.rows_considered} señales)"
             )
-        response = (
-            "Estado actual:\n"
-            f"Umbral mínimo de ganancia: {format_decimal_comma(CONFIG['threshold_percent'], decimals=2)}% en adelante\n"
-            f"Threshold dinámico actual: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
-            f"Histórico: {analysis_summary}\n"
-            f"Pares ({len(pairs)}): {', '.join(pairs) if pairs else 'sin pares'}"
-        )
+        response = "\n".join([
+            render_header("Estado actual", level=1, kind="INFO"),
+            render_kv("Umbral mínimo", f"{TG_STYLE['number']['percent'](CONFIG['threshold_percent'])} en adelante"),
+            render_kv("Threshold dinámico", TG_STYLE["number"]["percent"](DYNAMIC_THRESHOLD_PERCENT)),
+            render_kv("Histórico", analysis_summary),
+            render_kv("Cantidad de pares", str(len(pairs))),
+            render_kv("Pares", ", ".join(pairs) if pairs else "sin pares"),
+            render_footer(time.time()),
+        ])
         tg_send_message(response, enabled=enabled, chat_id=chat_id)
         return
 
@@ -3235,7 +3303,11 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         if not argument:
             capital = float(CONFIG.get("simulation_capital_quote", 0.0))
             tg_send_message(
-                f"Capital simulado actual: {format_decimal_comma(capital, decimals=2)} USDT",
+                "\n".join([
+                    render_header("Capital simulado", level=1, kind="INFO"),
+                    render_kv("Capital actual", TG_STYLE["number"]["currency"](capital)),
+                    render_footer(time.time()),
+                ]),
                 enabled=enabled,
                 chat_id=chat_id,
             )
@@ -3252,14 +3324,23 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             value = float(cleaned)
         except ValueError:
             tg_send_message(
-                "Valor inválido. Ej: /capital 2500 o /capital 2.500,50",
+                "\n".join([
+                    render_header("Capital inválido", level=1, kind="ERROR"),
+                    render_kv("Formato esperado", "/capital 2500"),
+                    render_kv("Formato alternativo", "/capital 2.500,50"),
+                    render_footer(time.time()),
+                ]),
                 enabled=enabled,
                 chat_id=chat_id,
             )
             return
         if value <= 0:
             tg_send_message(
-                "El capital debe ser mayor a 0.",
+                "\n".join([
+                    render_header("Capital inválido", level=1, kind="ERROR"),
+                    render_kv("Regla", "El capital debe ser mayor a 0"),
+                    render_footer(time.time()),
+                ]),
                 enabled=enabled,
                 chat_id=chat_id,
             )
@@ -3269,10 +3350,11 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             persist_runtime_config()
         refresh_config_snapshot()
         tg_send_message(
-            (
-                "Nuevo capital simulado guardado: "
-                f"{format_decimal_comma(value, decimals=2)} USDT"
-            ),
+            "\n".join([
+                render_header("Capital actualizado", level=1, kind="OK"),
+                render_kv("Nuevo capital", TG_STYLE["number"]["currency"](value)),
+                render_footer(time.time()),
+            ]),
             enabled=enabled,
             chat_id=chat_id,
         )
@@ -3281,10 +3363,26 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
     if command in ("/pairs", "/listapares"):
         pairs = CONFIG["pairs"]
         if not pairs:
-            tg_send_message("No hay pares configurados.", enabled=enabled, chat_id=chat_id)
+            tg_send_message(
+                "\n".join([
+                    render_header("Pares configurados", level=1, kind="ALERTA"),
+                    render_kv("Estado", "No hay pares configurados"),
+                    render_footer(time.time()),
+                ]),
+                enabled=enabled,
+                chat_id=chat_id,
+            )
         else:
-            formatted = "\n".join(f"- {p}" for p in pairs)
-            tg_send_message(f"Pares actuales:\n{formatted}", enabled=enabled, chat_id=chat_id)
+            tg_send_message(
+                "\n".join([
+                    render_header("Pares configurados", level=1, kind="INFO"),
+                    render_kv("Cantidad", str(len(pairs))),
+                    render_section("Listado", [f"- {pair}" for pair in pairs]),
+                    render_footer(time.time()),
+                ]),
+                enabled=enabled,
+                chat_id=chat_id,
+            )
         return
 
     if command in ("/addpair", "/adherirpar"):
@@ -3347,17 +3445,20 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
 
     if command == "/ranking":
         rankings = compute_reliability_rankings(limit=3)
-        lines = ["🏆 Ranking de confiabilidad"]
+        lines = [render_header("Ranking de confiabilidad", level=1, kind="INFO")]
         for kind, title in (("strategy", "Estrategia"), ("pair", "Par"), ("venue", "Venue")):
-            lines.append(f"\n*{title}:*")
             entries = rankings.get(kind, [])
             if not entries:
-                lines.append("- Sin datos")
+                lines.append(render_section(title, ["- Sin datos"]))
                 continue
+            section_lines: List[str] = []
             for item in entries:
-                lines.append(
-                    f"- `{item['key']}` | win={item['win_rate']*100:.1f}% | n={item['trades']} | Δ%={item['avg_delta_percent']:.2f}"
-                )
+                section_lines.append(f"- `Key`: `{item['key']}`")
+                section_lines.append(f"  - Win rate: {TG_STYLE['number']['percent'](item['win_rate'] * 100)}")
+                section_lines.append(f"  - Trades: {item['trades']}")
+                section_lines.append(f"  - Δ% promedio: {TG_STYLE['number']['percent'](item['avg_delta_percent'])}")
+            lines.append(render_section(title, section_lines))
+        lines.append(render_footer(time.time()))
         tg_send_message("\n".join(lines), enabled=enabled, chat_id=chat_id)
         return
 
