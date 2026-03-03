@@ -60,6 +60,16 @@ export WEB_AUTH_PASS="clave-segura"
 export STATE_DB_URL="sqlite:///state.db"
 ```
 
+Endurecimiento recomendado de seguridad web:
+
+```bash
+# Por defecto el bot exige auth para dashboard/API y /metrics
+export METRICS_PUBLIC="false"
+
+# Solo para desarrollo local (NO producción)
+export WEB_AUTH_OPTIONAL="false"
+```
+
 ### 3) Ejecutar
 
 **Monolítico (rápido):**
@@ -104,10 +114,12 @@ Al correr con `--web` se habilitan:
 - `/` dashboard autenticado
 - `/api/state` snapshot de estado
 - `/api/config` actualización de configuración (POST autenticado)
-- `/metrics` métricas Prometheus
-- `/health` salud integral
+- `/metrics` métricas Prometheus (**autenticado por defecto**, usar `METRICS_PUBLIC=true` solo si necesitás exposición pública)
+- `/health` salud integral (respuesta reducida, sin detalles sensibles)
 - `/live` liveness
 - `/ready` readiness
+
+> Seguridad: si corrés web en roles `api/scanner/telegram-worker`, el proceso aborta si faltan `WEB_AUTH_USER` y `WEB_AUTH_PASS` (excepto cuando `WEB_AUTH_OPTIONAL=true`, recomendado únicamente en desarrollo).
 
 ## 🧠 Threshold dinámico e inteligencia histórica
 
