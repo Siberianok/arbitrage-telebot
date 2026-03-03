@@ -1921,6 +1921,7 @@ def build_test_signal_message() -> str:
         capital_quote=capital,
         capital_used=capital_used,
         links=link_items,
+        signal_id="test-signal",
     )
 
     intro_lines = [
@@ -6604,6 +6605,88 @@ def format_venue_label(venue: str) -> str:
     return normalized.upper()
 
 
+def escape_telegram_markdown(text: Any) -> str:
+    value = str(text)
+    escaped = value.replace("\\", "\\\\")
+    for char in ("_", "*", "`", "["):
+        escaped = escaped.replace(char, f"\\{char}")
+    return escaped
+
+
+def confidence_badge(opp: Opportunity) -> str:
+    label = str(getattr(opp, "confidence_label", "media") or "media").strip().lower()
+    mapping = {
+        "alta": "Alta",
+        "high": "Alta",
+        "media": "Media",
+        "medium": "Media",
+        "baja": "Baja",
+        "low": "Baja",
+    }
+    pretty = mapping.get(label, label.capitalize() if label else "Media")
+    liquidity = format_decimal_comma(float(getattr(opp, "liquidity_score", 0.0)), decimals=2, min_int_digits=1)
+    volatility = format_decimal_comma(float(getattr(opp, "volatility_score", 0.0)), decimals=2, min_int_digits=1)
+    return f"Confianza: {pretty} · Liq {liquidity} · Vol {volatility}"
+
+
+def build_alert_details(opp: Opportunity) -> Optional[str]:
+    if not isinstance(opp.notes, dict):
+        return None
+
+    details: List[str] = []
+    fiat = opp.notes.get("fiat")
+    if fiat:
+        details.append(f"fiat `{escape_telegram_markdown(fiat)}`")
+
+    transfer_cost = opp.notes.get("transfer_cost_quote")
+    if transfer_cost is not None:
+        details.append(f"transfer `{format_decimal_comma(float(transfer_cost), decimals=2)} USDT`")
+
+    transfer_minutes = opp.notes.get("transfer_minutes")
+    if transfer_minutes is not None:
+        details.append(f"eta `{format_decimal_comma(float(transfer_minutes), decimals=1, min_int_digits=1)}m`")
+
+    if not details:
+        return None
+    return "*Detalles:* " + " · ".join(details)
+
+
+def build_alert_card_lines(
+    opp: Opportunity,
+    est_profit: float,
+    est_percent: float,
+    base_qty: float,
+    capital_used: float,
+    card_title: str,
+    signal_id: Optional[str] = None,
+) -> List[str]:
+    buy_label = escape_telegram_markdown(format_venue_label(opp.buy_venue))
+    sell_label = escape_telegram_markdown(format_venue_label(opp.sell_venue))
+    pair_label = escape_telegram_markdown(opp.pair)
+    signal_text = escape_telegram_markdown(signal_id) if signal_id else "n/a"
+    lines = [
+        f"{card_title} · *{escape_telegram_markdown(confidence_badge(opp))}*",
+        f"*Par/Ruta:* `{pair_label}` · Buy *{buy_label}* → Sell *{sell_label}*",
+        f"*Neto:* `{format_percent_comma(opp.net_percent)}` (est `{format_percent_comma(est_percent)}`)",
+        (
+            "*PnL/Capital:* "
+            f"`~{format_decimal_comma(est_profit, decimals=2)} USDT` · "
+            f"Usado `{format_decimal_comma(capital_used, decimals=2)} USDT` · "
+            f"Qty `{base_qty:.6f}`"
+        ),
+        (
+            "*Precios:* "
+            f"Entrada `{format_decimal_comma(opp.buy_price, decimals=6, min_int_digits=1)}` · "
+            f"Salida `{format_decimal_comma(opp.sell_price, decimals=6, min_int_digits=1)}`"
+        ),
+        f"*TS/ID:* `{time.strftime('%Y-%m-%d %H:%M:%S')}` · `{signal_text}`",
+    ]
+    details_line = build_alert_details(opp)
+    if details_line:
+        lines.append(details_line)
+    return lines
+
+
 def fmt_alert(
     opp: Opportunity,
     est_profit: float,
@@ -6612,6 +6695,7 @@ def fmt_alert(
     capital_quote: float,
     capital_used: float,
     links: Optional[List[Dict[str, str]]] = None,
+    signal_id: Optional[str] = None,
 ) -> str:
     strategy = getattr(opp, "strategy", "spot_spot")
     if strategy == "spot_p2p":
@@ -6621,34 +6705,20 @@ def fmt_alert(
     else:
         title = "🚨 *Arbitraje spot detectado*"
 
-    buy_label = format_venue_label(opp.buy_venue)
-    sell_label = format_venue_label(opp.sell_venue)
-
-    lines = [
+    lines = build_alert_card_lines(
+        opp,
+        est_profit,
+        est_percent,
+        base_qty,
+        capital_used,
         title,
-        f"*Par:* `{opp.pair}`",
-        f"*Ruta:* Comprar en *{buy_label}* a `{opp.buy_price:.6f}` · Vender en *{sell_label}* a `{opp.sell_price:.6f}`",
-        f"*Spreads:* bruto `{format_percent_comma(opp.gross_percent)}` · neto `{format_percent_comma(opp.net_percent)}`",
-        (
-            "*PnL estimado:* `~"
-            f"{format_decimal_comma(est_profit, decimals=2)} USDT` "
-            f"(`{format_percent_comma(est_percent)}`) sobre {format_decimal_comma(capital_quote, decimals=2)} USDT"
-        ),
-        f"*Cantidad base:* `{base_qty:.6f}` ({format_decimal_comma(capital_used, decimals=2)} USDT usados)",
-    ]
-    fiat = opp.notes.get("fiat") if isinstance(opp.notes, dict) else None
-    if fiat:
-        lines.append(f"*Fiat P2P:* `{fiat}`")
-    transfer_cost = opp.notes.get("transfer_cost_quote") if isinstance(opp.notes, dict) else None
-    transfer_minutes = opp.notes.get("transfer_minutes") if isinstance(opp.notes, dict) else None
-    if transfer_cost:
-        eta = f" · ETA `{transfer_minutes:.1f}m`" if transfer_minutes is not None else ""
-        lines.append(
-            "*Transferencia estimada:* `"
-            f"{format_decimal_comma(float(transfer_cost), decimals=2)} USDT`{eta}"
-        )
-    lines.append(time.strftime("%Y-%m-%d %H:%M:%S"))
-    return "\n".join(lines)
+        signal_id=signal_id,
+    )
+    alert_text = "\n".join(lines)
+    if len(alert_text) > 1200:
+        compact_lines = [line for line in lines if not line.startswith("*Detalles:*")]
+        alert_text = "\n".join(compact_lines)
+    return alert_text
 
 
 def fmt_test_alert_table(
@@ -6659,6 +6729,7 @@ def fmt_test_alert_table(
     capital_quote: float,
     capital_used: float,
     links: Optional[List[Dict[str, str]]] = None,
+    signal_id: Optional[str] = None,
 ) -> str:
     quick_actions: List[str] = []
     for item in links or []:
@@ -6667,36 +6738,20 @@ def fmt_test_alert_table(
         if label and url:
             quick_actions.append(label)
 
-    buy_label = format_venue_label(opp.buy_venue)
-    sell_label = format_venue_label(opp.sell_venue)
-    now_text = time.strftime("%Y-%m-%d %H:%M:%S")
-
-    lines = [
+    lines = build_alert_card_lines(
+        opp,
+        est_profit,
+        est_percent,
+        base_qty,
+        capital_used,
         "🚨 *Formato de alerta (test)*",
-        "📢 *Demo profesional del formato de alerta*",
-        "",
-        f"*Par:* `{opp.pair}`",
-        f"*Ruta sugerida:* Comprar en *{buy_label}* → Vender en *{sell_label}*",
-        (
-            "*Spreads:* "
-            f"Bruto `{format_percent_comma(opp.gross_percent)}` · "
-            f"Neto `{format_percent_comma(opp.net_percent)}`"
-        ),
-        (
-            "*PnL estimado:* "
-            f"`~{format_decimal_comma(est_profit, decimals=2)} USDT` "
-            f"(`{format_percent_comma(est_percent)}`)"
-        ),
-        (
-            "*Capital y tamaño:* "
-            f"`{format_decimal_comma(capital_quote, decimals=2)} USDT` · "
-            f"Qty `{base_qty:.6f}` · "
-            f"Usado `{format_decimal_comma(capital_used, decimals=2)} USDT`"
-        ),
-    ]
+        signal_id=signal_id,
+    )
+    lines.insert(1, "📢 *Demo profesional del formato de alerta*")
     if quick_actions:
         lines.append(f"*Acciones rápidas:* {' · '.join(quick_actions)}")
-    lines.append(f"*Fecha:* `{now_text}`")
+    if len("\n".join(lines)) > 1200:
+        lines = [line for line in lines if not line.startswith("*Acciones rápidas:*")]
 
     return "\n".join(lines)
 
@@ -7075,6 +7130,7 @@ def run_once() -> None:
                     opp.buy_depth,
                     opp.sell_depth,
                 )
+                signal_id = make_signal_id(opp)
                 msg = fmt_alert(
                     opp,
                     est_profit,
@@ -7083,8 +7139,8 @@ def run_once() -> None:
                     capital_for_pair,
                     capital_used,
                     link_items,
+                    signal_id=signal_id,
                 )
-                signal_id = make_signal_id(opp)
                 entry["signal_id"] = signal_id
                 SIGNAL_REGISTRY[signal_id] = dict(entry)
                 SIGNAL_REGISTRY[signal_id]["state"] = "detected"
@@ -7097,7 +7153,6 @@ def run_once() -> None:
                     sell_venue=opp.sell_venue,
                     est_pnl_quote=est_profit,
                 )
-                msg = f"{msg}\n*Signal ID:* `{signal_id}`"
                 reply_markup = build_trade_reply_markup(link_items)
                 tg_send_message(msg, enabled=tg_enabled, reply_markup=reply_markup)
                 SIGNAL_REGISTRY[signal_id]["state"] = "sent"
@@ -7256,6 +7311,7 @@ def run_once() -> None:
                     opp.buy_depth,
                     opp.sell_depth,
                 )
+                signal_id = make_signal_id(opp)
                 msg = fmt_alert(
                     opp,
                     est_profit,
@@ -7264,8 +7320,8 @@ def run_once() -> None:
                     capital_for_pair,
                     capital_used,
                     link_items,
+                    signal_id=signal_id,
                 )
-                signal_id = make_signal_id(opp)
                 entry["signal_id"] = signal_id
                 SIGNAL_REGISTRY[signal_id] = dict(entry)
                 SIGNAL_REGISTRY[signal_id]["state"] = "detected"
@@ -7278,7 +7334,6 @@ def run_once() -> None:
                     sell_venue=opp.sell_venue,
                     est_pnl_quote=est_profit,
                 )
-                msg = f"{msg}\n*Signal ID:* `{signal_id}`"
                 reply_markup = build_trade_reply_markup(link_items)
                 tg_send_message(msg, enabled=tg_enabled, reply_markup=reply_markup)
                 SIGNAL_REGISTRY[signal_id]["state"] = "sent"
@@ -7403,6 +7458,7 @@ def run_once() -> None:
                     None,
                     None,
                 )
+                signal_id = make_signal_id(opp)
                 msg = fmt_alert(
                     opp,
                     est_profit,
@@ -7411,8 +7467,8 @@ def run_once() -> None:
                     capital_for_pair,
                     capital_used,
                     link_items,
+                    signal_id=signal_id,
                 )
-                signal_id = make_signal_id(opp)
                 entry["signal_id"] = signal_id
                 SIGNAL_REGISTRY[signal_id] = dict(entry)
                 SIGNAL_REGISTRY[signal_id]["state"] = "detected"
@@ -7425,7 +7481,6 @@ def run_once() -> None:
                     sell_venue=opp.sell_venue,
                     est_pnl_quote=est_profit,
                 )
-                msg = f"{msg}\n*Signal ID:* `{signal_id}`"
                 reply_markup = build_trade_reply_markup(link_items)
                 tg_send_message(msg, enabled=tg_enabled, reply_markup=reply_markup)
                 SIGNAL_REGISTRY[signal_id]["state"] = "sent"
