@@ -1469,6 +1469,7 @@ RUNTIME_STATE = RuntimeState()
 
 WEB_AUTH_USER = os.getenv("WEB_AUTH_USER", "").strip()
 WEB_AUTH_PASS = os.getenv("WEB_AUTH_PASS", "").strip()
+WEB_AUTH_OPTIONAL = os.getenv("WEB_AUTH_OPTIONAL", "").strip().lower() in {"1", "true", "yes", "on"}
 
 LATEST_ANALYSIS: Optional[Any] = None
 LAST_TELEGRAM_SEND_TS: float = 0.0
@@ -2357,7 +2358,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _require_authentication(self) -> bool:
         if not WEB_AUTH_USER and not WEB_AUTH_PASS:
-            return True
+            if WEB_AUTH_OPTIONAL:
+                return True
+            self._send_unauthorized()
+            return False
         auth_header = self.headers.get("Authorization", "")
         if not auth_header.startswith("Basic "):
             self._send_unauthorized()
@@ -7618,6 +7622,7 @@ def _run_scanner_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
     ensure_keepalive_thread()
 
     if args.web:
+        ensure_web_startup_requirements("scanner", args.web)
         SCANNER_LOOP_THREAD = threading.Thread(
             target=run_loop_forever,
             args=(args.interval,),
@@ -7640,6 +7645,7 @@ def _run_scanner_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
 
 
 def _run_api_mode(args: argparse.Namespace) -> None:
+    ensure_web_startup_requirements("api", args.web)
     serve_http(args.port)
 
 
@@ -7666,8 +7672,48 @@ def ensure_telegram_startup_requirements(role: str, tg_enabled: bool) -> None:
     raise SystemExit(1)
 
 
+def ensure_web_startup_requirements(role: str, web_enabled: bool) -> None:
+    """Valida precondiciones obligatorias para exponer dashboard/API HTTP."""
+
+    if role not in ("all", "api", "scanner", "telegram-worker"):
+        return
+    if not web_enabled:
+        return
+    if WEB_AUTH_OPTIONAL:
+        return
+    if WEB_AUTH_USER and WEB_AUTH_PASS:
+        return
+    if role == "scanner":
+        log_event(
+            "web.startup.missing_auth_scanner_mode",
+            role=role,
+            web_auth_optional=WEB_AUTH_OPTIONAL,
+            user_set=bool(WEB_AUTH_USER),
+            pass_set=bool(WEB_AUTH_PASS),
+        )
+        print(
+            "Startup: web sin credenciales en role=scanner; sólo /health queda utilizable hasta configurar WEB_AUTH_USER/WEB_AUTH_PASS."
+        )
+        return
+
+    message = (
+        "Startup abortado: interfaz web habilitada sin credenciales de autenticación. "
+        "Definí WEB_AUTH_USER y WEB_AUTH_PASS o, sólo en desarrollo, WEB_AUTH_OPTIONAL=true."
+    )
+    log_event(
+        "web.startup.missing_auth",
+        role=role,
+        web_auth_optional=WEB_AUTH_OPTIONAL,
+        user_set=bool(WEB_AUTH_USER),
+        pass_set=bool(WEB_AUTH_PASS),
+    )
+    print(message)
+    raise SystemExit(1)
+
+
 def _run_telegram_worker_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
     ensure_telegram_startup_requirements("telegram-worker", tg_enabled)
+    ensure_web_startup_requirements("telegram-worker", args.web)
 
     if tg_enabled:
         tg_sync_command_menu(enabled=True)

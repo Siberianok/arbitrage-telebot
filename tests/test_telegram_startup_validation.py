@@ -73,3 +73,19 @@ def test_ensure_web_startup_requirements_skips_when_auth_present(monkeypatch):
     monkeypatch.setattr(bot, "WEB_AUTH_PASS", "pass")
 
     bot.ensure_web_startup_requirements("api", web_enabled=True)
+
+
+def test_ensure_web_startup_requirements_scanner_mode_warns_without_auth(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(bot, "WEB_AUTH_OPTIONAL", False)
+    monkeypatch.setattr(bot, "WEB_AUTH_USER", "")
+    monkeypatch.setattr(bot, "WEB_AUTH_PASS", "")
+    monkeypatch.setattr(bot, "log_event", lambda event, **payload: events.append((event, payload)))
+
+    bot.ensure_web_startup_requirements("scanner", web_enabled=True)
+
+    assert events
+    event, payload = events[0]
+    assert event == "web.startup.missing_auth_scanner_mode"
+    assert payload["role"] == "scanner"

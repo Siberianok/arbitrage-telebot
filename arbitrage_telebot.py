@@ -7705,6 +7705,18 @@ def ensure_web_startup_requirements(role: str, web_enabled: bool) -> None:
         return
     if WEB_AUTH_USER and WEB_AUTH_PASS:
         return
+    if role == "scanner":
+        log_event(
+            "web.startup.missing_auth_scanner_mode",
+            role=role,
+            web_auth_optional=WEB_AUTH_OPTIONAL,
+            user_set=bool(WEB_AUTH_USER),
+            pass_set=bool(WEB_AUTH_PASS),
+        )
+        print(
+            "Startup: web sin credenciales en role=scanner; sólo /health queda utilizable hasta configurar WEB_AUTH_USER/WEB_AUTH_PASS."
+        )
+        return
 
     message = (
         "Startup abortado: interfaz web habilitada sin credenciales de autenticación. "

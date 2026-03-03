@@ -119,7 +119,7 @@ Al correr con `--web` se habilitan:
 - `/live` liveness
 - `/ready` readiness
 
-> Seguridad: si corrés web en roles `api/scanner/telegram-worker`, el proceso aborta si faltan `WEB_AUTH_USER` y `WEB_AUTH_PASS` (excepto cuando `WEB_AUTH_OPTIONAL=true`, recomendado únicamente en desarrollo).
+> Seguridad: si corrés web en roles `api/telegram-worker`, el proceso aborta si faltan `WEB_AUTH_USER` y `WEB_AUTH_PASS` (excepto cuando `WEB_AUTH_OPTIONAL=true`, recomendado únicamente en desarrollo). En `role=scanner` sin credenciales se mantiene disponible sólo `/health`, `/live` y `/ready` hasta configurar autenticación.
 
 ## 🧠 Threshold dinámico e inteligencia histórica
 
