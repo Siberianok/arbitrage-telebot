@@ -153,7 +153,17 @@ Para evitar suspensión en entornos con idling:
 pytest
 ```
 
-La suite cubre conectividad de adapters, observabilidad, ciclo de señales, estado runtime, polling de Telegram, keepalive y persistencia/configuración.
+Por defecto `pytest` ejecuta solo unit tests (`-m "not integration"`) para mantener la suite rápida y offline.
+
+Para correr tests de integración de red (adapters contra APIs reales) on-demand:
+
+```bash
+env -u SKIP_NETWORK_TESTS pytest -m integration tests/adapters/test_connectivity.py
+```
+
+> Nota: `SKIP_NETWORK_TESTS` controla el apagado explícito de conectividad real. Si está definida (con cualquier valor), los tests de red se saltan.
+
+La suite cubre conectividad de adapters, smoke tests offline con mocks del contrato de adapters, observabilidad, ciclo de señales, estado runtime, polling de Telegram, keepalive y persistencia/configuración.
 
 ## 📚 Documentación adicional
 
