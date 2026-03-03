@@ -1469,6 +1469,8 @@ RUNTIME_STATE = RuntimeState()
 
 WEB_AUTH_USER = os.getenv("WEB_AUTH_USER", "").strip()
 WEB_AUTH_PASS = os.getenv("WEB_AUTH_PASS", "").strip()
+WEB_AUTH_OPTIONAL = os.getenv("WEB_AUTH_OPTIONAL", "").strip().lower() in {"1", "true", "yes", "on"}
+METRICS_PUBLIC = os.getenv("METRICS_PUBLIC", "").strip().lower() in {"1", "true", "yes", "on"}
 
 LATEST_ANALYSIS: Optional[Any] = None
 LAST_TELEGRAM_SEND_TS: float = 0.0
@@ -1991,7 +1993,7 @@ refresh_config_snapshot()
 # =========================
 
 
-def build_health_payload() -> Dict[str, Any]:
+def build_health_payload(include_diagnostics: bool = True) -> Dict[str, Any]:
     now = time.time()
     now_monotonic = time.monotonic()
     metrics = metrics_snapshot()
@@ -2080,6 +2082,10 @@ def build_health_payload() -> Dict[str, Any]:
             "checks": checks,
         },
     }
+    if not include_diagnostics:
+        payload.pop("latest_alerts", None)
+        payload.pop("latest_quotes", None)
+        payload.pop("quote_discards", None)
     return payload
 
 
@@ -2357,7 +2363,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _require_authentication(self) -> bool:
         if not WEB_AUTH_USER and not WEB_AUTH_PASS:
-            return True
+            if WEB_AUTH_OPTIONAL:
+                return True
+            self._send_unauthorized()
+            return False
         auth_header = self.headers.get("Authorization", "")
         if not auth_header.startswith("Basic "):
             self._send_unauthorized()
@@ -2387,6 +2396,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         body = html.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'",
+        )
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -2398,7 +2414,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         if self._is_healthcheck():
-            payload = build_health_payload()
+            payload = build_health_payload(include_diagnostics=False)
             self.send_response(health_status_code(self.path, payload))
             self.end_headers()
             return
@@ -2409,7 +2425,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self._is_healthcheck():
-            payload = build_health_payload()
+            payload = build_health_payload(include_diagnostics=False)
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(health_status_code(self.path, payload))
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2424,6 +2440,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_html(DASHBOARD_HTML)
             return
         if self.path == "/metrics":
+            if not METRICS_PUBLIC and not self._require_authentication():
+                return
             body = generate_latest(PROM_REGISTRY)
             self.send_response(200)
             self.send_header("Content-Type", CONTENT_TYPE_LATEST)
@@ -3321,7 +3339,21 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
 
     if command in ("/test", "/senalprueba"):
         link_items = build_trade_link_items("binance", "bybit", "BTC/USDT")
-        reply_markup = tg_inline_keyboard_from_link_items(link_items)
+        title_items: List[Dict[str, str]] = []
+        for item in link_items[:2]:
+            action = str(item.get("action", "")).strip() if isinstance(item, dict) else ""
+            venue = str(item.get("venue", "")).strip() if isinstance(item, dict) else ""
+            url = str(item.get("url", "")).strip() if isinstance(item, dict) else ""
+            if not action or not venue or not url:
+                continue
+            title_venue = {
+                "binance": "Binance",
+                "bybit": "Bybit",
+                "kucoin": "KuCoin",
+                "okx": "OKX",
+            }.get(venue.lower(), venue.title())
+            title_items.append({"label": f"{action} en {title_venue}", "url": url})
+        reply_markup = tg_inline_keyboard_from_link_items(title_items)
         tg_send_message(
             build_test_signal_message(),
             enabled=enabled,
@@ -4108,13 +4140,73 @@ def build_trade_link(venue: str, pair: str, device: str = "desktop") -> Optional
 def build_trade_link_items(buy_venue: str, sell_venue: str, pair: str) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
 
-    buy_link = build_trade_link(buy_venue, pair, device="desktop")
-    if buy_link:
-        items.append({"label": f"Comprar en {format_venue_label(buy_venue)}", "url": buy_link})
-    sell_link = build_trade_link(sell_venue, pair)
-    if sell_link:
-        items.append({"label": f"Vender en {format_venue_label(sell_venue)}", "url": sell_link})
+    def _append(action: str, venue: str, device: str) -> None:
+        link = build_trade_link(venue, pair, device=device)
+        if not link:
+            return
+        items.append(
+            {
+                "action": action,
+                "venue": venue,
+                "device": device,
+                "label": f"{action} en {format_venue_label(venue)}",
+                "url": link,
+            }
+        )
+
+    _append("Comprar", buy_venue, "desktop")
+    _append("Vender", sell_venue, "desktop")
+
+    include_mobile = _has_device_trade_link(buy_venue, pair, "mobile") or _has_device_trade_link(
+        sell_venue, pair, "mobile"
+    )
+    if include_mobile:
+        _append("Comprar", buy_venue, "mobile")
+        _append("Vender", sell_venue, "mobile")
+
     return items
+
+
+def build_trade_links_inline_keyboard(
+    link_items: Optional[List[Dict[str, str]]],
+) -> Optional[Dict[str, List[List[Dict[str, str]]]]]:
+    if not link_items:
+        return None
+
+    buckets: Dict[str, List[Dict[str, str]]] = {"desktop": [], "mobile": []}
+    for item in link_items:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action", "")).strip()
+        venue = str(item.get("venue", "")).strip()
+        device = str(item.get("device", "desktop")).strip().lower() or "desktop"
+        url = str(item.get("url", "")).strip()
+        if not action or not venue or not url:
+            continue
+        if device not in buckets:
+            buckets[device] = []
+        device_label = "Móvil" if device == "mobile" else "Desktop"
+        title_venue = {
+            "binance": "Binance",
+            "bybit": "Bybit",
+            "kucoin": "KuCoin",
+            "okx": "OKX",
+        }.get(venue.lower(), venue.title())
+        buckets[device].append(
+            {
+                "text": f"{action} ({title_venue} · {device_label})",
+                "url": url,
+            }
+        )
+
+    rows: List[List[Dict[str, str]]] = []
+    for device in ("desktop", "mobile"):
+        if buckets.get(device):
+            rows.append(buckets[device])
+
+    if not rows:
+        return None
+    return {"inline_keyboard": rows}
 
 
 def tg_inline_keyboard_from_link_items(
@@ -4134,6 +4226,27 @@ def tg_inline_keyboard_from_link_items(
     if not keyboard:
         return None
 
+    return {"inline_keyboard": keyboard}
+
+
+def build_trade_reply_markup(
+    link_items: Optional[List[Dict[str, str]]],
+) -> Optional[Dict[str, List[List[Dict[str, str]]]]]:
+    """Compat helper: construye inline keyboard simple para envío por Telegram."""
+
+    if not link_items:
+        return None
+    keyboard: List[List[Dict[str, str]]] = []
+    for item in link_items[:2]:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label", "")).strip()
+        url = str(item.get("url", "")).strip()
+        if not label or not url:
+            continue
+        keyboard.append([{"text": label, "url": url}])
+    if not keyboard:
+        return None
     return {"inline_keyboard": keyboard}
 
 
@@ -6665,7 +6778,12 @@ def fmt_test_alert_table(
         label = str(item.get("label", "")).strip() if isinstance(item, dict) else ""
         url = str(item.get("url", "")).strip() if isinstance(item, dict) else ""
         if label and url:
-            quick_actions.append(label)
+            quick_actions.append(
+                label.replace("BINANCE", "Binance")
+                .replace("BYBIT", "Bybit")
+                .replace("KUCOIN", "KuCoin")
+                .replace("OKX", "OKX")
+            )
 
     buy_label = format_venue_label(opp.buy_venue)
     sell_label = format_venue_label(opp.sell_venue)
@@ -7529,6 +7647,8 @@ def run_once() -> None:
 def _run_scanner_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
     global SCANNER_LOOP_THREAD
 
+    ensure_web_startup_requirements("scanner", args.web)
+
     if tg_enabled:
         tg_sync_command_menu(enabled=True)
         tg_send_message(
@@ -7562,6 +7682,7 @@ def _run_scanner_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
 
 
 def _run_api_mode(args: argparse.Namespace) -> None:
+    ensure_web_startup_requirements("api", args.web)
     serve_http(args.port)
 
 
@@ -7588,8 +7709,36 @@ def ensure_telegram_startup_requirements(role: str, tg_enabled: bool) -> None:
     raise SystemExit(1)
 
 
+def ensure_web_startup_requirements(role: str, web_enabled: bool) -> None:
+    """Valida precondiciones obligatorias para exponer dashboard/API HTTP."""
+
+    if role not in ("all", "api", "scanner", "telegram-worker"):
+        return
+    if not web_enabled:
+        return
+    if WEB_AUTH_OPTIONAL:
+        return
+    if WEB_AUTH_USER and WEB_AUTH_PASS:
+        return
+
+    message = (
+        "Startup abortado: interfaz web habilitada sin credenciales de autenticación. "
+        "Definí WEB_AUTH_USER y WEB_AUTH_PASS o, sólo en desarrollo, WEB_AUTH_OPTIONAL=true."
+    )
+    log_event(
+        "web.startup.missing_auth",
+        role=role,
+        web_auth_optional=WEB_AUTH_OPTIONAL,
+        user_set=bool(WEB_AUTH_USER),
+        pass_set=bool(WEB_AUTH_PASS),
+    )
+    print(message)
+    raise SystemExit(1)
+
+
 def _run_telegram_worker_mode(args: argparse.Namespace, tg_enabled: bool) -> None:
     ensure_telegram_startup_requirements("telegram-worker", tg_enabled)
+    ensure_web_startup_requirements("telegram-worker", args.web)
 
     if tg_enabled:
         tg_sync_command_menu(enabled=True)

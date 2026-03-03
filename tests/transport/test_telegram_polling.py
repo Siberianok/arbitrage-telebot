@@ -277,3 +277,21 @@ def test_health_status_code_returns_503_on_stale_live_check():
 
     assert bot.health_status_code("/live", payload) == 503
     assert bot.health_status_code("/health", payload) == 200
+
+
+def test_build_health_payload_can_hide_diagnostics(monkeypatch):
+    monkeypatch.setattr(bot, "PROCESS_ROLE", "telegram-worker")
+    monkeypatch.setattr(bot, "metrics_snapshot", lambda: {})
+    monkeypatch.setattr(bot, "TELEGRAM_POLLING_THREAD", type("Alive", (), {"is_alive": lambda self: True})())
+    monkeypatch.setattr(bot, "SCANNER_LOOP_THREAD", None)
+    monkeypatch.setattr(bot, "LAST_TELEGRAM_SEND_TS", 0, raising=False)
+    monkeypatch.setattr(bot, "TELEGRAM_POLL_HEARTBEAT_TS", 0.0, raising=False)
+
+    with bot.STATE_LOCK:
+        bot.DASHBOARD_STATE["last_run_summary"] = {"ts": 1, "ts_str": "1970-01-01T00:00:01Z"}
+
+    payload = bot.build_health_payload(include_diagnostics=False)
+
+    assert "latest_alerts" not in payload
+    assert "latest_quotes" not in payload
+    assert "quote_discards" not in payload
