@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ except Exception:  # pragma: no cover - optional dependency
     yaml = None
 
 RUNTIME_CONFIG_VERSION = 1
+LOGGER = logging.getLogger(__name__)
 
 
 def utc_now_iso() -> str:
@@ -130,11 +132,14 @@ def apply_runtime_overrides(base_config: Dict[str, Any], runtime_payload: Dict[s
 
 
 def load_config_with_runtime(base_config: Dict[str, Any], runtime_path: Path) -> Tuple[Dict[str, Any], bool]:
-    if not runtime_path.exists():
+    def _base_with_runtime_defaults() -> Dict[str, Any]:
         config = copy.deepcopy(base_config)
         config.setdefault("config_version", RUNTIME_CONFIG_VERSION)
         config.setdefault("updated_at", utc_now_iso())
-        return config, False
+        return config
+
+    if not runtime_path.exists():
+        return _base_with_runtime_defaults(), False
 
     backup_path = runtime_path.with_suffix(runtime_path.suffix + ".bak")
 
@@ -144,17 +149,28 @@ def load_config_with_runtime(base_config: Dict[str, Any], runtime_path: Path) ->
         if runtime_payload:
             write_runtime_config(runtime_path, runtime_payload)
         return merged, True
-    except Exception:
-        if backup_path.exists():
+    except Exception as primary_exc:
+        LOGGER.warning(
+            "No se pudo cargar configuración runtime primaria desde %s: %s",
+            runtime_path,
+            primary_exc,
+        )
+
+    if backup_path.exists():
+        try:
             backup_payload = _read_raw(backup_path)
             merged = apply_runtime_overrides(base_config, backup_payload)
             write_runtime_config(runtime_path, backup_payload)
             return merged, True
+        except Exception as backup_exc:
+            LOGGER.error(
+                "No se pudo cargar configuración runtime de backup desde %s tras fallo de primario (%s): %s",
+                backup_path,
+                runtime_path,
+                backup_exc,
+            )
 
-    config = copy.deepcopy(base_config)
-    config.setdefault("config_version", RUNTIME_CONFIG_VERSION)
-    config.setdefault("updated_at", utc_now_iso())
-    return config, False
+    return _base_with_runtime_defaults(), False
 
 
 def write_runtime_config(runtime_path: Path, runtime_payload: Dict[str, Any]) -> None:
