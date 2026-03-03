@@ -1760,6 +1760,10 @@ COMMANDS_HELP: List[Tuple[str, str]] = [
     ("/test", "Señal de prueba"),
 ]
 
+MAIN_MENU_LABEL = "🏠 Volver al menú principal"
+CONFIRM_YES_LABEL = "✅ Confirmar"
+CONFIRM_NO_LABEL = "❌ Cancelar"
+
 
 def format_command_help() -> str:
     command_lines = [f"- {command}: {description}" for command, description in COMMANDS_HELP]
@@ -1786,6 +1790,7 @@ def tg_commands_reply_markup() -> Dict[str, Any]:
             row = []
     if row:
         keyboard.append(row)
+    keyboard.append([{"text": MAIN_MENU_LABEL}])
 
     return {
         "keyboard": keyboard,
@@ -1854,12 +1859,31 @@ def build_pairs_reply_keyboard(pairs: Iterable[str]) -> Dict[str, Any]:
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([{"text": "⬅️ Volver"}])
+    keyboard.append([{"text": "⬅️ Volver"}, {"text": MAIN_MENU_LABEL}])
     return {
         "keyboard": keyboard,
         "resize_keyboard": True,
         "one_time_keyboard": True,
     }
+
+
+def build_confirm_reply_keyboard() -> Dict[str, Any]:
+    return {
+        "keyboard": [
+            [{"text": CONFIRM_YES_LABEL}, {"text": CONFIRM_NO_LABEL}],
+            [{"text": MAIN_MENU_LABEL}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def build_success_message(title: str, detail: str, next_step: str = "/pairs") -> str:
+    return f"✅ {title}\n{detail}\n\nSiguiente paso: {next_step}"
+
+
+def build_error_message(cause: str, example: str, next_step: str = "/start") -> str:
+    return f"❌ Error: {cause}\nEjemplo correcto: {example}\n\nSiguiente paso: {next_step}"
 
 
 def tg_enable_menu_button(chat_id: Optional[str] = None) -> None:
@@ -2993,11 +3017,100 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
         return False
 
     raw_text = text.strip()
-    cancel_tokens = {"cancelar", "⬅️ volver", "volver"}
+    cancel_tokens = {"cancelar", "⬅️ volver", "volver", MAIN_MENU_LABEL.casefold(), CONFIRM_NO_LABEL.casefold()}
     if raw_text.casefold() in cancel_tokens:
         set_pending_action(chat_id, None)
         tg_send_message(
-            "Operación cancelada.",
+            "Operación cancelada.\n\nSiguiente paso: /start",
+            enabled=enabled,
+            chat_id=chat_id,
+            reply_markup=tg_commands_reply_markup(),
+        )
+        return True
+
+    if action.startswith("confirm_capital:"):
+        if raw_text.casefold() != CONFIRM_YES_LABEL.casefold():
+            tg_send_message(
+                build_error_message(
+                    "Debés usar los botones para confirmar o cancelar el cambio de capital.",
+                    "/capital 2500",
+                    next_step="/capital",
+                ),
+                enabled=enabled,
+                chat_id=chat_id,
+                reply_markup=build_confirm_reply_keyboard(),
+            )
+            return True
+        try:
+            value = float(action.split(":", 1)[1])
+        except ValueError:
+            set_pending_action(chat_id, None)
+            tg_send_message(
+                build_error_message(
+                    "No pude recuperar el valor pendiente de capital.",
+                    "/capital 2500",
+                    next_step="/capital",
+                ),
+                enabled=enabled,
+                chat_id=chat_id,
+                reply_markup=tg_commands_reply_markup(),
+            )
+            return True
+        with CONFIG_LOCK:
+            CONFIG["simulation_capital_quote"] = value
+            persist_runtime_config()
+        refresh_config_snapshot()
+        set_pending_action(chat_id, None)
+        tg_send_message(
+            build_success_message(
+                "Capital actualizado",
+                f"Nuevo capital simulado: {format_decimal_comma(value, decimals=2)} USDT.",
+                next_step="/status",
+            ),
+            enabled=enabled,
+            chat_id=chat_id,
+            reply_markup=tg_commands_reply_markup(),
+        )
+        return True
+
+    if action.startswith("confirm_delpair:"):
+        target = action.split(":", 1)[1]
+        if raw_text.casefold() != CONFIRM_YES_LABEL.casefold():
+            tg_send_message(
+                build_error_message(
+                    "Debés usar los botones para confirmar o cancelar la eliminación.",
+                    "/delpair",
+                    next_step="/delpair",
+                ),
+                enabled=enabled,
+                chat_id=chat_id,
+                reply_markup=build_confirm_reply_keyboard(),
+            )
+            return True
+        if target not in CONFIG["pairs"]:
+            set_pending_action(chat_id, None)
+            tg_send_message(
+                build_error_message(
+                    f"{target} ya no está en la lista de pares.",
+                    "/pairs",
+                    next_step="/pairs",
+                ),
+                enabled=enabled,
+                chat_id=chat_id,
+                reply_markup=tg_commands_reply_markup(),
+            )
+            return True
+        with CONFIG_LOCK:
+            CONFIG["pairs"] = [p for p in CONFIG["pairs"] if p != target]
+            persist_runtime_config()
+        refresh_config_snapshot()
+        set_pending_action(chat_id, None)
+        tg_send_message(
+            build_success_message(
+                "Par eliminado",
+                f"Se removió {target} de la lista de seguimiento.",
+                next_step="/pairs",
+            ),
             enabled=enabled,
             chat_id=chat_id,
             reply_markup=tg_commands_reply_markup(),
@@ -3007,7 +3120,11 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
     value = normalize_pair_input(text)
     if not value:
         tg_send_message(
-            "No pude interpretar ese valor. Probá nuevamente o enviá otro comando para cancelar.",
+            build_error_message(
+                "No pude interpretar ese valor.",
+                "/addpair BTC o /addpair BTC/USDT",
+                next_step="/addpair",
+            ),
             enabled=enabled,
             chat_id=chat_id,
         )
@@ -3017,9 +3134,10 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
         pair = value
         if pair in CONFIG["pairs"]:
             tg_send_message(
-                (
-                    f"{pair} ya está configurado. Ingresá otra cripto o "
-                    "enviá cualquier comando para cancelar."
+                build_error_message(
+                    f"{pair} ya está configurado.",
+                    "/addpair ETH",
+                    next_step="/pairs",
                 ),
                 enabled=enabled,
                 chat_id=chat_id,
@@ -3031,9 +3149,14 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
         refresh_config_snapshot()
         set_pending_action(chat_id, None)
         tg_send_message(
-            f"Par agregado: {pair}",
+            build_success_message(
+                "Par agregado",
+                f"Ahora monitoreamos {pair}.",
+                next_step="/delpair",
+            ),
             enabled=enabled,
             chat_id=chat_id,
+            reply_markup=tg_commands_reply_markup(),
         )
         return True
 
@@ -3047,24 +3170,25 @@ def tg_handle_pending_input(chat_id: str, text: str, enabled: bool) -> bool:
                     target = candidates[0]
         if target not in CONFIG["pairs"]:
             tg_send_message(
-                (
-                    f"{target} no figura en la lista. Elegí otro de los botones "
-                    "o ingresá una cripto válida."
+                build_error_message(
+                    f"{target} no figura en la lista.",
+                    "/delpair BTC/USDT",
+                    next_step="/pairs",
                 ),
                 enabled=enabled,
                 chat_id=chat_id,
             )
             return True
-        with CONFIG_LOCK:
-            CONFIG["pairs"] = [p for p in CONFIG["pairs"] if p != target]
-            persist_runtime_config()
-        refresh_config_snapshot()
-        set_pending_action(chat_id, None)
+        set_pending_action(chat_id, f"confirm_delpair:{target}")
         tg_send_message(
-            f"Par eliminado: {target}",
+            (
+                f"Vas a eliminar {target}.\n"
+                "Confirmá la acción con el botón.\n\n"
+                "Siguiente paso: ✅ Confirmar"
+            ),
             enabled=enabled,
             chat_id=chat_id,
-            reply_markup=tg_commands_reply_markup(),
+            reply_markup=build_confirm_reply_keyboard(),
         )
         return True
 
@@ -3199,7 +3323,8 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         response = (
             "Hola! Ya estás registrado para recibir señales.\n"
             f"Threshold base: {CONFIG['threshold_percent']:.3f}% | dinámico: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
-            f"{format_command_help()}"
+            f"{format_command_help()}\n\n"
+            "Siguiente paso: /status"
         )
         tg_send_message(
             response,
@@ -3210,7 +3335,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         return
 
     if command == "/ping":
-        tg_send_message("pong", enabled=enabled, chat_id=chat_id)
+        tg_send_message("pong\n\nSiguiente paso: /status", enabled=enabled, chat_id=chat_id)
         return
 
     if command == "/status":
@@ -3228,14 +3353,18 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             f"Histórico: {analysis_summary}\n"
             f"Pares ({len(pairs)}): {', '.join(pairs) if pairs else 'sin pares'}"
         )
-        tg_send_message(response, enabled=enabled, chat_id=chat_id)
+        tg_send_message(f"{response}\n\nSiguiente paso: /addpair", enabled=enabled, chat_id=chat_id)
         return
 
     if command == "/capital":
         if not argument:
             capital = float(CONFIG.get("simulation_capital_quote", 0.0))
             tg_send_message(
-                f"Capital simulado actual: {format_decimal_comma(capital, decimals=2)} USDT",
+                (
+                    "Capital simulado actual: "
+                    f"{format_decimal_comma(capital, decimals=2)} USDT\n\n"
+                    "Siguiente paso: /capital <monto>"
+                ),
                 enabled=enabled,
                 chat_id=chat_id,
             )
@@ -3252,39 +3381,55 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             value = float(cleaned)
         except ValueError:
             tg_send_message(
-                "Valor inválido. Ej: /capital 2500 o /capital 2.500,50",
+                build_error_message(
+                    "No pude parsear el monto de capital.",
+                    "/capital 2500 o /capital 2.500,50",
+                    next_step="/capital",
+                ),
                 enabled=enabled,
                 chat_id=chat_id,
             )
             return
         if value <= 0:
             tg_send_message(
-                "El capital debe ser mayor a 0.",
+                build_error_message(
+                    "El capital debe ser mayor a 0.",
+                    "/capital 2500",
+                    next_step="/capital",
+                ),
                 enabled=enabled,
                 chat_id=chat_id,
             )
             return
-        with CONFIG_LOCK:
-            CONFIG["simulation_capital_quote"] = value
-            persist_runtime_config()
-        refresh_config_snapshot()
+        set_pending_action(chat_id, f"confirm_capital:{value}")
         tg_send_message(
             (
-                "Nuevo capital simulado guardado: "
-                f"{format_decimal_comma(value, decimals=2)} USDT"
+                "Vas a modificar el capital simulado a "
+                f"{format_decimal_comma(value, decimals=2)} USDT.\n"
+                "Confirmá la acción con el botón.\n\n"
+                "Siguiente paso: ✅ Confirmar"
             ),
             enabled=enabled,
             chat_id=chat_id,
+            reply_markup=build_confirm_reply_keyboard(),
         )
         return
 
     if command in ("/pairs", "/listapares"):
         pairs = CONFIG["pairs"]
         if not pairs:
-            tg_send_message("No hay pares configurados.", enabled=enabled, chat_id=chat_id)
+            tg_send_message(
+                "No hay pares configurados.\n\nSiguiente paso: /addpair",
+                enabled=enabled,
+                chat_id=chat_id,
+            )
         else:
             formatted = "\n".join(f"- {p}" for p in pairs)
-            tg_send_message(f"Pares actuales:\n{formatted}", enabled=enabled, chat_id=chat_id)
+            tg_send_message(
+                f"Pares actuales:\n{formatted}\n\nSiguiente paso: /addpair",
+                enabled=enabled,
+                chat_id=chat_id,
+            )
         return
 
     if command in ("/addpair", "/adherirpar"):
@@ -3294,9 +3439,15 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         default_quote = DEFAULT_QUOTE_ASSET
         prompt = (
             "Ingresá la cripto que querés adherir."
-            f" Se agregará como BASE/{default_quote}."
+            f" Se agregará como BASE/{default_quote}.\n\n"
+            "Siguiente paso: enviar símbolo (ej: BTC)"
         )
-        tg_send_message(prompt, enabled=enabled, chat_id=chat_id)
+        tg_send_message(
+            prompt,
+            enabled=enabled,
+            chat_id=chat_id,
+            reply_markup=build_pairs_reply_keyboard([]),
+        )
         return
 
     if command in ("/delpair", "/eliminarpar"):
@@ -3304,14 +3455,23 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             return
         pairs = CONFIG["pairs"]
         if not pairs:
-            tg_send_message("No hay pares configurados para eliminar.", enabled=enabled, chat_id=chat_id)
+            tg_send_message(
+                build_error_message(
+                    "No hay pares configurados para eliminar.",
+                    "/addpair BTC",
+                    next_step="/addpair",
+                ),
+                enabled=enabled,
+                chat_id=chat_id,
+            )
             return
         set_pending_action(chat_id, "delpair")
         keyboard = build_pairs_reply_keyboard(pairs)
         tg_send_message(
             (
                 "Elegí el par a eliminar desde los botones o ingresá "
-                "manual la cripto/par a remover."
+                "manual la cripto/par a remover.\n\n"
+                "Siguiente paso: seleccionar un par"
             ),
             enabled=enabled,
             chat_id=chat_id,
@@ -3323,7 +3483,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
         link_items = build_trade_link_items("binance", "bybit", "BTC/USDT")
         reply_markup = tg_inline_keyboard_from_link_items(link_items)
         tg_send_message(
-            build_test_signal_message(),
+            build_test_signal_message() + "\n\nSiguiente paso: /status",
             enabled=enabled,
             chat_id=chat_id,
             reply_markup=reply_markup,
@@ -3342,7 +3502,7 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
             )
             return
         ok, message = settle_signal_result(parsed, settled_by=f"telegram:{chat_id}")
-        tg_send_message(message, enabled=enabled, chat_id=chat_id)
+        tg_send_message(f"{message}\n\nSiguiente paso: /ranking", enabled=enabled, chat_id=chat_id)
         return
 
     if command == "/ranking":
@@ -3358,11 +3518,11 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
                 lines.append(
                     f"- `{item['key']}` | win={item['win_rate']*100:.1f}% | n={item['trades']} | Δ%={item['avg_delta_percent']:.2f}"
                 )
-        tg_send_message("\n".join(lines), enabled=enabled, chat_id=chat_id)
+        tg_send_message("\n".join(lines) + "\n\nSiguiente paso: /status", enabled=enabled, chat_id=chat_id)
         return
 
     tg_send_message(
-        "Comando no reconocido. Usá el botón de menú para ver las opciones disponibles.",
+        "Comando no reconocido. Usá el botón de menú para ver las opciones disponibles.\n\nSiguiente paso: /start",
         enabled=enabled,
         chat_id=chat_id,
     )
@@ -3462,6 +3622,10 @@ def tg_process_updates(enabled: bool = True) -> None:
             continue
 
         chat_id_str = register_telegram_chat(chat_id)
+        if text.casefold() == MAIN_MENU_LABEL.casefold():
+            set_pending_action(chat_id_str, None)
+            tg_handle_command("/start", "", chat_id_str, enabled)
+            continue
         if text.startswith("/"):
             set_pending_action(chat_id_str, None)
             parts = text.split(maxsplit=1)
