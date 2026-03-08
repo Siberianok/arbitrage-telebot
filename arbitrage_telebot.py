@@ -1600,7 +1600,7 @@ def record_signal_lifecycle_event(
             signal_id,
             state,
             pair,
-            strategy,
+            normalize_strategy_name(strategy),
             buy_venue,
             sell_venue,
             f"{est_pnl_quote:.6f}",
@@ -6701,6 +6701,36 @@ def format_venue_label(venue: str) -> str:
     return normalized.upper()
 
 
+STRATEGY_VISUAL_PREFIX: Dict[str, str] = {
+    "spot_spot": "🟦",
+    "spot_p2p": "🟨",
+    "p2p_p2p": "🟪",
+    "triangular_intra_venue": "🔺",
+}
+
+STRATEGY_LABELS: Dict[str, str] = {
+    "spot_spot": "SPOT ↔ SPOT",
+    "spot_p2p": "SPOT ↔ P2P",
+    "p2p_p2p": "P2P ↔ P2P",
+    "triangular_intra_venue": "TRIANGULAR INTRA-VENUE",
+}
+
+
+def normalize_strategy_name(strategy: str) -> str:
+    normalized = str(strategy or "").strip().lower().replace("-", "_")
+    return normalized or "spot_spot"
+
+
+def strategy_display_name(strategy: str) -> str:
+    key = normalize_strategy_name(strategy)
+    return f"{key} · {STRATEGY_LABELS.get(key, key.upper())}"
+
+
+def strategy_visual_prefix(strategy: str) -> str:
+    key = normalize_strategy_name(strategy)
+    return STRATEGY_VISUAL_PREFIX.get(key, "🚨")
+
+
 def fmt_alert(
     opp: Opportunity,
     est_profit: float,
@@ -6710,21 +6740,18 @@ def fmt_alert(
     capital_used: float,
     links: Optional[List[Dict[str, str]]] = None,
 ) -> str:
-    strategy = getattr(opp, "strategy", "spot_spot")
-    if strategy == "spot_p2p":
-        title = "🚨 *Arbitraje spot↔P2P*"
-    elif strategy == "p2p_p2p":
-        title = "🚨 *Arbitraje P2P↔P2P*"
-    else:
-        title = "🚨 *Arbitraje spot detectado*"
+    strategy = normalize_strategy_name(getattr(opp, "strategy", "spot_spot"))
+    title = f"{strategy_visual_prefix(strategy)} *Arbitraje detectado*"
 
     buy_label = format_venue_label(opp.buy_venue)
     sell_label = format_venue_label(opp.sell_venue)
+    route_label = f"{buy_label} → {sell_label}"
 
     lines = [
         title,
+        f"*Estrategia:* `{strategy_display_name(strategy)}`",
         f"*Par:* `{opp.pair}`",
-        f"*Ruta:* Comprar en *{buy_label}* a `{opp.buy_price:.6f}` · Vender en *{sell_label}* a `{opp.sell_price:.6f}`",
+        f"*Ruta:* `{route_label}` · Comprar en *{buy_label}* a `{opp.buy_price:.6f}` · Vender en *{sell_label}* a `{opp.sell_price:.6f}`",
         f"*Spreads:* bruto `{format_percent_comma(opp.gross_percent)}` · neto `{format_percent_comma(opp.net_percent)}`",
         (
             "*PnL estimado:* `~"
@@ -6804,19 +6831,22 @@ def fmt_test_alert_table(
 
 
 def fmt_triangular_alert(opp: TriangularOpportunity, fee_percent: float) -> str:
+    strategy = "triangular_intra_venue"
     legs_lines = []
     for leg, price in opp.leg_prices:
         action = leg.normalized_action()
         legs_lines.append(f"- {leg.pair} [{action}] @ {price:.8f}")
     legs_block = "\n".join(legs_lines)
+    route_label = f"{opp.route.name} · {format_venue_label(opp.route.venue)}"
     return (
-        "ARBITRAJE TRIANGULAR\n"
-        f"Ruta: {opp.route.name} ({opp.route.venue})\n"
-        f"Asset inicial: {opp.route.start_asset}\n"
-        f"Capital simulado: {opp.start_capital:.4f} {opp.route.start_asset}\n"
-        f"Resultado neto: {opp.final_capital_net:.4f} {opp.route.start_asset} (PnL {opp.net_profit:.4f}, {opp.net_percent:.3f}%)\n"
-        f"Spread bruto: {opp.gross_percent:.3f}% | Fees considerados: {fee_percent:.3f}% por trade\n"
-        f"Legs:\n{legs_block}\n"
+        f"{strategy_visual_prefix(strategy)} *Arbitraje detectado*\n"
+        f"*Estrategia:* `{strategy_display_name(strategy)}`\n"
+        f"*Ruta:* `{route_label}`\n"
+        f"*Asset inicial:* `{opp.route.start_asset}`\n"
+        f"*Capital simulado:* `{opp.start_capital:.4f} {opp.route.start_asset}`\n"
+        f"*Resultado neto:* `{opp.final_capital_net:.4f} {opp.route.start_asset}` (PnL `{opp.net_profit:.4f}`, `{opp.net_percent:.3f}%`)\n"
+        f"*Spreads:* bruto `{opp.gross_percent:.3f}%` · fees `{fee_percent:.3f}%` por trade\n"
+        f"*Legs:*\n{legs_block}\n"
         f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
@@ -7218,6 +7248,8 @@ def run_once() -> None:
                     pair=opp.pair,
                     buy_venue=opp.buy_venue,
                     sell_venue=opp.sell_venue,
+                    strategy=normalize_strategy_name(opp.strategy),
+                    strategy_label=strategy_display_name(opp.strategy),
                     net_percent=opp.net_percent,
                     est_profit=est_profit,
                 )
@@ -7399,6 +7431,8 @@ def run_once() -> None:
                     pair=opp.pair,
                     buy_venue=opp.buy_venue,
                     sell_venue=opp.sell_venue,
+                    strategy=normalize_strategy_name(opp.strategy),
+                    strategy_label=strategy_display_name(opp.strategy),
                     net_percent=est_percent,
                     est_profit=est_profit,
                 )
@@ -7546,6 +7580,8 @@ def run_once() -> None:
                     pair=opp.pair,
                     buy_venue=opp.buy_venue,
                     sell_venue=opp.sell_venue,
+                    strategy=normalize_strategy_name(opp.strategy),
+                    strategy_label=strategy_display_name(opp.strategy),
                     net_percent=est_percent,
                     est_profit=est_profit,
                 )
@@ -7575,6 +7611,17 @@ def run_once() -> None:
         fee_pct = fee_cfg.default.taker_fee_percent if fee_cfg else 0.0
         msg = fmt_triangular_alert(opp, fee_pct)
         tg_send_message(msg, enabled=tg_enabled)
+        log_event(
+            "opportunity.alert",
+            pair=route.identifier,
+            buy_venue=opp.route.venue,
+            sell_venue=opp.route.venue,
+            strategy="triangular_intra_venue",
+            strategy_label=strategy_display_name("triangular_intra_venue"),
+            route=opp.route.name,
+            net_percent=opp.net_percent,
+            est_profit=opp.net_profit,
+        )
         tri_alerts += 1
 
     total_latency_ms = int((time.time() - run_start) * 1000)
