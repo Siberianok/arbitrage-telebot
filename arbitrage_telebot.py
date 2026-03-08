@@ -3217,18 +3217,41 @@ def tg_handle_command(command: str, argument: str, chat_id: str, enabled: bool) 
 
     if command == "/status":
         pairs = CONFIG["pairs"]
-        analysis_summary = "Sin historial"
-        if LATEST_ANALYSIS and LATEST_ANALYSIS.rows_considered:
+        has_pairs = bool(pairs)
+        has_history = bool(LATEST_ANALYSIS and LATEST_ANALYSIS.rows_considered)
+        if has_history:
             analysis_summary = (
-                f"SR: {LATEST_ANALYSIS.success_rate*100:.1f}%"
-                f" ({LATEST_ANALYSIS.rows_considered} señales)"
+                f"SR {LATEST_ANALYSIS.success_rate*100:.1f}%"
+                f" · {LATEST_ANALYSIS.rows_considered} señales"
             )
+        else:
+            analysis_summary = "Sin historial"
+
+        if not has_pairs:
+            overall_status = "BOOTING"
+            semaphore = "🔴 Rojo"
+        elif not has_history:
+            overall_status = "DEGRADED"
+            semaphore = "🟡 Amarillo"
+        else:
+            overall_status = "OK"
+            semaphore = "🟢 Verde"
+
+        suggested_actions: List[str] = []
+        if not has_history:
+            suggested_actions.append("/test o revisar señales")
+        if not has_pairs:
+            suggested_actions.append("/addpair")
+        actions_summary = ", ".join(suggested_actions) if suggested_actions else "Sin acciones inmediatas"
+
         response = (
-            "Estado actual:\n"
-            f"Umbral mínimo de ganancia: {format_decimal_comma(CONFIG['threshold_percent'], decimals=2)}% en adelante\n"
-            f"Threshold dinámico actual: {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
-            f"Histórico: {analysis_summary}\n"
-            f"Pares ({len(pairs)}): {', '.join(pairs) if pairs else 'sin pares'}"
+            f"Estado: {overall_status} ({semaphore})\n"
+            "Config activa:\n"
+            f"- Base {format_decimal_comma(CONFIG['threshold_percent'], decimals=2)}% | Dinámico {DYNAMIC_THRESHOLD_PERCENT:.3f}%\n"
+            f"- Capital {format_decimal_comma(float(CONFIG.get('simulation_capital_quote', 0.0)), decimals=2)} USDT\n"
+            f"Cobertura: {len(pairs)} pares\n"
+            f"Rendimiento: {analysis_summary}\n"
+            f"Acciones sugeridas: {actions_summary}"
         )
         tg_send_message(response, enabled=enabled, chat_id=chat_id)
         return
